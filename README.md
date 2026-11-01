@@ -43,8 +43,14 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/MSp
 This installs `%LOCALAPPDATA%\Programs\harness-knowledge\harness-knowledge.exe`. Both installers check
 the SHA-256 against the release's `checksums.txt` before installing anything.
 
+## Register with your harness
+
 Harness Desktop installs it, registers the MCP server for every harness and adds a Knowledge view
-(import, review queue, repository links). Without the desktop, add it to a harness by hand:
+(import, review queue, repository links). Without the desktop:
+
+- **Claude Code:** `claude mcp add --scope user harness-knowledge -- harness-knowledge mcp`
+- **Codex:** `codex mcp add harness-knowledge -- harness-knowledge mcp`
+- **OMP, PI, OpenCode** and other MCP clients: add this entry to their MCP config:
 
 ```json
 { "mcpServers": { "harness-knowledge": { "command": "harness-knowledge", "args": ["mcp"] } } }
