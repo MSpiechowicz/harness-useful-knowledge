@@ -11,8 +11,10 @@
 stdio [MCP](https://modelcontextprotocol.io) server that Claude Code, Codex, OMP, PI, OpenCode and any
 other MCP client can start. People import documents (guides, READMEs, ADRs, OpenAPI specs,
 Confluence exports, PDFs, meeting transcripts) and agents search them when they need to know how
-something works. It is the written side of the Harness family. `harness-memory` keeps what agents
-learn that is written down nowhere, and `harness-knowledge` keeps what is written down already.
+something works. It is the written side of the Harness family. [`harness-memory`](https://github.com/MSpiechowicz/harness-useful-memory) keeps what agents
+learn that is written down nowhere, `harness-knowledge` keeps what is written down already, and
+[`harness-code`](https://github.com/MSpiechowicz/harness-useful-code) knows the code. It works on its own, with neither of the
+others installed.
 
 Documents are split into heading-aware chunks and searched with hybrid ranking: keyword search (BM25)
 plus vector search with the multilingual
