@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.0.0...v1.0.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **libsql:** repeat a read once when the server closed the connection cleanly before replying ([4c37ff3](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/4c37ff346418b6901bc11cf8992f2b018cd39ae9))
+
 # 1.0.0 (2026-11-01)
 
 
