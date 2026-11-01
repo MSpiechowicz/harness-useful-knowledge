@@ -1,0 +1,49 @@
+[package]
+name = "harness_knowledge"
+description = "Project knowledge MCP server for any coding agent harness (documents, hybrid BM25 + vector search)"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/MSpiechowicz/harness-useful-knowledge"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# The stdio MCP server the harnesses' `mcp.json` entries start (`harness-knowledge mcp`).
+[[bin]]
+name = "harness-knowledge"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+# `preserve_order`: tool schemas and replies keep their keys in source order.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+# The secret patterns `support::redact` masks in messages.
+regex = "1.13"
+# Canonical paths without the Windows `\\?\` prefix.
+dunce = "1.0.5"
+# The team database config file (`<config dir>/harness-knowledge/config.toml`).
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+# The temporary file of an atomic private write.
+tempfile = "3.27.0"
+
+# Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+strip = true

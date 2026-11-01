@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUN_VERSION: 1.4.2
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the version, install it when the runner lacks it.
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Smoke test the binary
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          "target/release/harness-knowledge${ext}" --version
+
+  # The team-database stores against real PostgreSQL (pgvector), libSQL (sqld) and MongoDB Atlas Local (mongot) servers.
+  # Gating convention (same as harness-memory): the store tests are named `team_*` and skip themselves when their
+  # HARNESS_KNOWLEDGE_TEST_*_URL variable is unset, so the other jobs run without these servers and this job simply runs
+  # the whole suite with the variables set. Images are pinned by digest (the comment names the tag it was taken from).
+  team-backends:
+    name: Team backends
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8 # pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      # TODO(experiment X5): confirm this image (same as harness-memory) supports vector columns and indexes. Swap it
+      # for a build that does if not.
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67 # libsql-server:latest
+        env:
+          SQLD_NODE: primary
+          SQLD_HTTP_LISTEN_ADDR: 0.0.0.0:8080
+        ports:
+          - 8080:8080
+      # Atlas Local bundles mongod and mongot (the `$search` and `$vectorSearch` stages). Index builds are
+      # asynchronous, so the tests poll for READY. TODO(experiment X5): measure the READY latency and tune the wait.
+      mongo:
+        image: mongodb/mongodb-atlas-local@sha256:ca394bdaedef5d802a07f8e00e7734f181ee9b6cc1aacbf09a50fb776657edbf # mongodb/mongodb-atlas-local:latest
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.hello().ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      HARNESS_KNOWLEDGE_TEST_POSTGRES_URL: postgres://postgres:ci-postgres-password@localhost:5432/postgres?sslmode=disable
+      HARNESS_KNOWLEDGE_TEST_LIBSQL_URL: http://localhost:8080
+      HARNESS_KNOWLEDGE_TEST_MONGO_URL: mongodb://localhost:27017/?directConnection=true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Wait for libSQL
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "libSQL did not become healthy" >&2
+          exit 1
+      # rust-toolchain.toml pins the version, install it when the runner lacks it.
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --locked
+
+  # Supply-chain policy for the Rust dependencies (see deny.toml).
+  rust-deps:
+    name: Rust dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories bans licenses sources
+
+  # The installers and the release version script.
+  scripts:
+    name: Installers and version script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Lint install.sh
+        run: |
+          sh -n install.sh
+          shellcheck install.sh
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun test

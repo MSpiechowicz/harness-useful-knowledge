@@ -1,0 +1,44 @@
+# cargo-deny policy: `cargo deny check advisories bans licenses sources`.
+# Extend the allowlists when the PDF and YAML extraction dependencies (pdf-extract, YAML parser) are added and
+# cargo deny reports new licenses or advisories. Keep every entry commented with the crate that needs it.
+
+[advisories]
+yanked = "deny"
+ignore = [
+  # paste is unmaintained (archived), but it is only a proc macro that tokenizers 0.23 uses at
+  # build time (the embedder's tokenizer). No safe upgrade exists.
+  "RUSTSEC-2024-0436",
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  # foldhash (hashbrown).
+  "Zlib",
+  # ring, rustls-webpki and untrusted (TLS for the team database).
+  "ISC",
+  # subtle (TLS for the team database).
+  "BSD-3-Clause",
+  # webpki-roots: the Mozilla root certificates the MongoDB driver's rustls TLS trusts.
+  "CDLA-Permissive-2.0",
+  # tiny-keccak, a build-time dependency of the MongoDB driver's macros.
+  "CC0-1.0",
+  # doctest-file and recvmsg, dependencies of interprocess (the embedder's local socket).
+  "0BSD",
+  # This crate.
+  "GPL-3.0-or-later",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
