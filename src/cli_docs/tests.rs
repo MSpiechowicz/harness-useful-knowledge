@@ -396,6 +396,27 @@ fn deleting_removes_documents_and_counts_those_that_existed() {
 }
 
 #[test]
+fn stats_count_the_waiting_proposals_without_a_database() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.json(&["stats", "--json"])["held"], json!(0));
+
+    let held = crate::held::HeldStore::open(&fixture.env).expect("held store");
+    let folder = fixture.folder.join("held");
+    std::fs::create_dir_all(&folder).expect("folder");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    std::fs::write(folder.join("0123abcd-0123-0123-0123-0123456789ab.json"), "{}").expect("file");
+    std::fs::write(folder.join("notes.json"), "{}").expect("file");
+
+    assert_eq!(held.count(), 1);
+    assert_eq!(fixture.json(&["stats", "--json"])["held"], json!(1));
+    assert!(!fixture.folder.join(FILE_NAME).exists(), "no database was created");
+}
+
+#[test]
 fn stats_and_check_describe_the_database() {
     let (fixture, _, _) = Fixture::populated();
 

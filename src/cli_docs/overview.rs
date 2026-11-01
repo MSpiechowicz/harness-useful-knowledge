@@ -30,7 +30,8 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
 
 /// `stats --json`: `documents`, `chunks`, `embeddedChunks`, `bytes`, `globalDocuments`,
 /// `repositories`, `generation`, `schema` (the version a new file gets without a database) and `model` (the id
-/// of the model that embedded the chunks, `null` before any was). All counts are zero without a database.
+/// of the model that embedded the chunks, `null` before any was) and `held` (how many proposals wait in the
+/// review queue, counted from its files, so it is right without a database). All counts are zero without a database.
 pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     json_only(args)?;
 
@@ -52,6 +53,7 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
         "generation": stats.generation,
         "schema": stats.schema_version,
         "model": stats.model_id,
+        "held": crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()),
     })))
 }
 

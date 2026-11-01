@@ -152,6 +152,25 @@ impl HeldStore {
         Ok(items)
     }
 
+    /// How many proposals wait: the files named like one, none of them read. A missing folder
+    /// holds none, and nothing is created or put back.
+    pub fn count(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.folder) else {
+            return 0;
+        };
+
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .is_some_and(is_held_id)
+            })
+            .count()
+    }
+
     /// Proposal `held_id`, when it is waiting.
     pub fn get(&self, held_id: &str) -> Result<Option<HeldItem>, String> {
         if !is_held_id(held_id) || !self.exists()? {
