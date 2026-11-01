@@ -190,3 +190,15 @@ Feature branches in each repo, commits per milestone, `cargo clean` before commi
   - `COSINE_FLOOR` 0.80, `FLOOR` 400, `MARGIN` 0.4, `LINKED_BOOST` 1.1, `GLOB_BOOST` 1.3, `KEYWORD_FLOOR` 0. Keyword scores are not comparable across backends, so cosine is the portable signal.
   - Recall: `RECALL_COSINE_FLOOR` 0.82 with a 0.02 band (0/6 off-topic answered, found@3 37/40), and `RECALL_KEYWORD_FLOOR` 10 when the embedder is down (SQLite/libSQL scale, uncalibrated on Postgres and Atlas).
 - **Reproduce:** `cargo test --release --lib search::tests::calibration -- --nocapture` with `HARNESS_KNOWLEDGE_TEST_MODEL_DIR` and `HARNESS_KNOWLEDGE_TEST_CORPUS_ROOT`.
+
+## Routing: Remote / This computer / Remote + this computer (approved 2026-11-01)
+At parity with Harness Memory's "Kept in".
+- **Config:** `[routing] repository_documents` and `global_documents`, each `remote`, `local` or `remote+local`. Remote is the default when a database URL is set.
+- **Routed store:** this computer's SQLite plus the remote database.
+  - Repo-linked documents follow `repository_documents`, and global documents follow `global_documents`.
+  - The list merges both places with paging.
+  - Search runs the hybrid pipeline in each place and fuses the result lists with RRF.
+- **Ids:** documents carry their place. Ids from this computer are written `local:<id>`, and the CLI and MCP tools accept both forms.
+- **Writes:** `docs import` and `held approve` take `--place remote|local`, defaulting to remote in `remote+local`. `check` and `stats` report both places.
+- **Desktop:** Kept in rows in Settings → Remote knowledge (memory's 3-way component) with a routing-change warning, a "Save to" choice in Add documents when a row is `remote+local`, and a Kept in filter and place chip in the view.
+- **Not included:** copying local documents to remote, and hide on this computer (follow-up issue).
