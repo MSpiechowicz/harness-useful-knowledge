@@ -361,6 +361,11 @@ fn replaces_is_a_document_id_as_the_tools_show_it_and_is_kept_with_its_place() {
     let project = project_arg(&world);
     let local_seven = crate::store::routed::ids::tag(crate::config::Place::Local, 7);
 
+    for number in 1..=7 {
+        let seed = Seed::new(&format!("Document {number}")).chunk("Intro", &format!("text of number {number}"));
+        assert_eq!(insert(&mut world.database(), &seed), number);
+    }
+
     // Only this computer is in use, so each of them names its document 7.
     for (index, (given, kept)) in [
         (json!(7), local_seven),

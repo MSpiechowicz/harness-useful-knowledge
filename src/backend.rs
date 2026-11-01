@@ -227,9 +227,32 @@ fn open_remote_in(
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     let (env, backend) = (env.clone(), backend.clone());
 
-    open_in_phases(opens, &UPGRADES, connect, UPGRADE_BOUND, move |upgrade| {
+    let late = late_upgrade(&backend, UPGRADE_BOUND);
+
+    open_in_phases(opens, &UPGRADES, connect, (UPGRADE_BOUND, late), move |upgrade| {
         open_remote_place(&env, &backend, access, connect, upgrade)
     })
+}
+
+/// What to tell when an upgrade passes `bound`, true for what the backend does with the work done
+/// so far. PostgreSQL upgrades in one transaction on a thread of this process: the thread goes on
+/// while the process lives (the MCP server), but a command that ends closes the connection and the
+/// server rolls the transaction back. MongoDB stamps its progress per version, so the next run
+/// continues from there.
+fn late_upgrade(backend: &Backend, bound: Duration) -> String {
+    let minutes = bound.as_secs().div_ceil(60);
+
+    match backend {
+        Backend::Postgres { .. } => format!(
+            "upgrading the knowledge database is taking longer than {minutes} minutes. The server rolls it back \
+             when this process ends, so run it again from a long-running session such as the MCP server"
+        ),
+        Backend::Mongodb { .. } => format!(
+            "upgrading the knowledge database is taking longer than {minutes} minutes. Its progress is kept for \
+             each version, so it keeps going on the next run"
+        ),
+        _ => format!("upgrading the knowledge database is taking longer than {minutes} minutes, try again later"),
+    }
 }
 
 /// The type of what opens the remote database for [`open_in_phases`].
@@ -237,13 +260,14 @@ type RemoteOpen = dyn Fn(Upgrade) -> Result<Opened<Box<dyn KnowledgeStore>>, Ope
 
 /// Runs `open` with [`Upgrade::Defer`] on a thread of `opens` (unreachable when it did not finish
 /// within twice `connect`), and when it says the database needs an upgrade, runs it again with
-/// [`Upgrade::Run`] on a thread of `upgrades` that may take `bound`. A database that is still being
+/// [`Upgrade::Run`] on a thread of `upgrades` that may take `bound` (the first of `upgrade`, the
+/// second what to say when it takes longer, see [`late_upgrade`]). A database that is still being
 /// upgraded after that is a failure that says so, not an unreachable one.
 fn open_in_phases(
     opens: &'static deadline::Slots,
     upgrades: &'static deadline::Slots,
     connect: Duration,
-    bound: Duration,
+    upgrade: (Duration, String),
     open: impl Fn(Upgrade) -> Result<Opened<Box<dyn KnowledgeStore>>, OpenError> + Send + Sync + 'static,
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     let open: Arc<RemoteOpen> = Arc::new(open);
@@ -265,14 +289,14 @@ fn open_in_phases(
 
     match opened {
         Opened::Ready(store) => Ok(store),
-        Opened::NeedsUpgrade => upgrade_within(upgrades, bound, open),
+        Opened::NeedsUpgrade => upgrade_within(upgrades, upgrade, open),
     }
 }
 
 /// The second phase of [`open_in_phases`]: the open that upgrades the database.
 fn upgrade_within(
     upgrades: &'static deadline::Slots,
-    bound: Duration,
+    (bound, late): (Duration, String),
     open: Arc<RemoteOpen>,
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     let upgrading = deadline::within_slots(upgrades, "remote-upgrade", bound, move || open(Upgrade::Run));
@@ -283,11 +307,7 @@ fn upgrade_within(
             "the knowledge database could not be upgraded".to_owned(),
         )),
         Ok(Err(error)) => Err(error),
-        Err(deadline::Missed::Late) => Err(OpenError::Failed(format!(
-            "upgrading the knowledge database is taking longer than {} minutes, it keeps running on the \
-             server, try again later",
-            bound.as_secs().div_ceil(60)
-        ))),
+        Err(deadline::Missed::Late) => Err(OpenError::Failed(late)),
         Err(deadline::Missed::Busy) => Err(OpenError::Failed(
             "upgrading the knowledge database is still running, try again later".to_owned(),
         )),

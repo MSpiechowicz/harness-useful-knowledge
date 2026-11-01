@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::config::Where;
+use crate::held::Replaced;
+use crate::store::KnowledgeStore;
 
 const BOTH: Routing = Routing {
     repository: Where::RemoteLocal,
@@ -107,4 +109,125 @@ fn an_id_naming_the_only_place_in_use_replaces_there_and_one_naming_the_other_pl
     assert!(message.contains("not in use"), "{message}");
     assert_eq!(mine(&world), "Replacement", "this computer's document is untouched");
     assert!(world.held().get(&held).expect("get").is_some(), "the proposal waits");
+}
+
+impl World {
+    /// The document `id` of this computer's file as `knowledge_add` records it when it holds a
+    /// proposal, `None` when there is no such document.
+    pub(super) fn replaced(&self, id: i64) -> Option<Replaced> {
+        let mut store = backend::open(&self.env, &Backend::Sqlite, Routing::local(), Access::Read).ok()??;
+        let doc = store.get(id, &crate::store::Detail::default()).ok()??.doc;
+
+        Some(Replaced {
+            content_sha256: doc.content_sha256,
+            source_key: doc.source_key,
+        })
+    }
+}
+
+#[test]
+fn a_proposal_does_not_replace_a_document_that_took_the_number_of_the_one_it_was_about() {
+    let world = World::new();
+    let file = world.dir.path().join("knowledge").join(FILE_NAME);
+    let mut local = SqliteStore::open(&file).expect("local file");
+    let first = insert(&mut local, &Seed::new("Mine").chunk("Intro", "gateway notes of mine"));
+    assert_eq!(first, 1);
+
+    let held = world.propose(
+        "Replacement",
+        TEXT,
+        Vec::new(),
+        Some(crate::store::routed::ids::tag(Place::Local, first)),
+    );
+
+    // The document is deleted and another one is imported under the same number (a database
+    // that reuses row numbers does this).
+    local.delete(&[first]).expect("delete");
+    let other = insert(
+        &mut local,
+        &Seed::new("Someone else's").chunk("Intro", "zebrafish notes"),
+    );
+    drop(local);
+
+    let connection = rusqlite::Connection::open(&file).expect("raw connection");
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE knowledge_chunks SET doc_id = {first} WHERE doc_id = {other};
+             UPDATE knowledge_documents SET id = {first} WHERE id = {other};"
+        ))
+        .expect("the new document takes the old number");
+    drop(connection);
+
+    let Reply::Refused(Code::Refused, message) = approve_local(&world, &held) else {
+        panic!("not refused");
+    };
+    assert!(message.contains("changed or was deleted"), "{message}");
+    assert_eq!(mine(&world), "Someone else's", "nothing was overwritten");
+    assert!(world.held().get(&held).expect("get").is_some(), "the proposal waits");
+}
+
+#[test]
+fn a_proposal_for_a_document_that_was_deleted_is_refused() {
+    let world = World::new();
+    let mut local = SqliteStore::open(&world.dir.path().join("knowledge").join(FILE_NAME)).expect("local file");
+    let first = insert(&mut local, &Seed::new("Mine").chunk("Intro", "gateway notes of mine"));
+    let held = world.propose(
+        "Replacement",
+        TEXT,
+        Vec::new(),
+        Some(crate::store::routed::ids::tag(Place::Local, first)),
+    );
+
+    local.delete(&[first]).expect("delete");
+    drop(local);
+
+    let Reply::Refused(Code::Refused, message) = approve_local(&world, &held) else {
+        panic!("not refused");
+    };
+    assert!(message.contains("changed or was deleted"), "{message}");
+    assert_eq!(
+        world.store().stats().expect("stats").documents,
+        0,
+        "no document was created"
+    );
+}
+
+fn approve_local(world: &World, held: &str) -> Reply {
+    world.run(&["approve", "--json", held])
+}
+
+#[test]
+fn a_proposal_shows_the_document_it_replaces_as_clients_read_ids() {
+    use crate::store::routed::ids;
+
+    let held = |replaces| {
+        HeldItem::new(
+            Source {
+                client: "tests".to_owned(),
+                session: None,
+                project_path: None,
+                repo_key: None,
+            },
+            Proposal {
+                title: "T".to_owned(),
+                format: "markdown".to_owned(),
+                name: "t.md".to_owned(),
+                source_path: None,
+                content: "text".to_owned(),
+                links: Vec::new(),
+                replaces: Some(replaces),
+                replaced: None,
+            },
+        )
+    };
+
+    assert_eq!(
+        crate::cli_held::public(&held(ids::tag(crate::config::Place::Remote, 12)))["replaces"],
+        serde_json::json!(12)
+    );
+    assert_eq!(
+        crate::cli_held::public(&held(ids::tag(crate::config::Place::Local, 12)))["replaces"],
+        serde_json::json!("local:12")
+    );
 }

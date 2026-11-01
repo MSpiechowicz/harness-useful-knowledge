@@ -23,6 +23,7 @@ fn propose_page(world: &World, replaces: Option<i64>) -> String {
             content: PAGE.to_owned(),
             links: Vec::new(),
             replaces,
+            replaced: replaces.and_then(|id| world.replaced(crate::store::routed::ids::split(id).1)),
         },
     );
 

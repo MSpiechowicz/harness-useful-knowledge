@@ -131,8 +131,11 @@ mod tests {
             assert!(names.iter().any(|name| name == expected), "{expected} in {names:?}");
         }
 
+        // `sqlite_sequence` is SQLite's own table behind AUTOINCREMENT, not one of ours.
         assert!(
-            names.iter().all(|name| name.starts_with("knowledge_")),
+            names
+                .iter()
+                .all(|name| name.starts_with("knowledge_") || name == "sqlite_sequence"),
             "every table and trigger is prefixed: {names:?}"
         );
 

@@ -207,3 +207,4 @@ fn a_serve_loop_reads_lines_skips_blanks_and_survives_garbage() {
 mod offline;
 mod proposals;
 mod reading;
+mod replaced;

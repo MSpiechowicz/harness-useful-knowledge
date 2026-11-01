@@ -23,6 +23,7 @@ fn proposal(title: &str, content: &str) -> HeldItem {
                 globs: Vec::new(),
             }],
             replaces: None,
+            replaced: None,
         },
     )
 }

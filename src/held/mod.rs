@@ -83,8 +83,20 @@ pub struct HeldItem {
     pub links: Vec<Link>,
     /// The document the approval replaces in place.
     pub replaces: Option<i64>,
+    /// That document as it was when the proposal was held: an approval replaces it only while it is
+    /// still this one (a document that was deleted and a new one that took its number is not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<Replaced>,
     /// The [`Self::digest`] of the content, set when it is held.
     pub revision: String,
+}
+
+/// What identifies the document a proposal replaces: its text and the key it was imported under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replaced {
+    pub content_sha256: String,
+    pub source_key: String,
 }
 
 /// Who proposed, and from where.
@@ -106,6 +118,8 @@ pub struct Proposal {
     pub content: String,
     pub links: Vec<Link>,
     pub replaces: Option<i64>,
+    /// The document `replaces` names, as it is now.
+    pub replaced: Option<Replaced>,
 }
 
 impl HeldItem {
@@ -128,6 +142,7 @@ impl HeldItem {
             content: proposal.content,
             links: proposal.links,
             replaces: proposal.replaces,
+            replaced: proposal.replaced,
             revision: String::new(),
         }
     }
@@ -146,13 +161,15 @@ impl HeldItem {
         hex(&Sha256::digest(&text))
     }
 
-    /// The same proposal as `other` (a retry): same text, title, format, links and replacement.
+    /// The same proposal as `other` (a retry): same text, title, format, links and replacement (the
+    /// same document, as it was).
     fn repeats(&self, other: &Self) -> bool {
         self.content_sha256 == other.content_sha256
             && self.title == other.title
             && self.format == other.format
             && self.links == other.links
             && self.replaces == other.replaces
+            && self.replaced == other.replaced
     }
 }
 

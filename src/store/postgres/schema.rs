@@ -15,8 +15,8 @@
 //!
 //! - It runs in its own open ([`super::PostgresStore::open_with`] with [`crate::backend::Upgrade::Run`]),
 //!   which [`crate::backend`] gives a long bound of its own and not the probe deadline of an
-//!   ordinary open, and the transaction lifts the session's statement and idle limits and waits
-//!   longer for locks (see [`migrate_with`]).
+//!   ordinary open, and the transaction lifts the session's statement limit and waits longer for
+//!   locks (the idle limit stays) (see [`migrate_with`]).
 //! - A change that only adds (a column, an index) leaves a read of the older database working:
 //!   queries written for the new version must still answer on the old one, or wait for the writer
 //!   to upgrade it. A change that readers of the old version cannot cope with raises
@@ -41,6 +41,10 @@ pub(super) const READABLE_FROM: i64 = 1;
 /// How long the migration waits for a lock another session holds (the session's own limit is
 /// 10 s, which suits a read or a write but not a migration queued behind running writes).
 const MIGRATION_LOCK_TIMEOUT: &str = "5min";
+
+/// How long the migration's transaction may sit idle before the server ends it. Only the statement
+/// timeout is lifted: a client that stalls or dies mid-migration must not hold its locks forever.
+const MIGRATION_IDLE_TIMEOUT: &str = "60s";
 
 /// The advisory lock migrations take (database-wide, "knowledge" and 01). Writes hold it shared, so
 /// a migration waits for running writes and later writes see its version.
@@ -260,9 +264,10 @@ pub(super) fn migrate(client: &mut Client) -> Result<SchemaState, Fault> {
 /// [`migrate`] with `steps` as the migrations (entry `n` takes version `n` to `n + 1`).
 ///
 /// The transaction is not bound by the limits of an ordinary session, which would end a migration
-/// of a real-sized database every time it is tried: it has no statement timeout, no idle limit, and
-/// waits [`MIGRATION_LOCK_TIMEOUT`] for a lock (`SET LOCAL`, so the session's own limits are back
-/// when it ends).
+/// of a real-sized database every time it is tried: it has no statement timeout and waits
+/// [`MIGRATION_LOCK_TIMEOUT`] for a lock (`SET LOCAL`, so the session's own limits are back when it
+/// ends). It keeps a finite idle limit ([`MIGRATION_IDLE_TIMEOUT`]), so a stalled client cannot hold
+/// the migration's locks.
 pub(super) fn migrate_with(client: &mut Client, steps: &[String]) -> Result<SchemaState, Fault> {
     let target = i64::try_from(steps.len()).unwrap_or(i64::MAX);
 
@@ -274,7 +279,8 @@ pub(super) fn migrate_with(client: &mut Client, steps: &[String]) -> Result<Sche
 
     let mut tx = client.transaction().map_err(backend)?;
     tx.batch_execute(&format!(
-        "SET LOCAL statement_timeout = 0; SET LOCAL idle_in_transaction_session_timeout = 0; \
+        "SET LOCAL statement_timeout = 0; \
+         SET LOCAL idle_in_transaction_session_timeout = '{MIGRATION_IDLE_TIMEOUT}'; \
          SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}';"
     ))
     .map_err(backend)?;

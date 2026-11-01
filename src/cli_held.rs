@@ -15,6 +15,8 @@
 //!   where that document is (`local:12` is on this computer, a plain id in the remote database), and
 //!   a `--place` that disagrees is `refused`. `docId` is a number, or `local:12` for a
 //!   document on this computer when both places are in use.
+//!   A proposal that replaces a document is approved only while that document is the one it was
+//!   made about (its text hash and key as held), otherwise it is `refused` and nothing is overwritten.
 //! - `held reject --json ID [--expect REVISION]` removes it, printing `{"rejected": "<heldId>"}`.
 //!
 //! Approving and rejecting claim the proposal first (see [`crate::held`]), so two decisions about one
@@ -39,7 +41,7 @@ use crate::import::place::write_place;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
-use crate::store::{KnowledgeStore, Origin, clean};
+use crate::store::{Detail, KnowledgeStore, Origin, clean};
 use crate::support::Env;
 use crate::tokens::counter_for;
 
@@ -356,6 +358,10 @@ fn import(
         Err(reply) => return Err(reply),
     };
 
+    if let Some(id) = item.replaces {
+        check_replaced(store.as_mut(), item, ids::split(id).1)?;
+    }
+
     let counter = counter_for(env);
     let never = || false;
     let mut embedder = embed::default_embedder(env);
@@ -388,6 +394,31 @@ fn import(
                 .reason
                 .unwrap_or_else(|| "the document could not be imported".to_owned()),
         )),
+    }
+}
+
+/// Refuses the approval unless the document `id` of `store` is still the one the proposal was made
+/// about (same text hash and key, see [`HeldItem::replaced`]). A document that was deleted, and
+/// another that took its number, is not replaced.
+fn check_replaced(store: &mut dyn KnowledgeStore, item: &HeldItem, id: i64) -> Result<(), Reply> {
+    let changed = || {
+        Reply::Refused(
+            Code::Refused,
+            "the document this proposal replaces changed or was deleted".to_owned(),
+        )
+    };
+
+    let found = store
+        .get(id, &Detail::default())
+        .map_err(|error| Reply::Failed(error.to_string()))?;
+
+    match (found, &item.replaced) {
+        (Some(found), Some(expected))
+            if found.doc.content_sha256 == expected.content_sha256 && found.doc.source_key == expected.source_key =>
+        {
+            Ok(())
+        }
+        _ => Err(changed()),
     }
 }
 

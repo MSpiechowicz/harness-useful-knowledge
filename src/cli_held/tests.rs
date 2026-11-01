@@ -43,6 +43,7 @@ impl World {
                 content: content.to_owned(),
                 links,
                 replaces,
+                replaced: replaces.and_then(|id| self.replaced(crate::store::routed::ids::split(id).1)),
             },
         );
 
@@ -250,7 +251,7 @@ fn an_approval_that_fails_puts_the_proposal_back() {
     let (code, message) = world.refused(&["approve", "--json", &id]);
 
     assert_eq!(code, Code::Refused);
-    assert!(message.contains("999"), "{message}");
+    assert!(message.contains("changed or was deleted"), "{message}");
     assert_eq!(
         world.done(&["list", "--json"])["held"][0]["heldId"],
         id,
@@ -481,39 +482,5 @@ fn an_approval_to_a_remote_that_cannot_be_reached_is_refused_and_recorded_like_a
             .join("remote-unreachable.json")
             .exists(),
         "the failure goes to the cooldown that every other command shares"
-    );
-}
-
-#[test]
-fn a_proposal_shows_the_document_it_replaces_as_clients_read_ids() {
-    use crate::store::routed::ids;
-
-    let held = |replaces| {
-        HeldItem::new(
-            Source {
-                client: "tests".to_owned(),
-                session: None,
-                project_path: None,
-                repo_key: None,
-            },
-            Proposal {
-                title: "T".to_owned(),
-                format: "markdown".to_owned(),
-                name: "t.md".to_owned(),
-                source_path: None,
-                content: "text".to_owned(),
-                links: Vec::new(),
-                replaces: Some(replaces),
-            },
-        )
-    };
-
-    assert_eq!(
-        super::public(&held(ids::tag(crate::config::Place::Remote, 12)))["replaces"],
-        serde_json::json!(12)
-    );
-    assert_eq!(
-        super::public(&held(ids::tag(crate::config::Place::Local, 12)))["replaces"],
-        serde_json::json!("local:12")
     );
 }

@@ -369,3 +369,18 @@ fn the_database_itself_refuses_an_embedding_of_the_wrong_size_or_without_a_model
     assert!(insert_chunk(Some(&[0; 1536]), Some("m")).is_ok());
     assert!(insert_chunk(None, None).is_ok());
 }
+
+#[test]
+fn the_number_of_a_deleted_document_is_never_given_to_another() {
+    let mut store = store();
+    let first = insert(&mut store, &Seed::new("First").chunk("Intro", "alpha"));
+    let last = insert(&mut store, &Seed::new("Second").chunk("Intro", "beta"));
+
+    assert_eq!(store.delete(&[last]).expect("delete"), 1);
+    let next = insert(&mut store, &Seed::new("Third").chunk("Intro", "gamma"));
+
+    assert!(
+        next > last,
+        "{next} follows {last}, which is not given again (first was {first})"
+    );
+}

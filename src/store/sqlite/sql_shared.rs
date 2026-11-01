@@ -25,7 +25,9 @@ pub(crate) fn check_settable(key: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The meta, documents and links tables of version 1 (see [`super::schema`] for what they hold).
+/// The meta, documents and links tables of version 1 (see [`super::schema`] for what they hold). A
+/// document's number is never given again (`AUTOINCREMENT`), so a number that a proposal or a link
+/// names cannot come to mean another document.
 macro_rules! tables {
     () => {
         "
@@ -35,7 +37,7 @@ CREATE TABLE knowledge_meta (
 ) WITHOUT ROWID;
 
 CREATE TABLE knowledge_documents (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     source_name TEXT NOT NULL,
     source_key TEXT NOT NULL,

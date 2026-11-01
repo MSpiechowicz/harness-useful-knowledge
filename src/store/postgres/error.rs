@@ -58,18 +58,21 @@ pub(super) fn unreachable(error: &postgres::Error) -> bool {
     false
 }
 
-/// How the driver words an error of its TLS kind (it keeps the kind private): what a server that
-/// answers the TLS request with "no TLS here" ends in, with a cause that has no type to look for.
+/// How the driver words an error of its TLS kind (it keeps the kind private). The driver files
+/// every failure of the handshake under it, a lost connection included.
 const TLS_KIND: &str = "error performing TLS handshake";
 
 /// Whether `error` is the TLS check refusing the server (a certificate, an alert, a server that does
-/// not speak TLS): an error of the driver's TLS kind, or rustls' error as one of its causes, directly or
-/// inside an I/O error.
+/// not speak TLS): rustls' error among its causes, directly or inside an I/O error, or an error of
+/// the driver's TLS kind that is not an I/O error at all (a server that answers the TLS request with
+/// "no TLS here"). An I/O error without rustls' error inside (a reset, "tls handshake eof") is a
+/// connection that was lost, so it is unreachable, as in [`unreachable`].
 pub(super) fn refused_by_tls(error: &postgres::Error) -> bool {
-    if error.as_db_error().is_none() && error.to_string().starts_with(TLS_KIND) {
-        return true;
+    if error.as_db_error().is_some() {
+        return false;
     }
 
+    let mut plain_tls_kind = error.to_string().starts_with(TLS_KIND);
     let mut cause = std::error::Error::source(error);
 
     while let Some(inner) = cause {
@@ -77,16 +80,18 @@ pub(super) fn refused_by_tls(error: &postgres::Error) -> bool {
             return true;
         }
 
-        if let Some(io) = inner.downcast_ref::<std::io::Error>()
-            && io.get_ref().is_some_and(|wrapped| wrapped.is::<rustls::Error>())
-        {
-            return true;
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            if io.get_ref().is_some_and(|wrapped| wrapped.is::<rustls::Error>()) {
+                return true;
+            }
+
+            plain_tls_kind = false;
         }
 
         cause = inner.source();
     }
 
-    false
+    plain_tls_kind
 }
 
 /// Whether the SQLSTATE `code` says the server could not be reached: the connection exceptions of

@@ -4,7 +4,8 @@
 //! The text is the agent's `content`, or the text of a file named by `path`, which must be inside
 //! the project, a regular file reached without a symbolic link and not hidden (no dot in the name of
 //! the file or of a folder on the way), at most [`CONTENT_MAX`] bytes of UTF-8. A text that holds a
-//! credential is refused. `replaces` is a document id as the tools show it (`12` or `local:12`).
+//! credential is refused. `replaces` is a document id as the tools show it (`12` or `local:12`) of a document
+//! that exists: the proposal keeps its text hash and key, and an approval replaces only that document.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -13,12 +14,14 @@ use serde::Deserialize;
 
 use super::scope::repository;
 use super::{CONTENT_MAX, Server};
+use crate::config::Layout;
 use crate::extract::{self, Format};
-use crate::held::{HeldItem, HoldError, Proposal, Source};
+use crate::held::{HeldItem, HoldError, Proposal, Replaced, Source};
 use crate::import::manifest::document_id;
 use crate::import::place::hold_replaces;
 use crate::project::ProjectKey;
-use crate::store::{Link, clean};
+use crate::store::routed::ids;
+use crate::store::{Detail, Link, clean};
 use crate::support::redact::has_credentials;
 
 #[derive(Deserialize)]
@@ -84,13 +87,15 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
 
     check_text(&content)?;
 
-    let Some(held) = &server.held else {
+    let Some(held) = server.held.clone() else {
         return Err("the review queue cannot be reached: the data folder is unknown".to_owned());
     };
 
     // The routing can change before the person approves, and the same number would then name a
-    // document in the other place: the proposal keeps the place it names now.
+    // document in the other place: the proposal keeps the place it names now, and the document as it is
+    // now, so a document that takes its number later is not replaced by mistake.
     let replaces = args.replaces.map(|id| hold_replaces(server.routing, id)).transpose()?;
+    let replaced = replaces.map(|id| replaced_document(server, id)).transpose()?;
 
     let item = HeldItem::new(
         Source {
@@ -110,6 +115,7 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
             content,
             links,
             replaces,
+            replaced,
         },
     );
 
@@ -121,6 +127,35 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
                 .to_owned(),
         ),
         Err(HoldError::Failed(reason)) => Err(format!("the proposal could not be held: {reason}")),
+    }
+}
+
+/// The document `held` names (an id from [`hold_replaces`], tagged with its place) as it is now, so
+/// the approval can tell it from another document that later takes the same number. A document that
+/// is not there is refused.
+fn replaced_document(server: &mut Server, held: i64) -> Result<Replaced, String> {
+    // One place in use is a store with plain ids, two are a routed store that reads the tag.
+    let id = if server.routing.layout() == Layout::Both {
+        held
+    } else {
+        ids::split(held).1
+    };
+
+    let read = match server.store()? {
+        Some(store) => store.get(id, &Detail::default()),
+        None => Ok(None),
+    };
+
+    match read {
+        Ok(Some(found)) => Ok(Replaced {
+            content_sha256: found.doc.content_sha256,
+            source_key: found.doc.source_key,
+        }),
+        Ok(None) => Err(format!(
+            "replaces names document {}, which does not exist",
+            ids::show(held)
+        )),
+        Err(error) => Err(server.failed(&error)),
     }
 }
 

@@ -161,6 +161,26 @@ fn nonsense_after_tls_request() -> u16 {
     port
 }
 
+/// A server that agrees to TLS (`S` to the SSL request) and closes the connection, as one that is
+/// restarting or reset does. The handshake is lost, the certificate was never refused.
+fn closing_after_tls_request() -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut request = [0_u8; 8];
+            let _ = stream.read_exact(&mut request);
+            let _ = stream.write_all(b"S");
+        }
+    });
+
+    port
+}
+
 #[test]
 fn a_postgres_server_whose_tls_is_refused_is_a_setting_to_fix_and_check_starts_no_cooldown() {
     let root = tempfile::tempdir().expect("temp dir");
@@ -192,4 +212,23 @@ fn a_postgres_server_whose_tls_is_refused_is_a_setting_to_fix_and_check_starts_n
 
     assert_eq!(code, Some(3), "{stdout}");
     assert!(cooldown.exists(), "a connection that does not work is recorded");
+}
+
+#[test]
+fn a_postgres_handshake_that_is_lost_is_unreachable_and_check_starts_the_cooldown() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let port = closing_after_tls_request();
+    let url = format!("postgres://someone@127.0.0.1:{port}/knowledge?sslmode=require&connect_timeout=3");
+    let cooldown = root.path().join("knowledge").join("remote-unreachable.json");
+
+    let (code, stdout, stderr) = run(root.path(), &url, "remote+local", &["check", "--json"]);
+    let checked: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("{stdout} {stderr}"));
+
+    assert_eq!(code, Some(3), "{stdout} {stderr}");
+    assert_eq!(checked["places"]["remote"]["problem"], "unreachable", "{stdout}");
+    assert!(
+        cooldown.exists(),
+        "a handshake that was cut off is an outage, not a refused certificate: {stdout}"
+    );
 }

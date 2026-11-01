@@ -144,7 +144,7 @@ fn an_upgrade_runs_in_its_own_open_that_the_probe_deadline_does_not_bound() {
         &OPENS,
         &UPGRADES,
         probe,
-        Duration::from_secs(10),
+        (Duration::from_secs(10), String::new()),
         needing_upgrade(probe * 10, &runs),
     );
 
@@ -164,7 +164,7 @@ fn a_database_that_is_still_being_upgraded_is_not_unreachable() {
         &OPENS,
         &UPGRADES,
         probe,
-        Duration::from_millis(100),
+        (Duration::from_millis(100), late_upgrade(&refusing(), UPGRADE_BOUND)),
         needing_upgrade(Duration::from_millis(600), &runs),
     ) else {
         panic!("a failure that says it is upgrading");
@@ -176,7 +176,7 @@ fn a_database_that_is_still_being_upgraded_is_not_unreachable() {
         &OPENS,
         &UPGRADES,
         probe,
-        Duration::from_millis(100),
+        (Duration::from_millis(100), late_upgrade(&refusing(), UPGRADE_BOUND)),
         needing_upgrade(Duration::from_millis(600), &runs),
     ) else {
         panic!("still upgrading");
@@ -190,23 +190,51 @@ fn a_database_that_is_still_being_upgraded_is_not_unreachable() {
 }
 
 #[test]
+fn an_upgrade_that_passes_its_bound_says_what_becomes_of_it_for_each_backend() {
+    let postgres = late_upgrade(&refusing(), UPGRADE_BOUND);
+    assert!(postgres.contains("longer than 10 minutes"), "{postgres}");
+    assert!(
+        postgres.contains("rolls it back when this process ends") && postgres.contains("long-running session"),
+        "{postgres}"
+    );
+    assert!(!postgres.contains("keeps going"), "{postgres}");
+
+    let mongodb = crate::config::backend_for(Some("mongodb://127.0.0.1:1/none".to_owned()), None).expect("backend");
+    let mongodb = late_upgrade(&mongodb, UPGRADE_BOUND);
+    assert!(mongodb.contains("keeps going on the next run"), "{mongodb}");
+    assert!(!mongodb.contains("rolls it back"), "{mongodb}");
+}
+
+#[test]
 fn a_database_that_needs_no_upgrade_opens_in_the_first_phase_and_a_silent_one_is_unreachable() {
     static OPENS: deadline::Slots = deadline::Slots::new(2);
     static UPGRADES: deadline::Slots = deadline::Slots::new(1);
 
     let probe = Duration::from_millis(40);
 
-    let ready = open_in_phases(&OPENS, &UPGRADES, probe, Duration::from_secs(1), |mode| {
-        assert_eq!(mode, Upgrade::Defer, "no upgrade is needed, so none runs");
+    let ready = open_in_phases(
+        &OPENS,
+        &UPGRADES,
+        probe,
+        (Duration::from_secs(1), String::new()),
+        |mode| {
+            assert_eq!(mode, Upgrade::Defer, "no upgrade is needed, so none runs");
 
-        Ok(Opened::Ready(None))
-    });
+            Ok(Opened::Ready(None))
+        },
+    );
     assert!(matches!(ready, Ok(None)));
 
-    let silent = open_in_phases(&OPENS, &UPGRADES, probe, Duration::from_secs(1), |_| {
-        std::thread::sleep(Duration::from_millis(400));
+    let silent = open_in_phases(
+        &OPENS,
+        &UPGRADES,
+        probe,
+        (Duration::from_secs(1), String::new()),
+        |_| {
+            std::thread::sleep(Duration::from_millis(400));
 
-        Ok(Opened::Ready(None))
-    });
+            Ok(Opened::Ready(None))
+        },
+    );
     assert!(matches!(silent, Err(OpenError::Unreachable(_))));
 }

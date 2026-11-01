@@ -49,6 +49,22 @@ fn team_a_migration_outlasts_the_statement_timeout_of_the_session() {
 }
 
 #[test]
+fn team_a_migration_lifts_the_statement_timeout_but_keeps_a_finite_idle_limit() {
+    let Some(db) = database() else { return };
+    drop(db.open());
+
+    // The step fails the migration unless the limits are as intended while it runs.
+    let check = "DO $$ BEGIN \
+        IF current_setting('statement_timeout') <> '0' THEN RAISE EXCEPTION 'statement limit'; END IF; \
+        IF current_setting('idle_in_transaction_session_timeout') <> '1min' THEN RAISE EXCEPTION 'idle limit'; END IF; \
+        END $$";
+    let mut session = db.admin();
+    let state = schema::migrate_with(&mut session, &steps(check)).expect("the limits are as intended");
+
+    assert_eq!(state, SchemaState::Current);
+}
+
+#[test]
 fn team_a_migration_waits_for_running_writes_longer_than_the_lock_timeout_of_the_session() {
     let Some(db) = database() else { return };
     drop(db.open());
