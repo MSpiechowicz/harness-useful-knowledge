@@ -203,3 +203,36 @@ fn a_proposal_over_the_file_limit_is_refused() {
     assert_eq!(store.hold(proposal("Big", &big)), Err(HoldError::Limit));
     assert_eq!(store.list(), Ok(Vec::new()));
 }
+
+#[test]
+fn a_claim_left_behind_by_a_dead_process_is_put_back_after_ten_minutes() {
+    let (_dir, store) = store();
+    let id = store.hold(proposal("Guide", "text")).expect("held");
+
+    // The claimer dies: the claim is neither finished nor restored.
+    let claim = store.claim(&id).expect("claim").expect("waiting");
+    drop(claim);
+    assert_eq!(store.list(), Ok(Vec::new()), "a fresh claim hides the proposal");
+
+    let aside: Vec<_> = std::fs::read_dir(store.folder())
+        .expect("folder")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".held-"))
+        .collect();
+    assert_eq!(aside.len(), 1);
+
+    let old = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(aside[0].path())
+        .expect("open")
+        .set_modified(old)
+        .expect("mtime");
+
+    let items = store.list().expect("list");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].held_id, id);
+    assert!(path_of(&store, &id).is_file());
+    assert!(store.claim(&id).expect("claim").is_some(), "it can be decided again");
+}

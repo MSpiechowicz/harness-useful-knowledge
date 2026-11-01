@@ -237,16 +237,21 @@ fn check_text(content: &str) -> Result<(), String> {
 
 /// The canonical root a `path` must stay inside: the repository root, else the project folder.
 fn project_root(server: &mut Server, project_path: Option<&str>, repo: Option<&ProjectKey>) -> Result<PathBuf, String> {
-    if let Some(repo) = repo.filter(|repo| !repo.is_every()) {
-        return Ok(repo.root.clone());
-    }
+    let root = match repo.filter(|repo| !repo.is_every()) {
+        Some(repo) => repo.root.clone(),
+        None => {
+            let Some(folder) = project_path.map(str::trim).filter(|folder| !folder.is_empty()) else {
+                return Err("path needs project_path, the folder it is inside".to_owned());
+            };
 
-    let Some(folder) = project_path.map(str::trim).filter(|folder| !folder.is_empty()) else {
-        return Err("path needs project_path, the folder it is inside".to_owned());
+            crate::support::paths::validate_project_dir(&server.env, Path::new(folder))
+                .map_err(|_| "project_path must be an existing folder that is not a filesystem root".to_owned())?
+        }
     };
 
-    crate::support::paths::validate_project_dir(&server.env, Path::new(folder))
-        .map_err(|_| "project_path must be an existing folder that is not a filesystem root".to_owned())
+    super::folder::check(&server.env, &root)?;
+
+    Ok(root)
 }
 
 /// The text of the file `path` inside `root`, with the path as shown (relative to `root`) and the

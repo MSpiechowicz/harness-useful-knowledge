@@ -348,3 +348,29 @@ fn team_a_vector_search_returns_at_most_the_candidate_cap_closest_first() {
     assert!(hits.windows(2).all(|pair| pair[0].score >= pair[1].score));
     assert!((hits[0].score - 1.0).abs() < 1e-5);
 }
+
+#[test]
+fn team_a_small_repository_is_found_behind_a_crowd_of_nearer_chunks_of_another() {
+    let Some(server) = server() else { return };
+    let mut store = server.store();
+
+    // 250 chunks of repository B sit nearer to the query than the one chunk of repository A, so the
+    // first window of 200 holds nothing A can see.
+    for n in 0..250_u32 {
+        let seed = Seed::new(&format!("Crowd {n}"))
+            .embedded("Intro", &format!("crowd text {n}"), angled(n as f32 * 0.1))
+            .link(B, &[]);
+        insert(&mut store, &seed);
+    }
+
+    insert(
+        &mut store,
+        &Seed::new("Only A")
+            .embedded("Intro", "the one chunk of A", angled(40.0))
+            .link(A, &[]),
+    );
+
+    let hits = store.vector_top_k(&axis(0), &from(A), 5).expect("vector");
+
+    assert_eq!(titles(&hits), ["Only A"]);
+}

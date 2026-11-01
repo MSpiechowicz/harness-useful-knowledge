@@ -31,6 +31,7 @@ impl World {
         let dir = tempfile::tempdir().expect("temp dir");
         let home = dunce::canonicalize(dir.path()).expect("home");
         std::fs::create_dir(home.join("proj")).expect("project folder");
+        std::fs::write(home.join("proj").join("package.json"), "{}").expect("project file");
 
         let mut env = Env::for_tests(&home).with_var(DIR_VAR, home.join("knowledge").to_string_lossy());
 

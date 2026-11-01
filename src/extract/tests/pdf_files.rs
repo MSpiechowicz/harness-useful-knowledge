@@ -129,6 +129,14 @@ mod process {
 
     use super::super::pdf::{PdfPages, WorkerProcess};
 
+    /// Scripts are written and run one test at a time: a script that a parallel test's fork still
+    /// holds open for writing cannot be executed ("Text file busy").
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A shell script standing in for the worker: `sh script.sh extract-worker FILE`.
     fn script(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -141,6 +149,7 @@ mod process {
 
     #[test]
     fn a_worker_that_outlives_its_deadline_is_killed() {
+        let _serial = serial();
         let dir = tempfile::tempdir().expect("temp dir");
         let worker = WorkerProcess::new(script(dir.path(), "sleep 30"), Duration::from_millis(300));
         let started = Instant::now();
@@ -153,6 +162,7 @@ mod process {
 
     #[test]
     fn a_worker_that_crashes_fails_the_file() {
+        let _serial = serial();
         let dir = tempfile::tempdir().expect("temp dir");
         let worker = WorkerProcess::new(script(dir.path(), "exit 101"), Duration::from_secs(10));
 
@@ -163,7 +173,44 @@ mod process {
     }
 
     #[test]
+    fn a_worker_stopped_by_its_memory_or_cpu_limit_fails_the_file_as_too_large() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        for signal in ["ABRT", "XCPU", "KILL"] {
+            let worker = WorkerProcess::new(
+                script(dir.path(), &format!("kill -{signal} $$")),
+                Duration::from_secs(10),
+            );
+
+            assert_eq!(
+                worker.pages(Path::new("/x.pdf")).expect_err("stopped"),
+                "the PDF is too large to read",
+                "{signal}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_worker_starts_with_an_empty_environment() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let worker = WorkerProcess::new(
+            script(
+                dir.path(),
+                "echo \"{\\\"error\\\":\\\"home=[$HOME] db=[$HARNESS_KNOWLEDGE_DATABASE_URL]\\\"}\"",
+            ),
+            Duration::from_secs(10),
+        );
+
+        // The test process has a HOME: the worker has none.
+        assert!(std::env::var_os("HOME").is_some());
+        assert_eq!(worker.pages(Path::new("/x.pdf")), Err("home=[] db=[]".to_owned()));
+    }
+
+    #[test]
     fn a_worker_reply_is_read_from_stdout() {
+        let _serial = serial();
         let dir = tempfile::tempdir().expect("temp dir");
         let worker = WorkerProcess::new(
             script(dir.path(), "echo '{\"pages\":[\"one\",\"two\"]}'"),

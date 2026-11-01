@@ -307,3 +307,50 @@ fn proposing_the_same_document_again_is_the_same_proposal() {
     assert_eq!(first, again);
     assert_eq!(world.held_files().len(), 1);
 }
+
+#[test]
+fn only_a_project_folder_is_read_from_never_the_home_folder_or_a_folder_without_project_files() {
+    let mut world = World::new();
+    let keys = world.home().join("keys");
+    std::fs::create_dir(&keys).expect("folder");
+    std::fs::write(keys.join("id_rsa"), "not a credential, just text").expect("write");
+    std::fs::write(world.home().join("diary.txt"), "private words").expect("write");
+
+    for (folder, path) in [
+        (world.home(), "diary.txt"),
+        (keys.clone(), "id_rsa"),
+        (std::path::PathBuf::from("/etc"), "hostname"),
+    ] {
+        let refused = world.err(
+            "knowledge_add",
+            json!({ "title": "x", "path": path, "project_path": folder.to_string_lossy() }),
+        );
+
+        assert!(refused.contains("root of a project"), "{folder:?}: {refused}");
+    }
+
+    assert!(world.held_files().is_empty());
+
+    // A folder with a project file is one.
+    std::fs::write(keys.join("Makefile"), "all:").expect("marker");
+    world.ok(
+        "knowledge_add",
+        json!({ "title": "x", "path": "id_rsa", "project_path": keys.to_string_lossy() }),
+    );
+}
+
+#[test]
+fn the_clients_name_is_one_visible_line() {
+    let mut world = World::new();
+    world.server.handle(json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": { "clientInfo": { "name": "co\u{202e}de\nx\u{7}" } }
+    }));
+
+    world.ok(
+        "knowledge_add",
+        json!({ "title": "Notes", "content": "some text", "project_path": project_arg(&world) }),
+    );
+
+    assert_eq!(held_item(&world)["client"], "code x");
+}

@@ -106,6 +106,14 @@ pub(super) fn keyword_top_k(
     client.query(&sql, &params).map_err(backend)?.iter().map(hit).collect()
 }
 
+/// The pgvector version, or the missing capability `search` answers with exit 3.
+fn require_pgvector(pgvector: Option<Version>) -> Result<Version, StoreError> {
+    pgvector.ok_or_else(|| StoreError::Missing {
+        code: Problem::NoPgvector.code(),
+        message: Problem::NoPgvector.message(),
+    })
+}
+
 pub(super) fn vector_top_k(
     client: &mut Client,
     pgvector: Option<Version>,
@@ -117,9 +125,7 @@ pub(super) fn vector_top_k(
         return Err(StoreError::Invalid(format!("a query vector is {DIMS} finite numbers")));
     }
 
-    let Some(pgvector) = pgvector else {
-        return Err(StoreError::Backend(Problem::NoPgvector.message()));
-    };
+    let pgvector = require_pgvector(pgvector)?;
 
     let (all, repo) = bindings(scope);
     let model = meta::get(client, "model_id")?;
@@ -228,6 +234,22 @@ mod tests {
         let query = tsquery(&text.join(" ")).expect("query");
 
         assert_eq!(query.matches(" | ").count(), QUERY_TOKENS_MAX - 1);
+    }
+
+    #[test]
+    fn a_database_without_pgvector_is_a_missing_capability_not_a_failure() {
+        match require_pgvector(None) {
+            Err(StoreError::Missing { code, message }) => {
+                assert_eq!(code, "no-pgvector");
+                assert!(message.contains("pgvector"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert_eq!(
+            require_pgvector(Some(Version(0, 8, 7))).expect("present"),
+            Version(0, 8, 7)
+        );
     }
 
     #[test]

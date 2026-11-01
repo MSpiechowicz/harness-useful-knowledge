@@ -25,7 +25,9 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// - `knowledge_chunks.embedding` is an `F32_BLOB(384)` (the server refuses another size) that is
 ///   NULL exactly when `model_id` is, and
 /// - `knowledge_chunks_vec` is the vector index: cosine, so `vector_top_k` returns the chunks
-///   closest in angle, which for the L2-normalised vectors stored is the dot product.
+///   closest in angle, which for the L2-normalised vectors stored is the dot product. Its
+///   `search_l=3200` is how many chunks one `vector_top_k` can return (200 by default, whatever `k`
+///   is), which a search narrowed to a small repository needs (see [`super::search`]).
 const V1: &str = concat!(
     tables!(),
     "
@@ -46,7 +48,7 @@ CREATE TABLE knowledge_chunks (
     CHECK ((embedding IS NULL) = (model_id IS NULL))
 );
 CREATE INDEX knowledge_chunks_sha ON knowledge_chunks (chunk_sha, model_id);
-CREATE INDEX knowledge_chunks_vec ON knowledge_chunks (libsql_vector_idx(embedding, 'metric=cosine'));
+CREATE INDEX knowledge_chunks_vec ON knowledge_chunks (libsql_vector_idx(embedding, 'metric=cosine', 'search_l=3200'));
 ",
     keyword_index!(),
     "

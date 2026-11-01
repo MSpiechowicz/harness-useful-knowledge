@@ -195,3 +195,4 @@ fn the_confluence_index_page_is_skipped() {
 
 mod formats;
 mod pdf_files;
+mod subtitles;

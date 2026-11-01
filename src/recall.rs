@@ -51,12 +51,14 @@ const HEADER: &str =
 /// `harness-knowledge recall --hook [--project PATH]`: always exit 0.
 pub fn recall(args: &[Option<&str>]) -> ExitCode {
     // A panic must not become a failing hook.
-    let _ = std::panic::catch_unwind(|| run(args));
+    let _ = std::panic::catch_unwind(|| run(args, Box::new(std::io::stdin()), DEADLINE, &mut std::io::stdout()));
 
     ExitCode::SUCCESS
 }
 
-fn run(args: &[Option<&str>]) {
+/// Reads the prompt from `input` and prints the block, all within `deadline`: a parent that keeps
+/// standard input open and silent costs the deadline, not the prompt it decorates.
+fn run(args: &[Option<&str>], mut input: Box<dyn Read + Send>, deadline: Duration, out: &mut dyn std::io::Write) {
     let Some(parsed) = Args::parse(args, &["--hook"], &["--project"]) else {
         return;
     };
@@ -72,31 +74,25 @@ fn run(args: &[Option<&str>]) {
         .map(|project| project.trim().to_owned())
         .filter(|project| !project.is_empty());
 
-    let Some(prompt) = read_prompt(&mut std::io::stdin().lock()) else {
-        return;
+    let work = move || {
+        let prompt = read_prompt(&mut input)?;
+        let env = Env::from_process().ok()?;
+        let selection = config::select(&env).ok()?;
+        let root = crate::embed::data_folder(&env)?;
+
+        pointers(
+            &prompt,
+            Setup {
+                embedder: Box::new(SocketEmbedder::new(&root)),
+                env,
+                backend: selection.backend,
+                project,
+            },
+        )
     };
 
-    let Ok(env) = Env::from_process() else {
-        return;
-    };
-    let Ok(selection) = config::select(&env) else {
-        return;
-    };
-    let Some(root) = crate::embed::data_folder(&env) else {
-        return;
-    };
-
-    let setup = Setup {
-        embedder: Box::new(SocketEmbedder::new(&root)),
-        env,
-        backend: selection.backend,
-        project,
-    };
-
-    if let Some(block) = within(DEADLINE, move || pointers(&prompt, setup)).flatten() {
-        use std::io::Write;
-
-        let _ = writeln!(std::io::stdout().lock(), "{block}");
+    if let Some(block) = within(deadline, work).flatten() {
+        let _ = writeln!(out, "{block}");
     }
 }
 

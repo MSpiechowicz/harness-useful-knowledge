@@ -54,6 +54,8 @@ pulldown-cmark = { version = "0.13.6", default-features = false }
 html5ever = "0.39.0"
 saphyr = { version = "0.3.3", default-features = false }
 pdf-extract = "0.12.1"
+# The PDF worker listens to the reader's log for a refused allocation.
+log = "0.4"
 unicode-normalization = "0.1.25"
 # SIGTERM, SIGHUP and Ctrl-C cancel an import between two documents.
 ctrlc = { version = "3.5.2", features = ["termination"] }
@@ -66,9 +68,10 @@ interprocess = "2.4.6"
 # unload gives it back.
 mimalloc = "0.1"
 
-# Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
+# Kills a timed-out git together with its process group (`killpg`), tells the user a file belongs to,
+# and limits the memory and CPU time of the PDF worker (`resource`).
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user", "resource"] }
 
 # The security descriptor string and the secret name of the embedder's named pipe (see `src/embed/pipe.rs`).
 [target.'cfg(windows)'.dependencies]
@@ -77,6 +80,8 @@ getrandom = "0.4.3"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+# Compresses the decompression bomb the PDF worker's limits are tested with (already built for lopdf).
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 
 [lints.rust]
 unsafe_code = "forbid"

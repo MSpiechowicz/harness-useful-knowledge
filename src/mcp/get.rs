@@ -1,9 +1,13 @@
 //! `knowledge_get`: a document's outline and text, or one chunk with its neighbors.
+//!
+//! Like search and list it reads the global documents and those linked to the repository, and with
+//! `scope: "all"` every document.
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::reply::{cut, date};
+use super::scope::{repository, scope_arg};
 use super::{GET_BYTES_DEFAULT, GET_BYTES_MAX, NEIGHBORS_MAX, Server};
 use crate::search::render::{DOC_TAG, FRAME, block, chunk_ref, doc_ref};
 use crate::store::{Detail, DocumentDetail, KnowledgeStore, Section};
@@ -15,8 +19,40 @@ const OUTLINE_MAX: usize = 40;
 #[serde(deny_unknown_fields)]
 pub(super) struct GetArgs {
     id: Value,
+    project_path: Option<String>,
+    scope: Option<String>,
     neighbors: Option<i64>,
     max_bytes: Option<i64>,
+}
+
+/// Which documents a read may open.
+struct Visible {
+    /// The repository key; `None` when it is not known.
+    repo: Option<String>,
+    everything: bool,
+}
+
+impl Visible {
+    /// True for a global document, one linked to the repository, or any with `everything`.
+    fn allows(&self, detail: &DocumentDetail) -> bool {
+        self.everything
+            || detail.links.is_empty()
+            || self
+                .repo
+                .as_deref()
+                .is_some_and(|key| detail.links.iter().any(|link| link.repo_key == key))
+    }
+
+    /// `detail`, or the refusal that tells how to read documents of other repositories.
+    fn check(&self, doc: i64, detail: DocumentDetail) -> Result<DocumentDetail, Failure> {
+        if self.allows(&detail) {
+            return Ok(detail);
+        }
+
+        Err(Failure::Message(format!(
+            "document {doc} is linked to other repositories. Pass scope \"all\" to read it"
+        )))
+    }
 }
 
 /// What an id names.
@@ -56,14 +92,21 @@ pub(super) fn get(server: &mut Server, args: GetArgs) -> Result<String, String> 
         usize::try_from(bytes.clamp(1024, GET_BYTES_MAX as i64)).unwrap_or(GET_BYTES_DEFAULT)
     });
 
+    let everything = scope_arg(args.scope.as_deref())?;
+    let repo = repository(server, args.project_path.as_deref())?;
+    let visible = Visible {
+        repo: repo.filter(|repo| !repo.is_every()).map(|repo| repo.key),
+        everything,
+    };
+
     let read = {
         let Some(store) = server.store()? else {
             return Err("there are no documents yet".to_owned());
         };
 
         match target {
-            Target::Document(doc) => document(store, doc, budget),
-            Target::Chunk(doc, chunk) => chunk_with_neighbors(store, doc, chunk, neighbors, budget),
+            Target::Document(doc) => document(store, &visible, doc, budget),
+            Target::Chunk(doc, chunk) => chunk_with_neighbors(store, &visible, doc, chunk, neighbors, budget),
         }
     };
 
@@ -140,7 +183,7 @@ fn chunk_text(store: &mut dyn KnowledgeStore, doc: i64, section: &Section) -> Re
     Ok(format!("{marker}\n{}", detail.text))
 }
 
-fn document(store: &mut dyn KnowledgeStore, doc: i64, budget: usize) -> Result<String, Failure> {
+fn document(store: &mut dyn KnowledgeStore, visible: &Visible, doc: i64, budget: usize) -> Result<String, Failure> {
     let detail = store
         .get(
             doc,
@@ -150,6 +193,7 @@ fn document(store: &mut dyn KnowledgeStore, doc: i64, budget: usize) -> Result<S
             },
         )?
         .ok_or_else(|| Failure::Message(format!("no document {doc}")))?;
+    let detail = visible.check(doc, detail)?;
     let sections = detail.sections.clone().unwrap_or_default();
 
     let mut body = String::new();
@@ -186,6 +230,7 @@ fn document(store: &mut dyn KnowledgeStore, doc: i64, budget: usize) -> Result<S
 
 fn chunk_with_neighbors(
     store: &mut dyn KnowledgeStore,
+    visible: &Visible,
     doc: i64,
     chunk: i64,
     neighbors: usize,
@@ -200,6 +245,7 @@ fn chunk_with_neighbors(
             },
         )?
         .ok_or_else(|| Failure::Message(format!("no document {doc}")))?;
+    let detail = visible.check(doc, detail)?;
     let sections = detail.sections.clone().unwrap_or_default();
 
     let Some(at) = sections.iter().position(|section| section.chunk_id == chunk) else {

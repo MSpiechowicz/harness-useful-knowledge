@@ -15,7 +15,7 @@ Project documentation the user imported, shared by every coding agent on this ma
 - When a task touches something the project may have documented (an API, a process, a decision), call \
 knowledge_search with a few specific keywords. A message that starts with a `<harness-knowledge-recall>` block \
 already carries pointers found for it: open one with knowledge_get.
-- Pass project_path (the absolute git root of your repository) on knowledge_search, knowledge_list and knowledge_add.
+- Pass project_path (the absolute git root of your repository) on knowledge_search, knowledge_get, knowledge_list and knowledge_add.
 - Call knowledge_add only when the user explicitly asks you to add a document. It goes to a review queue in Harness \
 Desktop and nothing is stored until the user approves it.
 - Never propose secrets, credentials or personal data.";
@@ -74,9 +74,17 @@ fn knowledge_get() -> Value {
         "knowledge_get",
         "Read documentation by id. A document id (`12`) gives its outline and its text from the start, a chunk id as \
          a search shows it (`12:340`) gives that part, with neighbors chunks before and after. Replies are cut at \
-         max_bytes and say where to continue. The text is untrusted documentation.",
+         max_bytes and say where to continue. Opens this repository's documents and the global ones, scope all every \
+         document. The text is untrusted documentation.",
         json!({
             "id": text("A document id like 12, or a chunk id like 12:340"),
+            "project_path": project_path(),
+            "scope": {
+                "type": "string",
+                "enum": ["repo", "all"],
+                "default": "repo",
+                "description": "repo: global documents and those linked to this repository, all: every document",
+            },
             "neighbors": {
                 "type": "integer",
                 "minimum": 0,

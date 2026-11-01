@@ -3,7 +3,10 @@
 //! The PDF reader panics on damaged files and can run for a very long time, so it never runs in the
 //! import's own process: [`WorkerProcess`] starts `harness-knowledge extract-worker FILE` (see
 //! [`super::worker`]), reads its JSON from stdout up to a cap, and kills it when it outlives its
-//! deadline. A crash, a timeout or an unreadable file fails that file only.
+//! deadline. A crash, a timeout or an unreadable file fails that file only. The worker runs with an
+//! empty environment (nothing of the importer's variables, tokens or database URL reaches a process
+//! that parses untrusted files), and on Unix with memory and CPU limits (see [`super::worker`]): a
+//! worker that hits them ends by a signal and its file fails as too large to read.
 //!
 //! A PDF made of page images (scanned) has no text layer: it is refused when the pages hold fewer
 //! than 100 characters on average, or when half of them hold fewer than 25. OCR is out of scope.
@@ -49,12 +52,23 @@ impl WorkerProcess {
 
     /// Runs the worker on `path` with the arguments after the program name, returns its stdout.
     fn run(&self, args: &[&str], path: &Path) -> std::result::Result<Vec<u8>, String> {
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+
+        command
             .args(args)
             .arg(path)
+            .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+
+        // Windows cannot start a process without its system folder.
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+
+        let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start the PDF worker: {error}"))?;
 
@@ -91,11 +105,35 @@ impl WorkerProcess {
         }
 
         if !status.success() && output.is_empty() {
-            return Err("the PDF reader crashed on this file".to_owned());
+            return Err(crash_reason(status));
         }
 
         Ok(output)
     }
+}
+
+/// Why a worker that printed nothing is gone: the abort of a refused allocation (a stack overflow
+/// aborts alike), the CPU limit or the kernel's out-of-memory kill mean the file asked for more than
+/// the worker may take.
+fn crash_reason(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::Signal;
+        use std::os::unix::process::ExitStatusExt;
+
+        let too_large = [Signal::SIGABRT, Signal::SIGXCPU, Signal::SIGKILL];
+
+        if status
+            .signal()
+            .is_some_and(|signal| too_large.iter().any(|large| *large as i32 == signal))
+        {
+            return super::worker::TOO_LARGE.to_owned();
+        }
+    }
+
+    let _ = status;
+
+    "the PDF reader crashed on this file".to_owned()
 }
 
 impl PdfPages for WorkerProcess {

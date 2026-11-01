@@ -289,3 +289,30 @@ fn work_that_outlasts_the_deadline_is_given_up_on() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(within(Duration::from_secs(5), || 7), Some(7));
 }
+
+/// A standard input that never delivers a byte, like a parent that keeps the pipe open.
+struct Silent;
+
+impl Read for Silent {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(Duration::from_secs(30));
+
+        Ok(0)
+    }
+}
+
+#[test]
+fn a_standard_input_that_stays_silent_costs_the_deadline_and_prints_nothing() {
+    let mut printed: Vec<u8> = Vec::new();
+    let started = Instant::now();
+
+    run(
+        &[Some("--hook")],
+        Box::new(Silent),
+        Duration::from_millis(150),
+        &mut printed,
+    );
+
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(printed.is_empty());
+}

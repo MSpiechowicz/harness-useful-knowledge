@@ -305,7 +305,7 @@ fn the_dedupe_matrix_unchanged_updated_with_reuse_and_added() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
     let path = write(root, "guide.md", &guide("The middle explains the flow."));
-    let source_key = format!("{}/guide.md", root.file_name().expect("name").to_string_lossy());
+    let source_key = format!("global/{}/guide.md", root.file_name().expect("name").to_string_lossy());
     let mut db = store();
     let mut embedder = Fake::new();
 
@@ -436,5 +436,34 @@ fn a_failing_embedder_leaves_the_chunks_pending_and_is_not_asked_again() {
     assert_eq!(db.stats().expect("stats").chunks, 6);
 }
 
+#[test]
+fn a_subtitle_file_in_a_folder_is_imported_as_a_transcript_with_a_section_per_stretch() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("talks");
+    write(&root, "review.vtt", include_str!("../../extract/fixtures/talk.vtt"));
+    write(&root, "call.srt", include_str!("../../extract/fixtures/talk.srt"));
+    let mut db = store();
+
+    let events = run_import(&mut db, &manifest(&[], &[&root]), None, &never);
+
+    assert_eq!(
+        statuses(&events),
+        pairs(&[("call.srt", "added"), ("review.vtt", "added")])
+    );
+
+    let rows = all_documents(&mut db);
+
+    assert!(rows.iter().all(|row| row.doc.format == "transcript"), "{rows:?}");
+    assert_eq!(
+        db.get(rows[0].doc.id, &Detail::default())
+            .expect("get")
+            .expect("stored")
+            .doc
+            .title,
+        "call"
+    );
+}
+
 mod flow;
+mod keys;
 mod reindex;

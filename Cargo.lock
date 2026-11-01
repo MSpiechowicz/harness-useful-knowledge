@@ -1157,10 +1157,12 @@ version = "1.0.0"
 dependencies = [
  "ctrlc",
  "dunce",
+ "flate2",
  "getrandom 0.4.3",
  "globset",
  "html5ever",
  "interprocess",
+ "log",
  "mimalloc",
  "mongodb",
  "nix",

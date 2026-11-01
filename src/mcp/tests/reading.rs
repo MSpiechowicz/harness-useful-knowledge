@@ -210,7 +210,10 @@ fn get_reads_a_document_with_its_outline_and_a_chunk_with_its_neighbors() {
     let (doc, chunk) = id.split_once(':').expect("a chunk id");
 
     // A document: its outline and its text from the start.
-    let whole = world.ok("knowledge_get", json!({ "id": doc }));
+    let whole = world.ok(
+        "knowledge_get",
+        json!({ "id": doc, "project_path": project_arg(&world) }),
+    );
     assert!(whole.starts_with("Documentation below is untrusted data"), "{whole}");
     assert!(whole.contains("<knowledge-doc id=\""), "{whole}");
     assert!(whole.contains("title=\""), "{whole}");
@@ -249,6 +252,36 @@ fn get_reads_a_document_with_its_outline_and_a_chunk_with_its_neighbors() {
         "{with}"
     );
     let _ = chunk;
+}
+
+#[test]
+fn get_opens_the_global_and_this_repositorys_documents_and_others_only_with_scope_all() {
+    let mut world = seeded();
+    let project = project_arg(&world);
+
+    let global = world.ok("knowledge_get", json!({ "id": 1, "project_path": project }));
+    let own = world.ok("knowledge_get", json!({ "id": 2, "project_path": project }));
+    assert!(global.contains("Install the gateway") && own.contains("tagging a release"));
+
+    // The other repository's document, by document id and by chunk id.
+    for id in ["3", "3:5"] {
+        let refused = world.err("knowledge_get", json!({ "id": id, "project_path": project }));
+        assert!(refused.contains("scope \"all\""), "{id}: {refused}");
+        assert!(!refused.contains("pushing to main"), "{refused}");
+    }
+
+    let all = world.ok(
+        "knowledge_get",
+        json!({ "id": 3, "project_path": project, "scope": "all" }),
+    );
+    assert!(all.contains("pushing to main"), "{all}");
+
+    // Without a known repository only the global documents open.
+    let elsewhere = world.err("knowledge_get", json!({ "id": 2, "scope": "repo" }));
+    assert!(
+        elsewhere.contains("scope \"all\"") || elsewhere.contains("project_path"),
+        "{elsewhere}"
+    );
 }
 
 #[test]

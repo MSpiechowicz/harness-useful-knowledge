@@ -1,8 +1,9 @@
 //! YAML as JSON values, for the OpenAPI extractor.
 //!
-//! `saphyr` does not expand aliases, so an alias bomb costs nothing here: an alias becomes `null`
-//! (an OpenAPI description uses `$ref`, not YAML anchors, to share a schema). The parser runs
-//! behind `catch_unwind`, so a parser bug fails the file and not the import.
+//! `saphyr` expands aliases while it loads, within a budget of 100 000 nodes: a file that needs more
+//! (a billion-laughs alias bomb) is refused with an error before it takes memory or time. An alias
+//! left in the tree (`Yaml::Alias`) becomes `null`. The parser runs behind `catch_unwind`, so a
+//! parser bug fails the file and not the import.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -71,5 +72,41 @@ fn key_text(key: &Yaml) -> String {
         Yaml::Value(Scalar::Null) => "null".to_owned(),
         Yaml::Representation(text, _, _) => text.to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `levels` lists of `width` references each to the list before, the classic billion laughs.
+    fn laughs(levels: usize, width: usize) -> String {
+        let mut text = String::from("l0: &l0 [\"lol\"]\n");
+
+        for level in 1..=levels {
+            let refs = vec![format!("*l{}", level - 1); width].join(", ");
+            text.push_str(&format!("l{level}: &l{level} [{refs}]\n"));
+        }
+
+        text
+    }
+
+    #[test]
+    fn a_billion_laughs_file_is_refused_by_the_node_budget_and_quickly() {
+        // 10^9 nodes if expanded.
+        let started = std::time::Instant::now();
+        let error = parse(&laughs(9, 10)).expect_err("refused");
+
+        assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+        assert!(error.starts_with("the YAML is invalid"), "{error}");
+        assert!(error.contains("budget"), "{error}");
+    }
+
+    #[test]
+    fn a_few_aliases_are_expanded() {
+        let value = parse("a: &x [1, 2]\nb: *x\n").expect("parses");
+
+        assert_eq!(value["b"], value["a"]);
+        assert_eq!(value["b"].as_array().map(Vec::len), Some(2));
     }
 }

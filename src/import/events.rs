@@ -4,7 +4,8 @@
 //! - `{"type":"plan","total":N}` first: how many files the import will look at.
 //! - `{"type":"file","path","status","reason"?,"docId"?,"chunks"?,"embedding"?,"warnings"?}` after each
 //!   file. `status` is `added`, `updated`, `unchanged`, `skipped` or `failed`, and `reason` says why
-//!   for the last two. `embedding` is `done` or `pending` (no embedder was available, so the chunks
+//!   for the last two (and for an `updated` that replaced a document of the same name from another
+//!   repository). `embedding` is `done` or `pending` (no embedder was available, so the chunks
 //!   wait for `docs reindex`).
 //! - `{"type":"progress","done":N,"total":N}` after each file.
 //! - `{"type":"done","counts":{...},"cancelled":bool,"counter":"tokenizer"|"approximate",

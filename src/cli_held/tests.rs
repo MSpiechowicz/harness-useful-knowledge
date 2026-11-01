@@ -202,7 +202,7 @@ fn approving_text_that_is_already_imported_is_unchanged_and_adds_the_links() {
         .as_i64()
         .expect("doc");
 
-    let again = world.propose("Another title", TEXT, vec![link("git:github.com/o/r")], None);
+    let again = world.propose("Gateway runbook", TEXT, vec![link("git:github.com/o/r")], None);
     let approved = world.done(&["approve", "--json", &again]);
 
     assert_eq!(approved["approved"]["status"], "unchanged");
@@ -353,3 +353,5 @@ fn bad_arguments_are_usage_errors() {
         assert_eq!(world.run(args), Reply::Usage, "{args:?}");
     }
 }
+
+mod keys;

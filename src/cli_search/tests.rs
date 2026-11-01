@@ -256,3 +256,19 @@ fn bad_arguments_are_usage_errors_and_a_bad_project_fails() {
         .expect_err("fails");
     assert!(matches!(failure, Failure::Failed(message) if message.contains("--project")));
 }
+
+#[test]
+fn a_store_that_lacks_a_capability_ends_the_search_with_exit_three() {
+    let missing = StoreError::Missing {
+        code: "no-pgvector",
+        message: "the pgvector extension is not installed".to_owned(),
+    };
+
+    assert_eq!(
+        Failure::from(missing),
+        Failure::Missing {
+            code: "no-pgvector",
+            message: "the pgvector extension is not installed".to_owned()
+        }
+    );
+}

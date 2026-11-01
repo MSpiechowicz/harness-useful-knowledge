@@ -15,7 +15,7 @@ Reference: `harness-useful-memory` v2.11.0. Follow-ups: #48 (`harness-code`), #4
   - libSQL: `F32_BLOB`, `vector_top_k` and FTS5.
   - DocumentDB is later.
   - Vectors and the keyword index live in the database. `check` reports missing capabilities.
-- **Formats:** Markdown, text, HTML/Confluence export, OpenAPI JSON/YAML, AsciiDoc, RST, PDF (pdf-extract in an isolated worker process; scanned PDFs refused). Files only.
+- **Formats:** Markdown, text, HTML/Confluence export, OpenAPI JSON/YAML, AsciiDoc, RST, WebVTT/SRT transcripts (`transcript`, one section per 2–3 minutes headed by its time span, speakers kept), PDF (pdf-extract in a worker process; scanned PDFs refused). Files only.
 - **Repo links:** a document links to 0..n repos plus path globs. Unlinked means global. Docs linked to the current repo get a boost, a glob match gets a further boost, and the view filters by repo.
 - **Agent writes:** `knowledge_add` sends a proposal to a local review queue (per computer). Approve or reject in the Knowledge view.
 - **Recall:** at most 3 pointers (title, section, snippet, id), ≤1 KiB.
@@ -58,7 +58,7 @@ DocumentDB, live connectors, code auto-links (#49), OCR, attachments, an agent d
   - `embedder run|status|stop`
 - **Data:**
   - `meta`
-  - `documents` (source_key, content_sha256, format, origin, …)
+  - `documents` (source_key, content_sha256, format, origin, …). `source_key` is `<scope>/<folder>/<path>` with the scope the first linked repository key (`path-<hash>` for a `path:` key, so no absolute path), else `global`. A Confluence page is `confluence:<id>` and an approved agent proposal `agent/<heldId>/<name>`. `content_sha256` covers the title and the text.
   - `doc_links` (doc, repo_key, globs)
   - `chunks` (heading_path, text, chunk_sha, embedding, model_id)
   - Mongo chunks also carry `repo_keys[]` and `global` for prefiltering.
@@ -134,6 +134,7 @@ DocumentDB, live connectors, code auto-links (#49), OCR, attachments, an agent d
 - Two embedder processes at about 120 MB each.
 - Ingest of 30k chunks takes about 10–20 minutes (needs batching, ETA, cancel).
 - pdf-extract panics or hangs (handled by the worker).
+- A PDF that inflates to gigabytes (decompression bomb). The worker runs with an empty environment and, on Unix, `RLIMIT_AS` 1.5 GiB and `RLIMIT_CPU` 60 s, and a refused allocation or the CPU limit fails that file as "the PDF is too large to read". Windows has no limit here (`unsafe_code` is forbidden, so no job object, and a FlateDecode stream does not declare its inflated size, so a bomb cannot be refused cheaply). There the 60 s deadline is the only bound. macOS sets the limit but may not enforce `RLIMIT_AS`.
 - mongot index builds are asynchronous and can make CI flaky (poll READY, Linux only).
 - ANN post-filter recall on libSQL.
 - `simple` config means no stemming in Postgres.

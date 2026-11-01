@@ -311,6 +311,10 @@ pub enum StoreError {
     /// This SQLite build has no FTS5, so there is no keyword index.
     #[error("this SQLite build has no FTS5 full-text search")]
     NoFts5,
+    /// The database lacks a capability (a `check` problem code such as `no-pgvector`): a command
+    /// answers with exit 3.
+    #[error("{message}")]
+    Missing { code: &'static str, message: String },
     /// The database failed (the message carries no stored text).
     #[error("knowledge database error: {0}")]
     Backend(String),

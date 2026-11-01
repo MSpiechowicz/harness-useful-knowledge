@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use support::pdf::pdf;
+use support::pdf::{flate_bomb, pdf};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_harness-knowledge");
 
@@ -112,6 +112,37 @@ fn pdfs_are_read_by_the_worker_process_and_a_bad_one_fails_only_itself() {
     let (again, _) = run(root.path(), &["docs", "import", "--ndjson"], &manifest);
     assert_eq!(file(&again, "a-good.pdf")["status"], "unchanged");
     assert_eq!(again.last().expect("done")["counts"]["added"], 0);
+}
+
+/// A 2 GiB decompression bomb of about 2 MB is one failed file, within the worker's memory limit, and the PDFs
+/// next to it are read. Only Linux enforces the address-space limit the worker sets.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_decompression_bomb_fails_as_too_large_and_does_not_take_the_import_down() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let docs = root.path().join("docs");
+    std::fs::create_dir_all(&docs).expect("folder");
+
+    let text = format!("Gateway handbook\n{}", "requests are routed by key ".repeat(40));
+    std::fs::write(docs.join("a-good.pdf"), pdf(&[&text, &text])).expect("pdf");
+
+    let bomb = flate_bomb(2048);
+    assert!(bomb.len() < 3 << 20, "the bomb is {} bytes on disk", bomb.len());
+    std::fs::write(docs.join("b-bomb.pdf"), bomb).expect("bomb");
+
+    let manifest = json!({ "folders": [docs] }).to_string();
+    let started = std::time::Instant::now();
+    let (events, code) = run(root.path(), &["docs", "import", "--ndjson"], &manifest);
+
+    assert_eq!(code, Some(0));
+    assert_eq!(file(&events, "a-good.pdf")["status"], "added");
+    assert_eq!(file(&events, "b-bomb.pdf")["status"], "failed");
+    assert_eq!(file(&events, "b-bomb.pdf")["reason"], "the PDF is too large to read");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(50),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

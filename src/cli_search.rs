@@ -62,6 +62,7 @@ impl From<StoreError> for Failure {
                 code: "no-fts5",
                 message: error.to_string(),
             },
+            StoreError::Missing { code, message } => Self::Missing { code, message },
             other => Self::Failed(other.to_string()),
         }
     }

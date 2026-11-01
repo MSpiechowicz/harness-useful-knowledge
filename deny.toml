@@ -9,7 +9,8 @@ ignore = [
   # build time (the embedder's tokenizer). No safe upgrade exists.
   "RUSTSEC-2024-0436",
   # ttf-parser is unmaintained, but it only reads the fonts embedded in a PDF (pdf-extract via lopdf),
-  # and that runs in the isolated extract-worker process. No safe upgrade exists.
+  # and that runs in the extract-worker child process (empty environment, memory and CPU limits on
+  # Unix), which is a separate process and not a sandbox. No safe upgrade exists.
   "RUSTSEC-2026-0192",
 ]
 

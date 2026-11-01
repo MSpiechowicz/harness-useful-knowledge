@@ -6,14 +6,17 @@
 //! format is passed over without a word (a folder of source code is not 5000 skipped files).
 //!
 //! A document's source key is its path inside the chosen folder, led by the folder's own name
-//! (`docs/guide/install.md`), or for a chosen file its folder's name and its name. It never holds
-//! the absolute path: a team database is shared between computers, and re-importing the same
-//! folder from another place must find the same documents.
+//! (`docs/guide/install.md`), or for a chosen file its folder's name and its name, and led by the
+//! scope of the import: the first linked repository (`git:github.com/o/r/docs/guide/install.md`),
+//! else `global`. Two same-named folders of different repositories so keep their own documents.
+//! It never holds the absolute path: a team database is shared between computers, and re-importing
+//! the same folder from another place must find the same documents.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::manifest::Manifest;
+use crate::digest::sha256_hex;
 use crate::extract::format_of_name;
 use crate::limits::{FILES_PER_IMPORT_MAX, WALK_DEPTH_MAX};
 
@@ -51,7 +54,23 @@ pub fn plan(manifest: &Manifest) -> Result<Vec<Candidate>, String> {
         folder(Path::new(raw), &mut found)?;
     }
 
+    let scope = key_scope(manifest);
+
+    for candidate in found.iter_mut().filter(|candidate| candidate.problem.is_none()) {
+        candidate.source_key = format!("{scope}/{}", candidate.source_key);
+    }
+
     Ok(found)
+}
+
+/// What leads every source key of the import: the first linked repository, else `global`. A
+/// `path:` repository key holds an absolute path, so only its hash is used.
+fn key_scope(manifest: &Manifest) -> String {
+    match manifest.links.first() {
+        Some(link) if link.repo_key.starts_with("git:") => link.repo_key.clone(),
+        Some(link) => format!("path-{}", &sha256_hex(link.repo_key.as_bytes())[..12]),
+        None => "global".to_owned(),
+    }
 }
 
 fn check_count(count: usize) -> Result<(), String> {
@@ -254,10 +273,10 @@ mod tests {
         assert_eq!(
             keys(&found),
             [
-                "docs/a/deep/spec.yaml",
-                "docs/a/guide.md",
-                "docs/a/notes.TXT",
-                "docs/b.md"
+                "global/docs/a/deep/spec.yaml",
+                "global/docs/a/guide.md",
+                "global/docs/a/notes.TXT",
+                "global/docs/b.md"
             ]
         );
         assert!(found.iter().all(|candidate| candidate.problem.is_none()));
@@ -277,7 +296,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret.md"), root.join("linked-file.md")).expect("file link");
 
         let found = plan(&folder_manifest(&root)).expect("plan");
-        assert_eq!(keys(&found), ["docs/real.md"]);
+        assert_eq!(keys(&found), ["global/docs/real.md"]);
 
         // A link given as a path or as the folder itself is reported, not followed.
         let manifest = Manifest {
@@ -327,8 +346,37 @@ mod tests {
         };
         let found = plan(&manifest).expect("plan");
 
-        assert_eq!(keys(&found), ["handbook/start.md"]);
+        assert_eq!(keys(&found), ["global/handbook/start.md"]);
         assert_eq!(found[0].display, path.to_string_lossy());
+    }
+
+    #[test]
+    fn same_named_folders_of_different_repositories_get_different_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a").join("docs");
+        let b = dir.path().join("b").join("docs");
+        touch(&a.join("guide.md"));
+        touch(&b.join("guide.md"));
+
+        let linked = |root: &Path, repo: &str| Manifest {
+            links: vec![crate::store::Link {
+                repo_key: repo.to_owned(),
+                globs: Vec::new(),
+            }],
+            ..folder_manifest(root)
+        };
+
+        let first = keys(&plan(&linked(&a, "git:github.com/o/a")).expect("plan"));
+        let second = keys(&plan(&linked(&b, "git:github.com/o/b")).expect("plan"));
+        let local = keys(&plan(&linked(&b, "path:/home/me/project")).expect("plan"));
+
+        assert_eq!(first, ["git:github.com/o/a/docs/guide.md"]);
+        assert_eq!(second, ["git:github.com/o/b/docs/guide.md"]);
+        assert!(
+            local[0].starts_with("path-") && local[0].ends_with("/docs/guide.md"),
+            "{local:?}"
+        );
+        assert!(!local[0].contains("/home"), "no absolute path: {local:?}");
     }
 
     #[test]

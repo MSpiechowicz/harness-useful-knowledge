@@ -135,6 +135,37 @@ fn a_yaml_alias_bomb_is_refused_quickly() {
 }
 
 #[test]
+fn a_page_of_two_hundred_thousand_nested_tags_is_read_in_linear_time() {
+    let depth = 200_000;
+    let bold = "<b>".repeat(depth);
+    let nested = format!(
+        "<html><body><h1>Deep</h1><p>{bold}words in the middle{}</p></body></html>",
+        "</b>".repeat(depth)
+    );
+    // End tags that close nothing, and a list item opened at the bottom.
+    let strays = format!(
+        "<html><body><h1>Deep</h1>{bold}<ul><li>last item</li></ul>{}</body></html>",
+        "</i>".repeat(depth)
+    );
+
+    for page in [nested, strays] {
+        let started = std::time::Instant::now();
+        let extracted = extract(Format::Html, "deep.html", page.as_bytes()).expect("readable");
+
+        // Debug builds tokenize 400k tags in about 0.6 s: a quadratic walk takes minutes.
+        assert!(started.elapsed().as_millis() < 2000, "{:?}", started.elapsed());
+        assert_eq!(extracted.title.as_deref(), Some("Deep"));
+        assert!(
+            extracted
+                .sections
+                .iter()
+                .any(|section| section.text.contains("words in the middle") || section.text.contains("last item")),
+            "{extracted:?}"
+        );
+    }
+}
+
+#[test]
 fn asciidoc_has_headings_code_tables_and_no_attributes() {
     let extracted = run(Format::AsciiDoc, "guide.adoc", GUIDE_ADOC);
 

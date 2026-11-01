@@ -12,6 +12,10 @@ use crate::support::private::{check_folders, private_folder, read_private, write
 /// How long a proposal is kept.
 const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// How long a claim may last: an approval embeds a document, which takes minutes at most. A claim
+/// older than this was left behind by a process that died, and its proposal waits again.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// The prefix of the temporary files a proposal is written through or claimed under.
 const TEMP_PREFIX: &str = ".held-";
 
@@ -113,6 +117,12 @@ impl HeldStore {
             Err(error) => return Err(format!("moving the held proposal failed: {error}")),
         }
 
+        // A rename keeps the time the proposal was written: the claim starts now.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&aside)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+
         match parse(&aside, held_id) {
             Some(item) => Ok(Some(Claim {
                 item,
@@ -132,6 +142,8 @@ impl HeldStore {
             return Ok(Vec::new());
         }
 
+        self.restore_stranded();
+
         let mut items: Vec<HeldItem> = self.waiting()?.into_iter().map(|waiting| waiting.item).collect();
         items.sort_by(|a, b| (&b.created_at, &b.held_id).cmp(&(&a.created_at, &a.held_id)));
 
@@ -147,8 +159,35 @@ impl HeldStore {
         Ok(parse(&item_path(&self.folder, held_id), held_id))
     }
 
-    /// Removes the proposals and half-written files older than 30 days.
+    /// Puts back the proposals whose claim is older than [`CLAIM_TIMEOUT`] (the process that claimed
+    /// them died before it finished or restored them), unless a newer proposal has their id.
+    fn restore_stranded(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.folder) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            if !(name.starts_with(TEMP_PREFIX) && name.ends_with(".tmp")) || !older_than(&entry, CLAIM_TIMEOUT) {
+                continue;
+            }
+
+            let path = entry.path();
+            let Some(item) = read_item(&path) else {
+                continue;
+            };
+
+            let _ = put_back(&path, &item_path(&self.folder, &item.held_id));
+        }
+    }
+
+    /// Removes the proposals and half-written files older than 30 days, after putting back the
+    /// proposals of dead claims.
     pub fn sweep(&self) {
+        self.restore_stranded();
+
         let Ok(entries) = std::fs::read_dir(&self.folder) else {
             return;
         };
@@ -158,14 +197,7 @@ impl HeldStore {
             let name = name.to_string_lossy();
             let ours = name.ends_with(".json") || (name.starts_with(TEMP_PREFIX) && name.ends_with(".tmp"));
 
-            let stale = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age > KEEP_FOR);
-
-            if ours && stale {
+            if ours && older_than(&entry, KEEP_FOR) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -251,13 +283,28 @@ fn put_back(aside: &Path, home: &Path) -> Result<(), String> {
     std::fs::rename(aside, home).map_err(|error| format!("putting the held proposal back failed: {error}"))
 }
 
-/// The proposal `id` read from `path`, when the file is readable, of this version, names that id
-/// and has the revision of its content.
-fn parse(path: &Path, id: &str) -> Option<HeldItem> {
+/// True when the file of `entry` was last written more than `age` ago.
+fn older_than(entry: &std::fs::DirEntry, age: Duration) -> bool {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed > age)
+}
+
+/// The proposal in the file at `path`, whatever its name: its id is the one it holds.
+fn read_item(path: &Path) -> Option<HeldItem> {
     let bytes = read_private(path, HELD_FILE_MAX).ok()??;
     let item: HeldItem = serde_json::from_slice(&bytes).ok()?;
 
-    (item.version == VERSION && item.held_id == id && item.revision == item.digest()).then_some(item)
+    (item.version == VERSION && is_held_id(&item.held_id) && item.revision == item.digest()).then_some(item)
+}
+
+/// The proposal `id` read from `path`, when the file is readable, of this version, names that id
+/// and has the revision of its content.
+fn parse(path: &Path, id: &str) -> Option<HeldItem> {
+    read_item(path).filter(|item| item.held_id == id)
 }
 
 fn item_path(folder: &Path, id: &str) -> PathBuf {

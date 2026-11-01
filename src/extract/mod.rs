@@ -6,6 +6,8 @@
 //! - [`markdown`], [`html`] (with the Confluence export), [`asciidoc`], [`rst`] and [`plain`]
 //!   read text formats. Code blocks become fenced blocks, lists one line per item and tables one
 //!   line per row.
+//! - [`subtitles`] reads WebVTT and SubRip transcripts, one section per two to three minutes of talk
+//!   headed by its time span.
 //! - [`openapi`] reads an OpenAPI or Swagger description (JSON or YAML) into one section per
 //!   operation and per schema. Any other JSON or YAML is refused: it is data, not documentation.
 //! - [`pdf`] reads the pages a worker process extracted ([`worker`] runs in a child, so a crash or a
@@ -23,6 +25,7 @@ pub mod outline;
 pub mod pdf;
 pub mod plain;
 pub mod rst;
+pub mod subtitles;
 pub mod worker;
 mod yaml;
 
@@ -63,6 +66,8 @@ pub enum Format {
     AsciiDoc,
     Rst,
     Pdf,
+    /// WebVTT or SubRip subtitles.
+    Transcript,
 }
 
 impl Format {
@@ -76,6 +81,7 @@ impl Format {
             Self::AsciiDoc => "asciidoc",
             Self::Rst => "rst",
             Self::Pdf => "pdf",
+            Self::Transcript => "transcript",
         }
     }
 }
@@ -119,23 +125,26 @@ pub fn format_of_name(name: &str) -> Option<Format> {
         "adoc" | "asciidoc" | "asc" => Some(Format::AsciiDoc),
         "rst" => Some(Format::Rst),
         "pdf" => Some(Format::Pdf),
+        "vtt" | "srt" => Some(Format::Transcript),
         _ => None,
     }
 }
 
 /// The format of a file named `name` that starts with `head`. The PDF signature wins over the
-/// extension, then the extension decides, and a file without a known extension is sniffed (HTML,
-/// an OpenAPI description, else text unless it holds binary data).
+/// extension, then the extension decides (a `.txt` that holds subtitles is a transcript), and a file
+/// without a known extension is sniffed (HTML, an OpenAPI description, subtitles, else text unless it
+/// holds binary data).
 pub fn detect(name: &str, head: &[u8]) -> Option<Format> {
     if head.starts_with(b"%PDF-") {
         return Some(Format::Pdf);
     }
 
-    if let Some(format) = format_of_name(name) {
-        return Some(format);
+    match format_of_name(name) {
+        // A transcript saved as `.txt` is still one.
+        Some(Format::Text) if sniff(head) == Some(Format::Transcript) => Some(Format::Transcript),
+        Some(format) => Some(format),
+        None => sniff(head),
     }
-
-    sniff(head)
 }
 
 fn sniff(head: &[u8]) -> Option<Format> {
@@ -152,6 +161,10 @@ fn sniff(head: &[u8]) -> Option<Format> {
 
     if openapi::looks_like_description(&start) {
         return Some(Format::OpenApi);
+    }
+
+    if subtitles::looks_like(&start) {
+        return Some(Format::Transcript);
     }
 
     Some(Format::Text)
@@ -176,6 +189,7 @@ pub fn extract(format: Format, name: &str, bytes: &[u8]) -> Result<Extracted> {
         Format::OpenApi => openapi::extract(&text)?,
         Format::AsciiDoc => asciidoc::extract(&text),
         Format::Rst => rst::extract(&text),
+        Format::Transcript => subtitles::extract(&text)?,
         Format::Pdf => unreachable!("handled above"),
     };
 

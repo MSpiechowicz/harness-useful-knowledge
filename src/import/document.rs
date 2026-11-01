@@ -72,6 +72,10 @@ pub struct Importer<'a> {
     pub origin: Origin,
     /// The title every document of this import gets, instead of the one its file has.
     pub title: Option<String>,
+    /// False for an import of untrusted text (an agent's approved proposal): the key its text names
+    /// for itself (a Confluence page id) is ignored, and a key that is taken is refused unless the
+    /// import `replaces` that document.
+    pub trust_extracted_key: bool,
     pub cancel: &'a dyn Fn() -> bool,
     /// Set when the embedder failed: later files do not try it again.
     embedder_failed: bool,
@@ -101,6 +105,7 @@ impl<'a> Importer<'a> {
             replaces: None,
             origin: Origin::User,
             title: None,
+            trust_extracted_key: true,
             cancel,
             embedder_failed: false,
         }
@@ -160,12 +165,10 @@ impl<'a> Importer<'a> {
             )));
         }
 
-        let content_sha = sha256_hex(chunked.text.as_bytes());
-        let source_key = loaded
-            .extracted
-            .source_key
-            .clone()
-            .unwrap_or_else(|| candidate.source_key.clone());
+        // The title is part of the content: a renamed document is updated and embedded again.
+        let content_sha = sha256_hex(format!("{title}\n{}", chunked.text).as_bytes());
+        let extracted_key = loaded.extracted.source_key.clone().filter(|_| self.trust_extracted_key);
+        let source_key = extracted_key.unwrap_or_else(|| candidate.source_key.clone());
 
         if let Some(existing) = self.store.find_by_content_sha(&content_sha)? {
             if self.replaces.is_some_and(|id| id != existing.id) {
@@ -192,6 +195,11 @@ impl<'a> Importer<'a> {
             None => self.store.find_by_source_key(&source_key)?,
         };
 
+        if !self.trust_extracted_key && self.replaces.is_none() && previous.is_some() {
+            return Err(Stop::Failed("a document with this key exists already".to_owned()));
+        }
+
+        let previous_links = self.links_of(previous.as_ref())?;
         let now = now();
         let mut warnings = loaded.extracted.warnings.clone();
 
@@ -212,7 +220,7 @@ impl<'a> Importer<'a> {
             created_at: previous.as_ref().map_or(now, |doc| doc.created_at),
             updated_at: now,
             origin: match &previous {
-                Some(doc) if self.replaces.is_none() => doc.origin,
+                Some(doc) if self.replaces.is_none() && self.origin != Origin::AgentApproved => doc.origin,
                 _ => self.origin,
             },
             warnings: warnings.clone(),
@@ -220,7 +228,7 @@ impl<'a> Importer<'a> {
 
         let mut chunks = to_chunks(&chunked);
         let pending = self.embed(&title, &chunked, &mut chunks)?;
-        let links = self.links_for(previous.as_ref())?;
+        let links = clean::links(&[previous_links.clone(), self.links.clone()].concat())?;
         let id = self.store.put_document(&doc, &chunks, &links)?;
 
         if let Some(model) = chunks.iter().find_map(|chunk| chunk.model_id.as_deref()) {
@@ -232,6 +240,11 @@ impl<'a> Importer<'a> {
         } else {
             Status::Added
         };
+
+        if previous.is_some() && self.replaces.is_none() && unrelated(&previous_links, &self.links) {
+            event.reason = Some("replaced a document with the same name".to_owned());
+        }
+
         event.doc_id = Some(id);
         event.chunks = Some(chunks.len());
         event.embedding = Some(if pending == 0 { "done" } else { "pending" });
@@ -288,20 +301,17 @@ impl<'a> Importer<'a> {
         })
     }
 
-    /// The links the document gets: its own and those of this import.
-    fn links_for(&mut self, previous: Option<&Document>) -> Result<Vec<Link>, Stop> {
-        let mut all = match previous {
-            Some(doc) => self
-                .store
-                .get(doc.id, &Detail::default())?
-                .map(|found| found.links)
-                .unwrap_or_default(),
-            None => Vec::new(),
+    /// The links the document has now: none for a new one.
+    fn links_of(&mut self, previous: Option<&Document>) -> Result<Vec<Link>, Stop> {
+        let Some(doc) = previous else {
+            return Ok(Vec::new());
         };
 
-        all.extend(self.links.iter().cloned());
-
-        Ok(clean::links(&all)?)
+        Ok(self
+            .store
+            .get(doc.id, &Detail::default())?
+            .map(|found| found.links)
+            .unwrap_or_default())
     }
 
     /// An unchanged document gets the links of this import besides its own.
@@ -352,6 +362,18 @@ impl<'a> Importer<'a> {
 
         Ok(chunks.iter().filter(|chunk| chunk.embedding.is_none()).count())
     }
+}
+
+/// True when a document's own links and those of the import share no repository, and at least one
+/// side is linked: a document of the same name from somewhere else, not a newer version.
+fn unrelated(current: &[Link], incoming: &[Link]) -> bool {
+    if current.is_empty() && incoming.is_empty() {
+        return false;
+    }
+
+    !current
+        .iter()
+        .any(|link| incoming.iter().any(|other| other.repo_key == link.repo_key))
 }
 
 fn to_chunks(chunked: &Chunked) -> Vec<Chunk> {

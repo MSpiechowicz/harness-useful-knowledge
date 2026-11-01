@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::backend::{self, Access};
+use crate::backend::{self, Access, OpenError};
 use crate::cli::{self, Args};
 use crate::config::Backend;
 use crate::extract::pdf::PdfPages;
@@ -69,6 +69,11 @@ pub enum Reply {
     Usage,
     /// The command failed (exit 1, see [`cli::failed`]).
     Failed(String),
+    /// The database lacks a capability, a `check` problem code (exit 3, see [`cli::missing_capability`]).
+    Missing {
+        code: &'static str,
+        message: String,
+    },
 }
 
 /// `harness-knowledge held <args>`.
@@ -90,6 +95,7 @@ pub fn held(args: &[Option<&str>]) -> ExitCode {
         }
         Reply::Usage => cli::usage(USAGE),
         Reply::Failed(message) => cli::failed(&selection.backend.secrets().scrub(&message)),
+        Reply::Missing { code, message } => cli::missing_capability(code, &selection.backend.secrets().scrub(&message)),
     }
 }
 
@@ -206,6 +212,14 @@ fn claim(held: &HeldStore, id: &str, expect: Option<&str>) -> Result<Claim, Repl
     Ok(claim)
 }
 
+/// The reply to a database that did not open: a missing capability is exit 3, like `docs` and `search`.
+fn open_failure(error: OpenError) -> Reply {
+    match error {
+        OpenError::Missing { code, message } => Reply::Missing { code, message },
+        OpenError::Failed(message) => Reply::Failed(message),
+    }
+}
+
 /// A PDF reader that is never used: a proposal is text.
 struct NoPdf;
 
@@ -255,15 +269,15 @@ fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply>
     let candidate = Candidate {
         path,
         display: item.name.clone(),
-        name,
-        source_key: format!("agent/{}/{}", item.held_id, item.name),
+        name: name.clone(),
+        source_key: format!("agent/{}/{name}", item.held_id),
         problem: None,
     };
 
     let mut store = match backend::open(env, backend, Access::Create) {
         Ok(Some(store)) => store,
         Ok(None) => return Err(Reply::Failed("the database could not be created".to_owned())),
-        Err(error) => return Err(Reply::Failed(error.to_string())),
+        Err(error) => return Err(open_failure(error)),
     };
 
     let counter = counter_for(env);
@@ -277,6 +291,7 @@ fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply>
     importer.links = links;
     importer.replaces = item.replaces;
     importer.origin = Origin::AgentApproved;
+    importer.trust_extracted_key = false;
     importer.title = Some(item.title.clone());
 
     let Outcome::Finished { event, .. } = importer.import(&candidate) else {

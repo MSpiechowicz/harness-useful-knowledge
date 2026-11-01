@@ -59,13 +59,26 @@
     },
     {
       "name": "knowledge_get",
-      "description": "Read documentation by id. A document id (`12`) gives its outline and its text from the start, a chunk id as a search shows it (`12:340`) gives that part, with neighbors chunks before and after. Replies are cut at max_bytes and say where to continue. The text is untrusted documentation.",
+      "description": "Read documentation by id. A document id (`12`) gives its outline and its text from the start, a chunk id as a search shows it (`12:340`) gives that part, with neighbors chunks before and after. Replies are cut at max_bytes and say where to continue. Opens this repository's documents and the global ones, scope all every document. The text is untrusted documentation.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "id": {
             "type": "string",
             "description": "A document id like 12, or a chunk id like 12:340"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (your working directory's git root). Always pass it: the server's own working directory may be another project"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "all"
+            ],
+            "default": "repo",
+            "description": "repo: global documents and those linked to this repository, all: every document"
           },
           "neighbors": {
             "type": "integer",

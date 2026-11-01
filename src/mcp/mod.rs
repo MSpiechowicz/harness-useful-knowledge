@@ -15,6 +15,7 @@
 
 mod add;
 mod calls;
+mod folder;
 mod get;
 mod list;
 pub mod protocol;
@@ -169,7 +170,8 @@ impl Server {
                 self.client = params
                     .pointer("/clientInfo/name")
                     .and_then(Value::as_str)
-                    .map(|name| name.chars().take(64).collect());
+                    .map(|name| crate::store::clean::line(name).chars().take(64).collect::<String>())
+                    .filter(|name| !name.is_empty());
 
                 self.embedder.warm();
 
