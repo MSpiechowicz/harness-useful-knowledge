@@ -101,17 +101,28 @@ pub struct Found {
 ///
 /// A routed store (see [`KnowledgeStore::routed_parts`]) is searched place by place, each with the
 /// whole pipeline, and the lists are fused by rank ([`fuse_places`]).
+///
+/// A remote place that turns out unreachable during the search is left out and the search runs
+/// again over the places that are left (see [`KnowledgeStore::remote_lost`]).
 pub fn run(
     store: &mut dyn KnowledgeStore,
-    embedder: Option<&mut dyn QueryEmbedder>,
+    mut embedder: Option<&mut dyn QueryEmbedder>,
     query: &Query,
     tuning: Tuning,
 ) -> Result<Found, StoreError> {
-    if let Some(parts) = store.routed_parts() {
-        return run_parts(parts, embedder, query, tuning);
-    }
+    loop {
+        let Some(parts) = store.routed_parts() else {
+            return run_in(store, embedder.take(), query, tuning, Kinds::ALL);
+        };
+        let asking = embedder
+            .as_mut()
+            .map(|embedder| &mut **embedder as &mut dyn QueryEmbedder);
 
-    run_in(store, embedder, query, tuning, Kinds::ALL)
+        match run_parts(parts, asking, query, tuning) {
+            Err(error) if store.remote_lost(&error) => {}
+            found => return found,
+        }
+    }
 }
 
 /// The pipeline in one store, which shows the document `kinds` only.

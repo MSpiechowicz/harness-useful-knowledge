@@ -47,6 +47,7 @@ use hrana::{Client, Stream};
 use sql::Sql;
 use wire::{Outcome, execute};
 
+pub use hrana::CONNECT_TIMEOUT;
 pub use probe::{Capabilities, NO_VECTOR_MESSAGE, Trouble, probe};
 pub use schema::SCHEMA_VERSION;
 
@@ -117,7 +118,16 @@ impl LibsqlStore {
     }
 
     fn open(url: &str, token: Option<&str>, mode: Mode) -> Result<Option<Self>, StoreError> {
-        let client = Client::new(endpoint::parse(url)?, token)?;
+        Self::open_within(url, token, mode, hrana::CONNECT_TIMEOUT)
+    }
+
+    fn open_within(
+        url: &str,
+        token: Option<&str>,
+        mode: Mode,
+        connect_timeout: Duration,
+    ) -> Result<Option<Self>, StoreError> {
+        let client = Client::within(endpoint::parse(url)?, token, connect_timeout)?;
         let found = schema::version(&mut client.single())?;
         let mut store = Self {
             client,
@@ -345,19 +355,21 @@ fn begin(client: &Client) -> Result<Stream<'_>, StoreError> {
 }
 
 /// The store `backend::open` hands out for a libSQL URL: `None` when `access` does not create the
-/// tables and the database has none. A failure is one readable line without the URL or the token
+/// tables and the database has none, and connecting is given up on after `connect_timeout`. A failure is one readable line without the URL or the token
 /// (every secret of them is scrubbed from it).
 pub fn open_boxed(
     url: &str,
     token: Option<&str>,
     access: Access,
+    connect_timeout: Duration,
     secrets: &Secrets,
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
-    let opened = match access {
-        Access::Read => LibsqlStore::open_read_only(url, token),
-        Access::Existing => LibsqlStore::open_existing(url, token),
-        Access::Create => LibsqlStore::connect(url, token).map(Some),
+    let mode = match access {
+        Access::Read => Mode::Read,
+        Access::Existing => Mode::Existing,
+        Access::Create => Mode::Create,
     };
+    let opened = LibsqlStore::open_within(url, token, mode, connect_timeout);
 
     match opened {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
@@ -373,6 +385,7 @@ fn open_error(error: StoreError, secrets: &Secrets) -> OpenError {
             code: "libsql-no-vector",
             message,
         },
+        StoreError::Unreachable(message) => OpenError::Unreachable(secrets.scrub(&message)),
         error => OpenError::Failed(secrets.scrub(&format!("cannot open the libSQL database: {error}"))),
     }
 }

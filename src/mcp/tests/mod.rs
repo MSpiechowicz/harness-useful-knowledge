@@ -204,5 +204,6 @@ fn a_serve_loop_reads_lines_skips_blanks_and_survives_garbage() {
     assert_eq!(replies[2]["result"]["tools"].as_array().map(Vec::len), Some(4));
 }
 
+mod offline;
 mod proposals;
 mod reading;

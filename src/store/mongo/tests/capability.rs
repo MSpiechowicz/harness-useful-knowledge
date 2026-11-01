@@ -9,7 +9,7 @@ use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 use crate::store::mongo::probe::probe;
 use crate::store::mongo::schema::{CHUNKS, DOCUMENTS, IndexState, KEYWORD_INDEX, META, SCHEMA_VERSION, VECTOR_INDEX};
-use crate::store::mongo::{MongoStore, open_boxed};
+use crate::store::mongo::{MongoStore, SERVER_SELECTION_TIMEOUT, open_boxed};
 use crate::store::testing::{MODEL, Seed};
 use crate::store::{KnowledgeStore, ListQuery, RepoFilter, Sort, StoreError};
 
@@ -271,7 +271,7 @@ fn a_server_that_does_not_answer_is_unreachable() {
     assert!(!problem.message.is_empty());
     assert!(!problem.message.contains(';'), "{}", problem.message);
 
-    assert!(matches!(MongoStore::connect(url), Err(StoreError::Backend(_))));
+    assert!(matches!(MongoStore::connect(url), Err(StoreError::Unreachable(_))));
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn team_mongo_opening_a_server_without_mongot_is_a_missing_capability() {
     let Some(db) = TestDb::on(PLAIN_URL_VAR) else { return };
     let secrets = Secrets::of(&db.url, None);
 
-    match open_boxed(&db.url, Access::Create, &secrets) {
+    match open_boxed(&db.url, Access::Create, SERVER_SELECTION_TIMEOUT, &secrets) {
         Err(OpenError::Missing { code, message }) => {
             assert_eq!(code, "no-mongot");
             assert!(message.contains("mongot"), "{message}");
@@ -315,7 +315,11 @@ fn team_mongo_opening_a_server_without_mongot_is_a_missing_capability() {
 
     // Nothing was written, so a read or a change finds no database.
     for access in [Access::Read, Access::Existing] {
-        assert!(open_boxed(&db.url, access, &secrets).expect("open").is_none());
+        assert!(
+            open_boxed(&db.url, access, SERVER_SELECTION_TIMEOUT, &secrets)
+                .expect("open")
+                .is_none()
+        );
     }
 
     assert!(!db.exists(), "the refused open created nothing");

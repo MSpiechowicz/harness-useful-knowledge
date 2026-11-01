@@ -1,5 +1,6 @@
 //! Small, self-contained helpers the server is built on.
 //!
+//! - [`deadline`]: work that must not outlast a deadline.
 //! - [`env`]: the injected process environment ([`Env`]) and the per-machine data folder.
 //! - [`paths`]: project folder validation.
 //! - [`private`]: the private files and folders next to the database.
@@ -8,6 +9,7 @@
 //! - [`text`]: display safety checks.
 //! - [`time`]: calendar dates and timestamps from Unix time.
 
+pub mod deadline;
 pub mod env;
 pub mod git;
 pub mod paths;

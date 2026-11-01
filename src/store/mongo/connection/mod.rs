@@ -265,8 +265,16 @@ pub(super) fn connect_error(error: &Error, url: &str) -> StoreError {
 
 /// A driver error as a short message: its kind and server error code (with the code name when it
 /// is a plain word), never server text or the URL. A server without `mongot` is named as such.
+///
+/// A server that cannot be reached (no usable server in time, a network error, a host that does
+/// not resolve) is [`StoreError::Unreachable`].
 pub(super) fn backend(error: &Error) -> StoreError {
-    StoreError::Backend(message(error))
+    match error.kind.as_ref() {
+        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
+            StoreError::Unreachable(message(error))
+        }
+        _ => StoreError::Backend(message(error)),
+    }
 }
 
 /// The server error code of `error`, if any.

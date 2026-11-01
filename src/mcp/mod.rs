@@ -12,6 +12,10 @@
 //!   ([`crate::search::render`]).
 //! - The store opens on the first call that needs it and is opened again after a database failure,
 //!   so a team database that was down, or a local one that did not exist yet, is picked up later.
+//! - With both places in use, a remote database that cannot be reached leaves the answers of
+//!   `knowledge_search`, `knowledge_list` and `knowledge_get` to this computer's documents. The first
+//!   such reply starts with one line saying so ([`OFFLINE_NOTICE`]), and the notice comes back once the
+//!   remote was reachable and is not again. An id of the remote database is an error meanwhile.
 
 mod add;
 mod calls;
@@ -32,6 +36,7 @@ use crate::config::{Backend, Routing, Selection};
 use crate::held::HeldStore;
 use crate::project::ProjectResolver;
 use crate::search::{AutoEmbedder, QueryEmbedder};
+use crate::store::routed::OFFLINE_NOTICE;
 use crate::store::{KnowledgeStore, StoreError};
 use crate::support::Env;
 use protocol::{INVALID_PARAMS, INVALID_REQUEST, Line, METHOD_NOT_FOUND, PARSE_ERROR};
@@ -76,6 +81,8 @@ pub struct Server {
     session: Option<String>,
     /// Whether the line saying vector search was unavailable was shown already.
     vector_notice: bool,
+    /// Whether the line saying the remote database is unreachable was shown since it last was.
+    offline_notice: bool,
 }
 
 impl std::fmt::Debug for Server {
@@ -107,6 +114,7 @@ impl Server {
             client: None,
             session,
             vector_notice: false,
+            offline_notice: false,
         }
     }
 
@@ -135,10 +143,20 @@ impl Server {
         open_store(&mut self.store, &self.env, &self.backend, self.routing)
     }
 
+    /// [`OFFLINE_NOTICE`] the first time a reply comes from this computer alone because the remote
+    /// database cannot be reached, then nothing until it was reachable again and is not any more.
+    /// Ask after the call the reply is about.
+    fn offline_notice(&mut self) -> Option<&'static str> {
+        let offline = self.store.as_ref().is_some_and(|store| store.offline());
+        let shown = std::mem::replace(&mut self.offline_notice, offline);
+
+        (offline && !shown).then_some(OFFLINE_NOTICE)
+    }
+
     /// The message of a store failure, safe to show. A database failure drops the connection, so the
     /// next call opens it again.
     fn failed(&mut self, error: &StoreError) -> String {
-        if matches!(error, StoreError::Backend(_)) {
+        if matches!(error, StoreError::Backend(_) | StoreError::Unreachable(_)) {
             self.store = None;
         }
 

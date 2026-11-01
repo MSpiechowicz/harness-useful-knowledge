@@ -210,3 +210,13 @@ At parity with Harness Memory.
 - Remote-only routing still fails clearly.
 - Writes meant for remote are refused while it is unreachable, never redirected.
 - Desktop: an offline banner in the Knowledge view, like Memory's.
+
+### Offline fallback: what was built
+- **Unreachable** is a connect timeout, a refused connection, a host that does not resolve or a lost connection (`StoreError::Unreachable`, `OpenError::Unreachable`). A certificate the TLS check refuses, a login that fails and a missing capability stay failures. PostgreSQL also counts SQLSTATE class 08 and 57P01 to 57P03, libSQL every transport failure except TLS, MongoDB server selection, network and DNS errors.
+- **Probe:** with both places in use the remote gets 3 s to connect (1 s for `recall --hook`), and 6 s (2 s) in all for a server that accepts the connection and never speaks. A URL that sets its own timeout keeps it. Remote-only keeps the drivers' 10 s.
+- **Cooldown:** `<data>/harness-knowledge/remote-unreachable.json` (next to the local database, private, names the remote by a hash without credentials), 60 s, shared by every process. An unreachable result writes it, an answer from the remote (or a `check` that reaches it) removes it. Reads skip the remote while it runs, `docs import` and `docs reindex` to the remote always try.
+- **JSON:** `offline: true` (absent otherwise) on `docs list --json`, `repos --json` and `stats --json`. In `stats`, `places.remote` is `{"offline": true}` and the top-level counts are this computer's. `search --json` keeps its array and writes `harness-knowledge: Remote knowledge is unreachable. Showing documents on this computer only.` to stderr. `check --json` is unchanged.
+- **Refusals:** `docs get`, `docs matches` and the changes of a remote id exit 1 with `remote knowledge is unreachable right now`. Imports and reindexes to the remote exit 1 with `remote knowledge is unreachable right now, so nothing was changed. Nothing is saved to this computer instead`.
+- **MCP:** `knowledge_search`, `knowledge_list` and `knowledge_get` start the first offline reply with the notice line, and again after the remote was reachable in between. `recall --hook` uses this computer's documents and adds nothing to its block.
+- **Feature token:** `offline-fallback`.
+- **`docs list --place remote|local`:** narrows the list to one place, merged and paged in the routed store so `total` and the pages are of that set (`KnowledgeStore::list_in`). With one place in use the other lists nothing, a bad value exits 2, and `--place remote` while the remote is unreachable exits 1 with `remote knowledge is unreachable right now`.

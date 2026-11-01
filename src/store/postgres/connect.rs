@@ -30,7 +30,7 @@ use rustls::pki_types::pem::PemObject;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// How long connecting may take when the URL sets no `connect_timeout`.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long sent data may stay unacknowledged before the connection is closed (Linux only): a
 /// healthy server acknowledges within a round trip, whatever its statement takes.
@@ -85,6 +85,11 @@ impl std::fmt::Debug for Settings {
 
 /// Parses `url` and applies the TLS policy of the module docs.
 pub fn parse(url: &str) -> Result<Settings, UrlError> {
+    parse_within(url, CONNECT_TIMEOUT)
+}
+
+/// [`parse`] with `connect_timeout` as the time connecting may take when the URL sets none.
+pub fn parse_within(url: &str, connect_timeout: Duration) -> Result<Settings, UrlError> {
     let (base, query) = match url.split_once('?') {
         Some((base, query)) => (base, Some(query)),
         None => (url, None),
@@ -114,7 +119,7 @@ pub fn parse(url: &str) -> Result<Settings, UrlError> {
     config.ssl_mode(ssl_policy(ssl_mode.as_deref(), local)?);
 
     if config.get_connect_timeout().is_none() {
-        config.connect_timeout(CONNECT_TIMEOUT);
+        config.connect_timeout(connect_timeout);
     }
 
     if config.get_application_name().is_none() {

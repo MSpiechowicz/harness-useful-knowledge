@@ -34,7 +34,7 @@ use crate::store::StoreError;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long connecting may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest reply read; every query is bounded far below it.
 const REPLY_MAX: u64 = 16 * 1024 * 1024;
@@ -54,6 +54,11 @@ impl Client {
     /// the platform's trusted roots; redirects are not followed and proxy variables are ignored,
     /// so the token goes to the configured host only.
     pub(super) fn new(base: String, token: Option<&str>) -> Result<Self, StoreError> {
+        Self::within(base, token, CONNECT_TIMEOUT)
+    }
+
+    /// [`Client::new`] giving up on a connection after `connect_timeout`.
+    pub(super) fn within(base: String, token: Option<&str>, connect_timeout: Duration) -> Result<Self, StoreError> {
         let authorization = match token.map(str::trim).filter(|token| !token.is_empty()) {
             Some(token) if token.bytes().all(|byte| byte.is_ascii_graphic()) => Some(format!("Bearer {token}")),
             Some(_) => {
@@ -73,7 +78,7 @@ impl Client {
         let agent = Agent::config_builder()
             .tls_config(tls)
             .timeout_global(Some(REQUEST_TIMEOUT))
-            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_connect(Some(connect_timeout))
             .http_status_as_error(false)
             .max_redirects(0)
             .proxy(None)
@@ -414,23 +419,29 @@ fn platform_roots() -> RootCerts {
     RootCerts::new_with_certs(&certs)
 }
 
-/// A transport failure, described without the URL.
+/// A transport failure, described without the URL: [`StoreError::Unreachable`] when the server
+/// could not be reached (a timeout, a host that does not resolve, a refused or lost connection),
+/// [`StoreError::Backend`] for anything the TLS check refused or the reply broke.
 fn transport(error: ureq::Error) -> StoreError {
-    let reason = match error {
-        ureq::Error::Timeout(_) => "the libSQL server did not answer in time".to_owned(),
-        ureq::Error::HostNotFound => "the libSQL host was not found".to_owned(),
-        ureq::Error::ConnectionFailed => "cannot connect to the libSQL server".to_owned(),
+    let (reason, reachable) = match error {
+        ureq::Error::Timeout(_) => ("the libSQL server did not answer in time".to_owned(), false),
+        ureq::Error::HostNotFound => ("the libSQL host was not found".to_owned(), false),
+        ureq::Error::ConnectionFailed => ("cannot connect to the libSQL server".to_owned(), false),
         ureq::Error::Io(error) => match error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
-            Some(tls) => format!("TLS with the libSQL server failed ({tls})"),
-            None => format!("cannot reach the libSQL server ({})", error.kind()),
+            Some(tls) => (format!("TLS with the libSQL server failed ({tls})"), true),
+            None => (format!("cannot reach the libSQL server ({})", error.kind()), false),
         },
-        ureq::Error::Rustls(error) => format!("TLS with the libSQL server failed ({error})"),
-        ureq::Error::Tls(reason) => format!("TLS with the libSQL server failed ({reason})"),
-        ureq::Error::BodyExceedsLimit(_) => "the libSQL server's reply is too large".to_owned(),
-        _ => "the request to the libSQL server failed".to_owned(),
+        ureq::Error::Rustls(error) => (format!("TLS with the libSQL server failed ({error})"), true),
+        ureq::Error::Tls(reason) => (format!("TLS with the libSQL server failed ({reason})"), true),
+        ureq::Error::BodyExceedsLimit(_) => ("the libSQL server's reply is too large".to_owned(), true),
+        _ => ("the request to the libSQL server failed".to_owned(), true),
     };
 
-    backend(reason)
+    if reachable {
+        backend(reason)
+    } else {
+        StoreError::Unreachable(reason)
+    }
 }
 
 fn ended() -> StoreError {

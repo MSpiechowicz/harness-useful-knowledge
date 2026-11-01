@@ -71,7 +71,7 @@ pub(super) fn import_with(
     let counter = counter_for(context.env);
     let place = import_place(context, manifest, Kind::of(links.len()))?;
     let mut store = context
-        .open_place(place, Access::Create)?
+        .open_place_to_change(place, Access::Create)?
         .ok_or_else(|| Failure::Failed("the database could not be created".to_owned()))?;
 
     let mut importer = Importer::new(store.as_mut(), counter.as_ref(), pdf, cancel);
@@ -192,7 +192,7 @@ pub(super) fn reindex_with(
             }
         };
 
-        let Some(mut store) = context.open_place(place, Access::Existing)? else {
+        let Some(mut store) = context.open_place_to_change(place, Access::Existing)? else {
             continue;
         };
 

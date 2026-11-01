@@ -9,6 +9,7 @@
 //! - [`rank`]: the repository and glob boosts, the floor and the per-document collapse.
 //! - [`glob`]: the path globs of a link.
 //! - [`routed`]: this computer's file and a remote database as one store, ids carrying their place.
+//! - [`reach`]: whether the remote database could be reached lately, shared by the processes.
 //! - [`clean`]: the checks every backend runs before it opens a write transaction.
 //!
 //! `updated_at` is the time the content was last imported: only [`KnowledgeStore::put_document`]
@@ -21,6 +22,7 @@ pub mod libsql;
 pub mod mongo;
 pub mod postgres;
 pub mod rank;
+pub mod reach;
 pub mod routed;
 pub mod sqlite;
 #[cfg(test)]
@@ -30,6 +32,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use reach::Reach;
 pub use routed::{Kinds, Part, RoutedStore};
 pub use sqlite::SqliteStore;
 
@@ -341,6 +344,10 @@ pub enum StoreError {
     /// answers with exit 3.
     #[error("{message}")]
     Missing { code: &'static str, message: String },
+    /// The remote database could not be reached (connect timeout, refused connection, DNS, a lost
+    /// connection). A routed store answers from this computer meanwhile (see [`reach`]).
+    #[error("{0}")]
+    Unreachable(String),
     /// The database failed (the message carries no stored text).
     #[error("knowledge database error: {0}")]
     Backend(String),
@@ -415,6 +422,13 @@ pub trait KnowledgeStore: Send {
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError>;
 
+    /// [`KnowledgeStore::list`] narrowed to the documents kept in `place` (all of them for
+    /// `None`), paged and counted over that set. Only a routed store has two places to tell
+    /// apart, any other lists as it is: the caller knows which place such a store is.
+    fn list_in(&mut self, _place: Option<crate::config::Place>, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+        self.list(query)
+    }
+
     /// A document with its links, and what `detail` asks for.
     fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError>;
 
@@ -438,4 +452,18 @@ pub trait KnowledgeStore: Send {
     fn repos(&mut self) -> Result<RepoCounts, StoreError>;
 
     fn stats(&mut self) -> Result<Stats, StoreError>;
+
+    /// True while a routed store answers from this computer alone because its remote database
+    /// cannot be reached (or is cooling down after it could not be). Read it after the call it
+    /// is about. A store that is one place is never offline.
+    fn offline(&self) -> bool {
+        false
+    }
+
+    /// Tells a routed store that a call it handed out through [`KnowledgeStore::routed_parts`]
+    /// failed with `error`. True when that was the remote database being unreachable and the call
+    /// can be tried again, now without it.
+    fn remote_lost(&mut self, _error: &StoreError) -> bool {
+        false
+    }
 }

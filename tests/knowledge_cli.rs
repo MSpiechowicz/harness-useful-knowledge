@@ -61,7 +61,15 @@ fn features_list_what_this_build_can_do() {
 
     assert_eq!(code, Some(0));
 
-    for feature in ["docs", "embedder", "search", "recall", "held", "mcp"] {
+    for feature in [
+        "docs",
+        "embedder",
+        "search",
+        "recall",
+        "held",
+        "mcp",
+        "offline-fallback",
+    ] {
         assert!(features.contains(&feature), "{feature} in {features:?}");
     }
 }

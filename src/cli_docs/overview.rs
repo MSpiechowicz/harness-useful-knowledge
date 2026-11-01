@@ -3,20 +3,21 @@
 use serde_json::{Value, json};
 
 use super::{Context, Done, Failure, Reply};
-use crate::backend::Access;
+use crate::backend::{self, Access, Attempt};
 use crate::cli::Args;
+use crate::config::{Layout, Place};
 use crate::project::ProjectResolver;
 use crate::store::sqlite::schema::SCHEMA_VERSION;
-use crate::store::{RepoCounts, Stats};
+use crate::store::{RepoCounts, Stats, StoreError};
 
 /// `repos --json`: `{"global": N, "repos": [{"key", "docs"}]}`, the repositories with documents,
 /// most documents first.
 pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
     json_only(args)?;
 
-    let counts = match context.open(Access::Read)? {
-        Some(mut store) => store.repos()?,
-        None => RepoCounts::default(),
+    let (counts, offline) = match context.open(Access::Read)? {
+        Some(mut store) => (store.repos()?, store.offline()),
+        None => (RepoCounts::default(), false),
     };
 
     let repos: Vec<_> = counts
@@ -25,7 +26,13 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
         .map(|(key, docs)| json!({ "key": key, "docs": docs }))
         .collect();
 
-    Ok(Done::ok(json!({ "global": counts.global, "repos": repos })))
+    let mut shown = json!({ "global": counts.global, "repos": repos });
+
+    if offline {
+        shown["offline"] = json!(true);
+    }
+
+    Ok(Done::ok(shown))
 }
 
 /// `stats --json`: `documents`, `chunks`, `embeddedChunks`, `bytes`, `globalDocuments`,
@@ -36,20 +43,24 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
 /// `places` is `{"remote": {...}, "local": {...}}` with the same counts (not `held`) of each place in
 /// use, and the top-level counts are those of the remote database, or of this computer when that is
 /// the only place. A database is counted whatever the routing shows of it.
+///
+/// With both places in use, a remote database that cannot be reached (or is cooling down after it
+/// could not be, see [`crate::store::Reach`]) is not counted: `places.remote` is `{"offline": true}`,
+/// the top-level counts are this computer's, and `offline` is `true` at the top level too (it is
+/// absent otherwise).
 pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     json_only(args)?;
 
     let places = context.routing.places();
     let mut by_place = serde_json::Map::new();
     let mut primary: Option<Value> = None;
+    let mut offline = false;
 
     for place in places {
-        let stats = match context.open_place(place, Access::Read)? {
-            Some(mut store) => store.stats()?,
-            None => Stats {
-                schema_version: SCHEMA_VERSION,
-                ..Stats::default()
-            },
+        let Some(stats) = place_stats(context, place)? else {
+            offline = true;
+            by_place.insert(place.as_str().to_owned(), json!({ "offline": true }));
+            continue;
         };
 
         let counts = counts(&stats);
@@ -66,7 +77,42 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     shown["held"] = json!(crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()));
     shown["places"] = Value::Object(by_place);
 
+    if offline {
+        shown["offline"] = json!(true);
+    }
+
     Ok(Done::ok(shown))
+}
+
+/// The counts of one place, all zero for a database that does not exist; `None` for a remote
+/// database that cannot be reached while this computer is in use too.
+fn place_stats(context: &Context, place: Place) -> Result<Option<Stats>, Failure> {
+    let empty = Stats {
+        schema_version: SCHEMA_VERSION,
+        ..Stats::default()
+    };
+
+    let store = if place == Place::Remote && context.routing.layout() == Layout::Both {
+        match backend::attempt_remote(context.env, context.backend, Access::Read, true)? {
+            Attempt::Opened(store) => store,
+            Attempt::Offline(_) => return Ok(None),
+        }
+    } else {
+        context.open_place(place, Access::Read)?
+    };
+
+    let Some(mut store) = store else {
+        return Ok(Some(empty));
+    };
+
+    match store.stats() {
+        Ok(stats) => Ok(Some(stats)),
+        Err(StoreError::Unreachable(message)) if place == Place::Remote && context.routing.layout() == Layout::Both => {
+            backend::reach_of(context.env, context.backend).failed(&message);
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The counts of a database as `stats` prints them.

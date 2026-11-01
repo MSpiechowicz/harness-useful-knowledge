@@ -93,6 +93,25 @@ impl Backend {
         }
     }
 
+    /// `remote:` and 16 hex digits naming the remote database without its credentials (its kind,
+    /// hosts and database, in lowercase), so changing the password keeps what is recorded about it
+    /// (see [`crate::store::Reach`]). `local` for the local database.
+    pub fn remote_key(&self) -> String {
+        let (kind, url) = match self {
+            Self::Sqlite => return "local".to_owned(),
+            Self::Postgres { url } => ("postgres", url),
+            Self::Mongodb { url } => ("mongodb", url),
+            Self::Libsql { url, .. } => ("libsql", url),
+        };
+
+        let rest = url.trim().split_once("://").map_or(url.trim(), |(_, rest)| rest);
+        let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+        let location = rest.rfind('@').map_or(rest, |at| &rest[at + 1..]);
+        let digest = crate::digest::sha256_hex(format!("{kind}://{}", location.to_ascii_lowercase()).as_bytes());
+
+        format!("remote:{}", &digest[..16])
+    }
+
     /// The secrets of this backend, for scrubbing messages.
     pub fn secrets(&self) -> Secrets {
         match self {

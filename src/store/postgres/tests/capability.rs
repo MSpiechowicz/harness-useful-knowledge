@@ -3,10 +3,10 @@
 use super::support::{client, database, plain_database, unique, url_of, with_database, with_login};
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
-use crate::store::KnowledgeStore;
 use crate::store::postgres::vector::{Fault, Problem, Version};
-use crate::store::postgres::{PostgresStore, open_boxed, open_error, probe};
+use crate::store::postgres::{CONNECT_TIMEOUT, PostgresStore, open_boxed, open_error, probe};
 use crate::store::testing::Seed;
+use crate::store::{KnowledgeStore, StoreError};
 
 /// A database of its own on the pgvector server, dropped on drop.
 struct Scratch {
@@ -201,6 +201,38 @@ fn team_a_server_without_pgvector_is_the_no_pgvector_problem_and_stays_untouched
 }
 
 #[test]
+fn a_server_that_cannot_be_reached_is_unreachable_within_the_connect_timeout_and_never_a_failure_of_the_url() {
+    // Nobody listens on port 1 (refused), and 192.0.2.1 is reserved for documentation (never answers,
+    // or no route). Either way the open ends at once or at the timeout, without the password.
+    for url in [
+        "postgres://someone:hunter2-secret@127.0.0.1:1/knowledge?sslmode=disable",
+        "postgres://someone:hunter2-secret@192.0.2.1/knowledge?sslmode=require",
+    ] {
+        let secrets = Secrets::of(url, None);
+        let started = std::time::Instant::now();
+
+        let error = open_boxed(url, Access::Read, std::time::Duration::from_millis(500), &secrets)
+            .err()
+            .expect("cannot connect");
+
+        assert!(matches!(&error, OpenError::Unreachable(_)), "{url}: {error:?}");
+        assert!(!error.to_string().contains("hunter2-secret"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    // A URL the rules refuse is a failure, not an unreachable server.
+    let refused = "postgres://someone@db.example.com/knowledge?sslmode=disable";
+    let error = open_boxed(refused, Access::Read, CONNECT_TIMEOUT, &Secrets::of(refused, None))
+        .err()
+        .expect("refused");
+    assert!(matches!(error, OpenError::Failed(_)), "{error:?}");
+}
+
+#[test]
 fn a_missing_capability_is_told_apart_from_an_open_that_failed() {
     let url = "postgres://someone:hunter2-secret@db.example.com/knowledge";
     let secrets = Secrets::of(url, None);
@@ -221,18 +253,29 @@ fn a_missing_capability_is_told_apart_from_an_open_that_failed() {
         );
     }
 
-    for problem in [Problem::Unreachable("no route".to_owned()), Problem::Auth] {
-        match open_error(Fault::Problem(problem), &secrets) {
-            OpenError::Failed(message) => {
-                assert!(message.starts_with("cannot open the PostgreSQL database"), "{message}")
+    match open_error(Fault::Problem(Problem::Auth), &secrets) {
+        OpenError::Failed(message) => {
+            assert!(message.starts_with("cannot open the PostgreSQL database"), "{message}")
+        }
+        other => panic!("not a missing capability: {other:?}"),
+    }
+
+    // A server that cannot be reached is told apart: a routed store answers from this computer meanwhile.
+    for unreachable in [
+        Fault::Problem(Problem::Unreachable("no route".to_owned())),
+        Fault::Store(StoreError::Unreachable("no route".to_owned())),
+    ] {
+        match open_error(unreachable, &secrets) {
+            OpenError::Unreachable(message) => {
+                assert!(message.starts_with("cannot reach the PostgreSQL database"), "{message}")
             }
-            other => panic!("not a missing capability: {other:?}"),
+            other => panic!("{other:?}"),
         }
     }
 
     let leaked = Problem::Unreachable(format!("cannot reach {url}"));
     match open_error(Fault::Problem(leaked), &secrets) {
-        OpenError::Failed(message) => assert!(!message.contains("hunter2-secret"), "{message}"),
+        OpenError::Unreachable(message) => assert!(!message.contains("hunter2-secret"), "{message}"),
         other => panic!("{other:?}"),
     }
 }
@@ -243,7 +286,7 @@ fn team_opening_a_server_without_pgvector_is_a_missing_capability() {
     let secrets = Secrets::of(db.url(), None);
 
     for access in [Access::Create, Access::Existing, Access::Read] {
-        let opened = open_boxed(db.url(), access, &secrets);
+        let opened = open_boxed(db.url(), access, CONNECT_TIMEOUT, &secrets);
 
         match (access, opened) {
             (Access::Create, Err(OpenError::Missing { code, message })) => {

@@ -77,7 +77,7 @@ impl Probe {
 
 /// Asks the server of `url`.
 pub fn probe(url: &str) -> Result<Probe, Problem> {
-    let (client, db) = connect_client(url).map_err(refused)?;
+    let (client, db) = connect_client(url, super::SERVER_SELECTION_TIMEOUT).map_err(refused)?;
 
     hello(&client).map_err(|error| classify(&error))?;
 

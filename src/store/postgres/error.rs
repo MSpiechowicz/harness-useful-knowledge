@@ -9,9 +9,10 @@ use postgres::types::FromSql;
 
 use crate::store::StoreError;
 
-/// A [`StoreError::Backend`] for a client error. A database error becomes its SQLSTATE with a
-/// fixed description (see [`described`]): the server's message, detail and hint can quote stored
-/// values or text a teammate wrote, so none of them is kept. Any other error is the error and its
+/// A [`StoreError::Backend`] for a client error, or [`StoreError::Unreachable`] when the server
+/// could not be reached (see [`unreachable`]). A database error becomes its SQLSTATE with a fixed
+/// description (see [`described`]): the server's message, detail and hint can quote stored values
+/// or text a teammate wrote, so none of them is kept. Any other error is the error and its
 /// causes, at most 200 characters.
 pub(super) fn backend(error: postgres::Error) -> StoreError {
     let message = match error.as_db_error() {
@@ -19,14 +20,52 @@ pub(super) fn backend(error: postgres::Error) -> StoreError {
         None => with_causes(&error).chars().take(200).collect(),
     };
 
-    StoreError::Backend(message)
+    if unreachable(&error) {
+        StoreError::Unreachable(message)
+    } else {
+        StoreError::Backend(message)
+    }
+}
+
+/// Whether `error` says the server could not be reached: a connection that was refused, timed out,
+/// could not be resolved or was lost (an I/O error, or a closed connection), or a server that
+/// says it is shutting down or the connection failed (SQLSTATE class 08, 57P01 to 57P03). A
+/// certificate the TLS check refuses is a setting to fix, not an unreachable server.
+pub(super) fn unreachable(error: &postgres::Error) -> bool {
+    if let Some(db) = error.as_db_error() {
+        let code = db.code().code();
+
+        return code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03");
+    }
+
+    if error.is_closed() {
+        return true;
+    }
+
+    let mut cause = std::error::Error::source(error);
+
+    while let Some(inner) = cause {
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            let refused_by_tls = io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>());
+
+            return !refused_by_tls;
+        }
+
+        if inner.is::<rustls::Error>() {
+            return false;
+        }
+
+        cause = inner.source();
+    }
+
+    false
 }
 
 /// Whether `error` says the server ended this session (an administrator or a restart terminated
 /// it: SQLSTATE 57P01, 57P02, 57P03). The client may not have noticed the closed socket yet, so
 /// this counts as a lost connection like [`postgres::Client::is_closed`].
 pub(super) fn ended(error: &StoreError) -> bool {
-    matches!(error, StoreError::Backend(message)
+    matches!(error, StoreError::Backend(message) | StoreError::Unreachable(message)
         if ["57P01", "57P02", "57P03"].iter().any(|code| message.contains(&format!("SQLSTATE {code}"))))
 }
 

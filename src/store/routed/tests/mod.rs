@@ -1,5 +1,7 @@
 use pretty_assertions::assert_eq;
 
+mod flaky;
+mod offline;
 mod paging;
 mod search;
 

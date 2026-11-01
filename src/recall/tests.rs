@@ -317,3 +317,19 @@ fn a_standard_input_that_stays_silent_costs_the_deadline_and_prints_nothing() {
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert!(printed.is_empty());
 }
+
+#[test]
+fn an_unreachable_remote_leaves_the_pointers_to_this_computer_without_a_word_about_it() {
+    let (_dir, mut setup) = world(&[guide("Gateway guide", 5.0)], answering(axis(0)));
+    setup.backend =
+        crate::config::backend_for(Some("postgres://nobody@127.0.0.1:1/none".to_owned()), None).expect("backend");
+    setup.routing = Routing::new(crate::config::Where::RemoteLocal, crate::config::Where::RemoteLocal);
+
+    let block = pointers(PROMPT, setup).expect("a block from this computer's documents");
+
+    assert!(block.contains("title=\"Gateway guide\""), "{block}");
+    assert!(
+        !block.to_lowercase().contains("unreachable") && !block.contains("offline"),
+        "{block}"
+    );
+}

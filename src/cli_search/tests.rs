@@ -272,3 +272,29 @@ fn a_store_that_lacks_a_capability_ends_the_search_with_exit_three() {
         }
     );
 }
+
+#[test]
+fn an_unreachable_remote_leaves_the_search_to_this_computer_and_is_said_so_beside_the_array() {
+    let world = World::new();
+    let mut database = world.database();
+    insert(
+        &mut database,
+        &Seed::new("Gateway guide").embedded("Install", "Install the gateway with the installer.", angled(4.0)),
+    );
+    drop(database);
+
+    let remote =
+        crate::config::backend_for(Some("postgres://nobody@127.0.0.1:1/none".to_owned()), None).expect("backend");
+    let routing = Routing::new(crate::config::Where::RemoteLocal, crate::config::Where::RemoteLocal);
+    let args = [Some("--json"), Some("--query"), Some("install gateway")];
+
+    let found = answer(&world.env, &remote, routing, &args, &mut Fake(Ok(axis(0)))).expect("answers");
+
+    assert!(found.offline);
+    assert_eq!(items(&found).len(), 1, "the array keeps its shape");
+    assert_eq!(items(&found)[0]["title"], "Gateway guide");
+    assert_eq!(items(&found)[0]["docId"], "local:1");
+
+    let alone = world.search(&["--json", "--query", "install gateway"], &mut Fake(Ok(axis(0))));
+    assert!(!alone.expect("answers").offline, "this computer alone is not offline");
+}

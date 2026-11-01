@@ -3,13 +3,18 @@
 //! object on stdout. Timestamps are RFC 3339, field names camelCase.
 //!
 //! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--sort
-//!   title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N]` prints `{"items": [...], "total": N}`:
+//!   title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] [--place remote|local]` prints `{"items": [...], "total": N}`:
 //!   one page of the documents (see [`json::document`] for an item, it has its `links`). `--repo`
 //!   keeps the documents linked to that repository key, `--global` those linked to none, `--all`
 //!   (the default) every one. `--query` keeps the documents whose title contains it or whose text has
 //!   all its words. Sorted by `updated` unless `--sort` says otherwise, ascending unless `--desc`,
 //!   ties by id. Pages count from 1, `--per-page` is 1 to 200 (50 when not given). `total` counts
-//!   every page.
+//!   every page. `--place remote|local` keeps the documents kept in that place, paged and counted
+//!   over that set (only with both places in use does it tell two sets apart: with one place in use
+//!   the place that is not in use lists nothing, and a value other than those two is a usage error).
+//!   `--place remote` while the remote cannot be reached exits 1 like `docs get` of a remote id.
+//!   `offline` is `true` (and absent otherwise) while the remote database cannot be
+//!   reached and the page comes from this computer alone (see [`crate::store::routed`]).
 //! - `docs get --json ID [--sections] [--chunk CID]` prints `{"document": {... "links"}}` and, as
 //!   asked, `"sections"` (the outline: every chunk's id, position, heading path and size) and
 //!   `"chunk"` (that chunk of the document, with its text).
@@ -29,17 +34,20 @@
 //! - `docs import --ndjson` reads a manifest from stdin and prints one JSON event per line while it
 //!   imports, `docs reindex --json (ID... | --all)` embeds the chunks that have no vector (see
 //!   [`import`]).
-//! - `repos --json` prints `{"global": N, "repos": [{"key", "docs"}]}`, `stats --json` the counts
-//!   of [`overview::stats`], `project-key --json --path PATH` the repository key of a folder, and
+//! - `repos --json` prints `{"global": N, "repos": [{"key", "docs"}]}` (and `"offline": true`
+//!   like `docs list`), `stats --json` the counts of [`overview::stats`], `project-key --json --path PATH` the repository key of a folder, and
 //!   `check --json` what the database can do (see [`check`]).
 //!
-//! A read never creates the local database: without it every list is empty and exit 0. A document
-//! that does not exist exits 1 with `harness-knowledge: document N not found` as the last stderr
+//! A read never creates the local database: without it every list is empty and exit 0. With both
+//! places in use, a read of a document of the remote database (`docs get`, `docs matches`, or any
+//! change) while it cannot be reached exits 1 with `harness-knowledge: remote knowledge is
+//! unreachable right now`. A document that does not exist exits 1 with `harness-knowledge: document N not found` as the last stderr
 //! line. Other exit codes and errors as in [`crate::cli`].
 
 mod check;
 mod import;
 mod json;
+mod listing;
 mod matches;
 mod overview;
 
@@ -48,17 +56,17 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::backend::{self, Access, OpenError};
+use crate::backend::{self, Access, Attempt, OpenError};
 use crate::cli::{self, Args};
-use crate::config::{Backend, Place, Routing};
-use crate::limits::{DELETE_IDS_MAX, LIST_PAGE_DEFAULT, LIST_PAGE_MAX, STDIN_MAX};
-use crate::store::routed::ids;
-use crate::store::{Detail, KnowledgeStore, Link, ListQuery, RepoFilter, Sort, StoreError, clean};
+use crate::config::{Backend, Layout, Place, Routing};
+use crate::limits::{DELETE_IDS_MAX, STDIN_MAX};
+use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
+use crate::store::{Detail, KnowledgeStore, Link, StoreError, clean};
 use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
-                         [--sort title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] | docs get --json ID \
+                         [--sort title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
                          [--sections] [--chunk CID] | docs matches --json ID --query Q [--limit N] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
                          --json (ID... | --all) | repos --json | stats --json | project-key --json \
@@ -84,6 +92,21 @@ impl<'a> Context<'a> {
     /// The store of one place alone, for what is done to a place (an import, a reindex, a check).
     fn open_place(&self, place: Place, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, Failure> {
         Ok(backend::open_place(self.env, self.backend, place, access)?)
+    }
+
+    /// The store of one place that is about to change. With both places in use, a remote database
+    /// that cannot be reached is refused ([`REMOTE_DOWN_WRITE`]) and never replaced by this
+    /// computer. It is always tried, cooldown or not, so a person is not refused for a minute after
+    /// the remote came back.
+    fn open_place_to_change(&self, place: Place, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, Failure> {
+        if place != Place::Remote || self.routing.layout() != Layout::Both {
+            return self.open_place(place, access);
+        }
+
+        match backend::attempt_remote(self.env, self.backend, access, false)? {
+            Attempt::Opened(store) => Ok(store),
+            Attempt::Offline(_) => Err(Failure::Failed(REMOTE_DOWN_WRITE.to_owned())),
+        }
     }
 }
 
@@ -128,7 +151,7 @@ impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Self {
         match error {
             OpenError::Missing { code, message } => Self::Missing { code, message },
-            OpenError::Failed(message) => Self::Failed(message),
+            OpenError::Failed(message) | OpenError::Unreachable(message) => Self::Failed(message),
         }
     }
 }
@@ -217,99 +240,30 @@ pub fn docs_reply(context: &Context, args: &[Option<&str>], input: &mut dyn Read
 
 /// `docs list`.
 fn list(context: &Context, args: &[Option<&str>]) -> Reply {
-    let query = parse_list(args)?;
+    let (query, place) = listing::parse_list(args)?;
 
-    // Without a database every list is empty, and nothing is created.
-    let Some(mut store) = context.open(Access::Read)? else {
+    // Without a database every list is empty, and nothing is created. So is the list of a place
+    // that is not in use.
+    let wanted = place.is_none_or(|place| context.routing.uses(place));
+    let store = if wanted { context.open(Access::Read)? } else { None };
+
+    let Some(mut store) = store else {
         return Ok(Done::ok(json!({ "items": [], "total": 0 })));
     };
 
-    let page = store.list(&query)?;
+    let page = store.list_in(place, &query)?;
     let items: Vec<Value> = page
         .items
         .iter()
         .map(|row| json::document(&row.doc, &row.links))
         .collect();
+    let mut shown = json!({ "items": items, "total": page.total });
 
-    Ok(Done::ok(json!({ "items": items, "total": page.total })))
-}
-
-fn parse_list(args: &[Option<&str>]) -> Result<ListQuery, Failure> {
-    let valued = ["--repo", "--format", "--query", "--sort", "--page", "--per-page"];
-    let parsed = Args::parse(args, &["--json", "--global", "--all", "--desc"], &valued).ok_or(Failure::Usage)?;
-
-    if !parsed.positional.is_empty() || !parsed.flag("--json") {
-        return Err(Failure::Usage);
+    if store.offline() {
+        shown["offline"] = json!(true);
     }
 
-    let filter = match (parsed.value("--repo"), parsed.flag("--global"), parsed.flag("--all")) {
-        (None, false, _) => RepoFilter::All,
-        (None, true, false) => RepoFilter::Global,
-        (Some(key), false, false) => RepoFilter::Repo(clean::repo_key(key).map_err(|_| Failure::Usage)?.to_owned()),
-        _ => return Err(Failure::Usage),
-    };
-
-    let format = match parsed.value("--format") {
-        Some(format) => Some(parse_format(format)?),
-        None => None,
-    };
-
-    let text = parsed.value("--query").unwrap_or_default().trim().to_owned();
-
-    if text.chars().count() > QUERY_CHARS_MAX {
-        return Err(Failure::Usage);
-    }
-
-    let sort = match parsed.value("--sort") {
-        None | Some("updated") => Sort::Updated,
-        Some("title") => Sort::Title,
-        Some("size") => Sort::Size,
-        Some("format") => Sort::Format,
-        Some("chunks") => Sort::Chunks,
-        Some("repos") => Sort::Repos,
-        Some(_) => return Err(Failure::Usage),
-    };
-
-    let page = match parsed.value("--page") {
-        Some(page) => page
-            .parse::<usize>()
-            .ok()
-            .filter(|page| *page >= 1)
-            .ok_or(Failure::Usage)?,
-        None => 1,
-    };
-
-    let per_page = match parsed.value("--per-page") {
-        Some(per_page) => per_page
-            .parse::<usize>()
-            .ok()
-            .filter(|per_page| (1..=LIST_PAGE_MAX).contains(per_page))
-            .ok_or(Failure::Usage)?,
-        None => LIST_PAGE_DEFAULT,
-    };
-
-    Ok(ListQuery {
-        filter,
-        format,
-        text,
-        sort,
-        descending: parsed.flag("--desc"),
-        offset: (page - 1).checked_mul(per_page).ok_or(Failure::Usage)?,
-        limit: per_page,
-    })
-}
-
-/// Most characters of `--query`.
-const QUERY_CHARS_MAX: usize = 200;
-
-/// A format name: lowercase letters, digits, `-` and `_`, 1 to 32 characters.
-fn parse_format(raw: &str) -> Result<String, Failure> {
-    let fine = (1..=32).contains(&raw.len())
-        && raw
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-
-    if fine { Ok(raw.to_owned()) } else { Err(Failure::Usage) }
+    Ok(Done::ok(shown))
 }
 
 /// A document or chunk id as written: `12`, or `local:12` for one on this computer (see
@@ -458,6 +412,8 @@ fn delete(context: &Context, args: &[Option<&str>]) -> Reply {
     Ok(Done::ok(json!({ "deleted": store.delete(&ids)? })))
 }
 
+#[cfg(test)]
+mod offline_tests;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]

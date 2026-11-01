@@ -10,7 +10,7 @@ use crate::store::StoreError;
 use crate::store::libsql::hrana::Client;
 use crate::store::libsql::sql::{Sql, args};
 use crate::store::libsql::wire::execute;
-use crate::store::libsql::{LibsqlStore, endpoint, open_boxed};
+use crate::store::libsql::{CONNECT_TIMEOUT, LibsqlStore, endpoint, open_boxed};
 
 /// A server that hangs up on the first `hangups` connections without a word, then answers every
 /// request with `body`.
@@ -65,7 +65,7 @@ fn a_read_is_not_repeated_forever() {
         .query("SELECT 7", args![])
         .expect_err("both tries hang up");
 
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
     assert!(
         !error.to_string().contains("127.0.0.1") && !error.to_string().contains("secret-token"),
         "{error}"
@@ -82,7 +82,7 @@ fn a_transaction_is_never_repeated_when_the_connection_broke() {
         .err()
         .expect("the request of a transaction is sent once");
 
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
 }
 
 #[test]
@@ -108,13 +108,13 @@ fn opening_never_shows_the_url_or_the_token() {
     let secrets = Secrets::of(&closed, Some("secret-token"));
 
     for access in [Access::Read, Access::Existing, Access::Create] {
-        let error = open_boxed(&closed, Some("secret-token"), access, &secrets)
+        let error = open_boxed(&closed, Some("secret-token"), access, CONNECT_TIMEOUT, &secrets)
             .err()
             .expect("refused");
         let message = error.to_string();
 
-        assert!(matches!(error, OpenError::Failed(_)), "{error:?}");
-        assert!(message.starts_with("cannot open the libSQL database"), "{message}");
+        assert!(matches!(error, OpenError::Unreachable(_)), "{error:?}");
+        assert!(message.starts_with("cannot reach the libSQL server"), "{message}");
         assert!(
             !message.contains("secret-token") && !message.contains("127.0.0.1"),
             "{message}"
@@ -238,7 +238,7 @@ fn opening_a_server_without_vectors_is_a_missing_capability() {
     let url = refusing_server("libsql_vector_idx", "SQLite error: no such function: libsql_vector_idx");
     let secrets = Secrets::of(&url, None);
 
-    let error = open_boxed(&url, None, Access::Create, &secrets)
+    let error = open_boxed(&url, None, Access::Create, CONNECT_TIMEOUT, &secrets)
         .err()
         .expect("the migration fails");
 
@@ -256,7 +256,7 @@ fn opening_a_server_without_fts5_is_a_missing_capability() {
     let url = refusing_server("fts5", "SQLite error: no such module: fts5");
     let secrets = Secrets::of(&url, None);
 
-    let error = open_boxed(&url, None, Access::Create, &secrets)
+    let error = open_boxed(&url, None, Access::Create, CONNECT_TIMEOUT, &secrets)
         .err()
         .expect("the migration fails");
 

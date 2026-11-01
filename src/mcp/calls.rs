@@ -33,13 +33,25 @@ impl Reply {
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
     let result = match name {
         "knowledge_search" => parse(arguments).and_then(|args| search(server, args)),
-        "knowledge_get" => parse(arguments).and_then(|args| super::get::get(server, args)),
-        "knowledge_list" => parse(arguments).and_then(|args| super::list::list(server, args)),
+        "knowledge_get" => parse(arguments)
+            .and_then(|args| super::get::get(server, args))
+            .map(|text| with_offline_notice(server, text)),
+        "knowledge_list" => parse(arguments)
+            .and_then(|args| super::list::list(server, args))
+            .map(|text| with_offline_notice(server, text)),
         "knowledge_add" => parse(arguments).and_then(|args| super::add::add(server, args)),
         _ => return None,
     };
 
     Some(Reply::of(result))
+}
+
+/// `text`, with the offline notice before it when there is one to show (see [`Server::offline_notice`]).
+fn with_offline_notice(server: &mut Server, text: String) -> String {
+    match server.offline_notice() {
+        Some(notice) => format!("{notice}\n{text}"),
+        None => text,
+    }
 }
 
 /// Parses tool arguments, serde's message names the offending field.
@@ -111,6 +123,10 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
     let found = found.map_err(|error| server.failed(&error))?;
 
     let mut reply = Capped::new(SEARCH_REPLY_MAX);
+
+    if let Some(notice) = server.offline_notice() {
+        reply.push(notice);
+    }
 
     if !found.hits.is_empty() {
         reply.push(FRAME);

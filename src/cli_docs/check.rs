@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use super::{Context, Done, Failure, Reply};
 use crate::backend::{self, Access};
 use crate::cli::Args;
-use crate::config::{Backend, Place};
+use crate::config::{Backend, Layout, Place};
 use crate::store::DIMS;
 use crate::store::libsql::{self, Trouble};
 use crate::store::postgres::{self, Fault, Problem};
@@ -35,7 +35,13 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
     let mut reports: Vec<(Place, Done)> = Vec::new();
 
     for place in context.routing.places() {
-        reports.push((place, check_place(context, place)?));
+        let done = check_place(context, place)?;
+
+        if place == Place::Remote && context.routing.layout() == Layout::Both {
+            note_reach(context, &done);
+        }
+
+        reports.push((place, done));
     }
 
     let first = reports.iter().position(|(_, done)| done.code != 0).unwrap_or(0);
@@ -48,6 +54,22 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
     shown.json["places"] = Value::Object(places);
 
     Ok(shown)
+}
+
+/// Records what the check found out about reaching the remote database, which every other command
+/// goes by while this computer stands in for it (see [`crate::store::Reach`]): an `unreachable`
+/// problem starts the cooldown, any other answer ends it. The check itself is never skipped.
+fn note_reach(context: &Context, done: &Done) {
+    let reach = backend::reach_of(context.env, context.backend);
+
+    match done.json["problem"].as_str() {
+        Some("unreachable") => reach.failed(
+            done.json["message"]
+                .as_str()
+                .unwrap_or("the remote database is unreachable"),
+        ),
+        _ => reach.reached(),
+    }
 }
 
 /// The check of one place.

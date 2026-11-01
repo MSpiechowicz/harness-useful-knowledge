@@ -14,6 +14,11 @@
 //!
 //! The embedder process answers the query's vector. Without it the model is loaded in this process
 //! when it is installed, else the search is keyword-only and says so on stderr.
+//!
+//! With both places in use, a remote database that cannot be reached (or is cooling down) leaves
+//! the answer to this computer's documents. The array keeps its shape, and stderr gets one line
+//! before the JSON: `harness-knowledge: Remote knowledge is unreachable. Showing documents on this
+//! computer only.` The search itself still exits 0.
 
 use std::process::ExitCode;
 
@@ -24,7 +29,7 @@ use crate::cli::{self, Args};
 use crate::config::{Backend, Routing};
 use crate::search::render::{DOC_TAG, Pointer, block, chunk_ref, words_of};
 use crate::search::{self, AutoEmbedder, Query, QueryEmbedder, Tuning, Vectors};
-use crate::store::routed::ids;
+use crate::store::routed::{OFFLINE_NOTICE, ids};
 use crate::store::{Scope, StoreError, clean};
 use crate::support::Env;
 
@@ -51,7 +56,7 @@ impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Self {
         match error {
             OpenError::Missing { code, message } => Self::Missing { code, message },
-            OpenError::Failed(message) => Self::Failed(message),
+            OpenError::Failed(message) | OpenError::Unreachable(message) => Self::Failed(message),
         }
     }
 }
@@ -74,6 +79,9 @@ impl From<StoreError> for Failure {
 pub struct Answer {
     pub json: Value,
     pub notice: Option<String>,
+    /// The remote database could not be reached: the array is from this computer alone, and stderr
+    /// says so ([`crate::store::routed::OFFLINE_NOTICE`]).
+    pub offline: bool,
 }
 
 /// `harness-knowledge search <args>`.
@@ -90,6 +98,10 @@ pub fn search(args: &[Option<&str>]) -> ExitCode {
 
     match answer(&env, &selection.backend, selection.routing, args, &mut embedder) {
         Ok(answer) => {
+            if answer.offline {
+                eprintln!("harness-knowledge: {OFFLINE_NOTICE}");
+            }
+
             if let Some(notice) = &answer.notice {
                 eprintln!("harness-knowledge: {notice}");
             }
@@ -210,6 +222,7 @@ pub fn answer(
         return Ok(Answer {
             json: json!([]),
             notice: None,
+            offline: false,
         });
     };
 
@@ -266,6 +279,7 @@ pub fn answer(
     Ok(Answer {
         json: Value::Array(items),
         notice,
+        offline: store.offline(),
     })
 }
 

@@ -7,6 +7,10 @@
 //! be reached, the prompt is too short to mean anything, nothing is above the recall floors
 //! ([`crate::store::rank`]), or the work does not finish within [`DEADLINE`].
 //!
+//! With both places in use, a remote database that cannot be reached (it gets
+//! [`HOOK_PROBE_TIMEOUT`] to connect, then a shared cooldown applies) leaves the pointers to this
+//! computer's documents, and the block carries no notice about it: it stays the same shape.
+//!
 //! While the embedder answers, only the vector list counts, above a stricter cosine floor, and only
 //! the pointers as close as the best one ([`rank::RECALL_COSINE_BAND`]). When it
 //! does not, recall never loads the model itself (that takes seconds and half a gigabyte, in a hook
@@ -14,10 +18,9 @@
 
 use std::io::Read;
 use std::process::ExitCode;
-use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::backend::{self, Access};
+use crate::backend::{self, Access, HOOK_PROBE_TIMEOUT};
 use crate::cli::Args;
 use crate::config::{self, Backend, Routing};
 use crate::project::ProjectResolver;
@@ -109,16 +112,7 @@ pub struct Setup {
 /// The result of `work` run on a thread of its own; `None` when it did not finish within `deadline`
 /// (the thread is left to end by itself, and the process ends first).
 pub fn within<T: Send + 'static>(deadline: Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let (sender, receiver) = mpsc::channel();
-
-    std::thread::Builder::new()
-        .name("recall".to_owned())
-        .spawn(move || {
-            let _ = sender.send(work());
-        })
-        .ok()?;
-
-    receiver.recv_timeout(deadline).ok()
+    crate::support::deadline::within("recall", deadline, work)
 }
 
 /// The first [`PROMPT_MAX`] bytes of `input` as text (a cut character is dropped); `None` when it
@@ -159,9 +153,17 @@ pub fn pointers(prompt: &str, mut setup: Setup) -> Option<String> {
     let repo = projects.resolve(setup.project.as_deref()).ok().flatten();
     let scope = Scope::from_repo(repo);
 
-    let mut store = backend::open(&setup.env, &setup.backend, setup.routing, Access::Read)
-        .ok()
-        .flatten()?;
+    // The remote database gets a second, not the connect timeout of a command: this has to end within
+    // the deadline. While it cannot be reached the pointers come from this computer, and nothing says so.
+    let mut store = backend::open_within(
+        &setup.env,
+        &setup.backend,
+        setup.routing,
+        Access::Read,
+        HOOK_PROBE_TIMEOUT,
+    )
+    .ok()
+    .flatten()?;
     let query = Query {
         text: &text,
         scope: &scope,

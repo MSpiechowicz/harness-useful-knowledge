@@ -72,7 +72,7 @@ use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 pub const DEFAULT_DATABASE: &str = "harness_knowledge";
 
 /// How long the driver looks for a usable server when the URL does not say.
-const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How much of the database a connection may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,12 +128,12 @@ impl MongoStore {
     }
 
     fn open(url: &str, mode: Mode) -> Result<Option<Self>, StoreError> {
-        Ok(Self::open_checked(url, mode)?)
+        Ok(Self::open_checked(url, mode, SERVER_SELECTION_TIMEOUT)?)
     }
 
     /// [`Self::open`], telling a server without `mongot` apart from other failures.
-    fn open_checked(url: &str, mode: Mode) -> Result<Option<Self>, Opening> {
-        let (client, db) = connect_client(url)?;
+    fn open_checked(url: &str, mode: Mode, selection_timeout: Duration) -> Result<Option<Self>, Opening> {
+        let (client, db) = connect_client(url, selection_timeout)?;
         let transactions = transactions(&client)?;
         let failed = |error: Error| match connection::missing(&error) {
             Some((code, message)) => Opening::Missing { code, message },
@@ -375,18 +375,27 @@ impl KnowledgeStore for MongoStore {
 }
 
 /// The store `backend::open` hands out for a MongoDB URL: `None` when `access` does not create the
-/// database and nobody wrote to it. Failures are one readable line without the URL (and with every
+/// database and nobody wrote to it, and a server is given up on after `connect_timeout` unless the URL
+/// names its own `serverSelectionTimeoutMS`. Failures are one readable line without the URL (and with every
 /// secret of it scrubbed).
-pub fn open_boxed(url: &str, access: Access, secrets: &Secrets) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+pub fn open_boxed(
+    url: &str,
+    access: Access,
+    connect_timeout: Duration,
+    secrets: &Secrets,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     let mode = match access {
         Access::Read => Mode::ReadOnly,
         Access::Existing => Mode::Existing,
         Access::Create => Mode::Create,
     };
 
-    match MongoStore::open_checked(url, mode) {
+    match MongoStore::open_checked(url, mode, connect_timeout) {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
         Err(Opening::Missing { code, message }) => Err(OpenError::Missing { code, message }),
+        Err(Opening::Failed(StoreError::Unreachable(message))) => Err(OpenError::Unreachable(
+            secrets.scrub(&format!("cannot reach the MongoDB database: {message}")),
+        )),
         Err(Opening::Failed(error)) => Err(OpenError::Failed(
             secrets.scrub(&format!("cannot open the MongoDB database: {error}")),
         )),
@@ -416,7 +425,7 @@ impl From<Opening> for StoreError {
 
 /// The client and the database of `url` (no request is sent yet): the URL and TLS rules applied,
 /// the database from the URL path.
-fn connect_client(url: &str) -> Result<(Client, Database), StoreError> {
+fn connect_client(url: &str, selection_timeout: Duration) -> Result<(Client, Database), StoreError> {
     let checked = connection::check(url)?;
     let mut options = ClientOptions::parse(url)
         .run()
@@ -429,7 +438,7 @@ fn connect_client(url: &str) -> Result<(Client, Database), StoreError> {
         .clone()
         .unwrap_or_else(|| DEFAULT_DATABASE.to_owned());
     options.app_name.get_or_insert_with(|| "harness-knowledge".to_owned());
-    options.server_selection_timeout.get_or_insert(SERVER_SELECTION_TIMEOUT);
+    options.server_selection_timeout.get_or_insert(selection_timeout);
 
     let client = Client::with_options(options).map_err(|error| connection::connect_error(&error, url))?;
     let db = client.database(&name);

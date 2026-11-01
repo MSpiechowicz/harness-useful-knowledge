@@ -35,7 +35,7 @@ use crate::held::{Claim, HeldItem, HeldStore};
 use crate::import::events::Status;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
-use crate::store::routed::ids;
+use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
 use crate::store::{Origin, clean};
 use crate::support::Env;
 use crate::tokens::counter_for;
@@ -243,6 +243,7 @@ fn open_failure(error: OpenError) -> Reply {
     match error {
         OpenError::Missing { code, message } => Reply::Missing { code, message },
         OpenError::Failed(message) => Reply::Failed(message),
+        OpenError::Unreachable(_) => Reply::Failed(REMOTE_DOWN_WRITE.to_owned()),
     }
 }
 

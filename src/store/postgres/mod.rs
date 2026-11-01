@@ -39,10 +39,11 @@ mod tests;
 pub mod vector;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use postgres::{Client, Transaction};
 
-pub use connect::UrlError;
+pub use connect::{CONNECT_TIMEOUT, UrlError};
 pub use probe::{Probe, probe};
 use schema::{SCHEMA_VERSION, SchemaState};
 use vector::Version;
@@ -84,7 +85,14 @@ impl PostgresStore {
     /// written by a newer server connects, but every operation then fails with
     /// [`StoreError::NewerSchema`].
     pub fn open(url: &str, access: Access) -> Result<Option<Self>, Fault> {
-        let settings = connect::parse(url).map_err(|error| StoreError::Backend(error.to_string()))?;
+        Self::open_within(url, access, connect::CONNECT_TIMEOUT)
+    }
+
+    /// [`PostgresStore::open`] giving up on a connection after `connect_timeout` unless the URL
+    /// names its own `connect_timeout`.
+    pub fn open_within(url: &str, access: Access, connect_timeout: Duration) -> Result<Option<Self>, Fault> {
+        let settings =
+            connect::parse_within(url, connect_timeout).map_err(|error| StoreError::Backend(error.to_string()))?;
         let mut client = session::open(&settings)?;
 
         let state = match (schema::stored_version(&mut client)?, access) {
@@ -226,7 +234,7 @@ fn transact<T>(
 /// The error of a `COMMIT` whose connection closed: the server may or may not have saved it.
 fn uncertain(error: StoreError) -> StoreError {
     match error {
-        StoreError::Backend(message) => StoreError::Backend(format!(
+        StoreError::Backend(message) | StoreError::Unreachable(message) => StoreError::Backend(format!(
             "{message}. The connection closed while the write was committed, so it may have been saved: \
              read it back before repeating it"
         )),
@@ -334,10 +342,15 @@ impl KnowledgeStore for PostgresStore {
 }
 
 /// The store `backend::open` hands out for a PostgreSQL URL: `None` when `access` does not create
-/// the schema and the database has none. Failures are one readable line without the URL (and with
+/// the schema and the database has none, and connecting is given up on after `connect_timeout`. Failures are one readable line without the URL (and with
 /// every secret of it scrubbed).
-pub fn open_boxed(url: &str, access: Access, secrets: &Secrets) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
-    match PostgresStore::open(url, access) {
+pub fn open_boxed(
+    url: &str,
+    access: Access,
+    connect_timeout: Duration,
+    secrets: &Secrets,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    match PostgresStore::open_within(url, access, connect_timeout) {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
         Err(fault) => Err(open_error(fault, secrets)),
     }
@@ -351,6 +364,9 @@ fn open_error(fault: Fault, secrets: &Secrets) -> OpenError {
             code: problem.code(),
             message: secrets.scrub(&problem.message()),
         },
+        Fault::Problem(Problem::Unreachable(message)) | Fault::Store(StoreError::Unreachable(message)) => {
+            OpenError::Unreachable(secrets.scrub(&format!("cannot reach the PostgreSQL database: {message}")))
+        }
         fault => OpenError::Failed(secrets.scrub(&format!(
             "cannot open the PostgreSQL database: {}",
             fault_message(fault)
@@ -362,7 +378,7 @@ fn open_error(fault: Fault, secrets: &Secrets) -> OpenError {
 fn fault_message(fault: Fault) -> String {
     match fault {
         Fault::Problem(problem) => problem.message(),
-        Fault::Store(StoreError::Backend(message)) => message,
+        Fault::Store(StoreError::Backend(message) | StoreError::Unreachable(message)) => message,
         Fault::Store(other) => other.to_string(),
     }
 }
