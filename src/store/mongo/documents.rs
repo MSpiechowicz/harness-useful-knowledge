@@ -9,8 +9,9 @@ use mongodb::bson::{Bson, Document as Row, doc};
 use super::ctx::{Ctx, Fail, long};
 use super::schema::{CHUNKS, DOCUMENTS};
 use super::{int, strings, terms, text};
-use crate::limits::DELETE_IDS_MAX;
-use crate::store::{Chunk, DIMS, Document, Link, Origin, StoreError};
+use crate::chunk::passage;
+use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
+use crate::store::{Chunk, DIMS, Document, Link, Origin, PendingChunk, StoreError};
 
 /// The fields of a document that change with an import or a rename (everything but `created_at`).
 fn fields(doc: &Document, title: &str, chunks: usize, links: &[Link]) -> Row {
@@ -258,6 +259,47 @@ pub(super) fn reusable_embeddings(
     }
 
     Ok(found)
+}
+
+/// The next `limit` chunks after chunk `after` that have no embedding of `model_id` (a chunk
+/// without an embedding has no `model_id` either, and `$ne` matches a missing field).
+pub(super) fn pending_chunks(
+    ctx: &mut Ctx<'_>,
+    model_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<PendingChunk>, Fail> {
+    let filter = doc! { "_id": { "$gt": after }, "model_id": { "$ne": model_id } };
+    let wanted = i64::try_from(limit.min(EMBED_BATCH_MAX)).unwrap_or(i64::MAX);
+    let projection = doc! { "doc_id": 1, "title": 1, "heading_path": 1, "text": 1 };
+    let rows = ctx.find(CHUNKS, filter, (doc! { "_id": 1 }, 0, wanted), projection)?;
+
+    Ok(rows
+        .iter()
+        .map(|row| PendingChunk {
+            chunk_id: int(row, "_id"),
+            doc_id: int(row, "doc_id"),
+            embed_text: passage(
+                &text(row, "title").unwrap_or_default(),
+                &text(row, "heading_path").unwrap_or_default(),
+                &text(row, "text").unwrap_or_default(),
+            ),
+        })
+        .collect())
+}
+
+/// Stores the embeddings; the number of chunks that existed.
+pub(super) fn set_embeddings(ctx: &mut Ctx<'_>, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, Fail> {
+    let mut found = 0;
+
+    for (chunk_id, vector) in embeddings {
+        let vector: Vec<f64> = vector.iter().map(|value| f64::from(*value)).collect();
+        let update = doc! { "$set": { "embedding": vector, "model_id": model_id } };
+
+        found += ctx.update_one(CHUNKS, doc! { "_id": *chunk_id }, update, false)?;
+    }
+
+    Ok(usize::try_from(found).unwrap_or(usize::MAX))
 }
 
 /// The embedding of a stored chunk; `None` unless it is exactly [`DIMS`] numbers.

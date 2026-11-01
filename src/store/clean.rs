@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use super::{Chunk, DIMS, Link, StoreError, glob};
-use crate::limits::{CHUNKS_PER_DOC_MAX, GLOB_MAX, GLOBS_MAX, LINKS_MAX, REPO_KEY_MAX, TITLE_MAX};
+use crate::limits::{CHUNKS_PER_DOC_MAX, EMBED_BATCH_MAX, GLOB_MAX, GLOBS_MAX, LINKS_MAX, REPO_KEY_MAX, TITLE_MAX};
 use crate::support::text::{display_safe, is_format_character};
 
 /// A document title (1 to [`TITLE_MAX`] characters, one line).
@@ -136,6 +136,26 @@ pub fn chunks(chunks: &[Chunk]) -> Result<(), StoreError> {
                 }
             }
             _ => return Err(invalid("a chunk has an embedding and a model, or neither".to_owned())),
+        }
+    }
+
+    Ok(())
+}
+
+/// `embeddings` of existing chunks, to be stored for `model_id`: a model, at most
+/// [`EMBED_BATCH_MAX`] of them, [`DIMS`] finite floats each.
+pub fn embeddings(model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<(), StoreError> {
+    if model_id.is_empty() {
+        return Err(invalid("an embedding needs the model that made it".to_owned()));
+    }
+
+    if embeddings.len() > EMBED_BATCH_MAX {
+        return Err(invalid(format!("at most {EMBED_BATCH_MAX} embeddings at once")));
+    }
+
+    for (_, vector) in embeddings {
+        if vector.len() != DIMS || vector.iter().any(|value| !value.is_finite()) {
+            return Err(invalid(format!("an embedding is {DIMS} finite numbers")));
         }
     }
 

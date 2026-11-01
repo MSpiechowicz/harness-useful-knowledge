@@ -118,6 +118,6 @@ pub fn record_model(store: &mut dyn KnowledgeStore, model: &str) -> Result<(), c
 }
 
 /// True for a vector the store takes: [`DIMS`] finite numbers.
-fn sound(vector: &[f32]) -> bool {
+pub(super) fn sound(vector: &[f32]) -> bool {
     vector.len() == DIMS && vector.iter().all(|value| value.is_finite())
 }

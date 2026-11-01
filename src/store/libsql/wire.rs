@@ -4,7 +4,7 @@
 use serde::Deserialize;
 use serde_json::json;
 
-use super::probe::{self, Problem};
+use super::probe::{self, NO_VECTOR_MESSAGE, Problem};
 use super::sql::{Value, base64_decode, base64_encode};
 use crate::store::StoreError;
 
@@ -100,11 +100,7 @@ impl Failure {
     pub(super) fn into_store_error(self) -> StoreError {
         match self.problem() {
             Some(Problem::NoFts5) => StoreError::NoFts5,
-            Some(Problem::NoVector) => backend(
-                "this libSQL server has no vector support (libsql-no-vector), use a build with F32_BLOB and \
-                 vector_top_k"
-                    .to_owned(),
-            ),
+            Some(Problem::NoVector) => backend(NO_VECTOR_MESSAGE.to_owned()),
             None => backend(self.code().unwrap_or("statement failed").to_owned()),
         }
     }

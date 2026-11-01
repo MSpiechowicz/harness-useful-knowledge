@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 
 use super::sql::{Row, Sql, Value, args, query_row};
-use crate::limits::DELETE_IDS_MAX;
+use crate::chunk::passage;
+use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
 use crate::store::sqlite::sql_shared::DOCUMENT_COLUMNS;
-use crate::store::{Chunk, DIMS, Document, Link, Origin, StoreError};
+use crate::store::{Chunk, DIMS, Document, Link, Origin, PendingChunk, StoreError};
 
 /// A [`Document`] from a row of [`DOCUMENT_COLUMNS`].
 pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
@@ -222,6 +223,60 @@ pub(super) fn reusable_embeddings(
     }
 
     Ok(found)
+}
+
+/// The next `limit` chunks after chunk `after` that have no embedding of `model_id`.
+pub(super) fn pending_chunks(
+    db: &mut dyn Sql,
+    model_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<PendingChunk>, StoreError> {
+    let rows = db.query(
+        "SELECT id, doc_id, title, heading_path, text FROM knowledge_chunks
+         WHERE id > ?1 AND (model_id IS NULL OR model_id != ?2) ORDER BY id LIMIT ?3",
+        args![after, model_id, limit.min(EMBED_BATCH_MAX)],
+    )?;
+
+    rows.iter()
+        .map(|row| {
+            let (title, heading, body): (String, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
+
+            Ok(PendingChunk {
+                chunk_id: row.get(0)?,
+                doc_id: row.get(1)?,
+                embed_text: passage(&title, &heading, &body),
+            })
+        })
+        .collect()
+}
+
+/// Stores the embeddings (each updates the ANN graph); the number of chunks that existed. The
+/// keyword index is not touched (its trigger fires on title, heading and text only).
+pub(super) fn set_embeddings(
+    db: &mut dyn Sql,
+    model_id: &str,
+    embeddings: &[(i64, Vec<f32>)],
+) -> Result<usize, StoreError> {
+    let rows: Vec<Vec<Value>> = embeddings
+        .iter()
+        .map(|(chunk_id, vector)| vec![(*chunk_id).into(), vector_text(vector).into(), model_id.into()])
+        .collect();
+
+    db.execute_many(
+        "UPDATE knowledge_chunks SET embedding = vector32(?2), model_id = ?3 WHERE id = ?1",
+        &rows,
+    )?;
+
+    let ids: Vec<i64> = embeddings.iter().map(|(chunk_id, _)| *chunk_id).collect();
+    let wanted = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned());
+    let found = query_row(
+        db,
+        "SELECT count(*) FROM knowledge_chunks WHERE model_id = ?2 AND id IN (SELECT value FROM json_each(?1))",
+        args![wanted, model_id],
+    )?;
+
+    found.map_or(Ok(0), |row| row.get(0))
 }
 
 /// The links of document `id`, by repository key.

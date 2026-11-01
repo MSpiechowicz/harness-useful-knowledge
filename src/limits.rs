@@ -24,6 +24,9 @@ pub const REPO_KEY_MAX: usize = 1024;
 /// Most chunks of one document.
 pub const CHUNKS_PER_DOC_MAX: usize = 4000;
 
+/// Most chunks one page of pending chunks, or one write of embeddings, carries.
+pub const EMBED_BATCH_MAX: usize = 256;
+
 /// Most document ids one `docs delete` takes.
 pub const DELETE_IDS_MAX: usize = 1000;
 

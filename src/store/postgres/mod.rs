@@ -49,7 +49,7 @@ use vector::Version;
 pub use vector::{Fault, Problem};
 
 use super::{Chunk, ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{RepoCounts, Scope, Stats, StoreError, clean};
+use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 use error::{backend, ended};
@@ -274,6 +274,16 @@ impl KnowledgeStore for PostgresStore {
         self.read(|client| documents::reusable_embeddings(client, model_id, chunk_shas))
     }
 
+    fn pending_chunks(&mut self, model_id: &str, after: i64, limit: usize) -> Result<Vec<PendingChunk>, StoreError> {
+        self.read(|client| documents::pending_chunks(client, model_id, after, limit))
+    }
+
+    fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError> {
+        clean::embeddings(model_id, embeddings)?;
+
+        self.write(|tx| documents::set_embeddings(tx, model_id, embeddings))
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -323,10 +333,22 @@ impl KnowledgeStore for PostgresStore {
 pub fn open_boxed(url: &str, access: Access, secrets: &Secrets) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     match PostgresStore::open(url, access) {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
-        Err(fault) => Err(OpenError::Failed(secrets.scrub(&format!(
+        Err(fault) => Err(open_error(fault, secrets)),
+    }
+}
+
+/// What a failed open is called: a database without pgvector (or with too old a one, or an index
+/// still building) lacks a capability, anything else is a failure.
+fn open_error(fault: Fault, secrets: &Secrets) -> OpenError {
+    match fault {
+        Fault::Problem(problem) if problem.is_missing() => OpenError::Missing {
+            code: problem.code(),
+            message: secrets.scrub(&problem.message()),
+        },
+        fault => OpenError::Failed(secrets.scrub(&format!(
             "cannot open the PostgreSQL database: {}",
             fault_message(fault)
-        )))),
+        ))),
     }
 }
 

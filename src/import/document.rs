@@ -67,6 +67,11 @@ pub struct Importer<'a> {
     pub links: Vec<Link>,
     /// The document the one file of this import replaces.
     pub replaces: Option<i64>,
+    /// Who the documents of this import come from: [`Origin::User`], or an agent's proposal the
+    /// person approved. A document an import updates keeps its origin, unless it is `replaces`.
+    pub origin: Origin,
+    /// The title every document of this import gets, instead of the one its file has.
+    pub title: Option<String>,
     pub cancel: &'a dyn Fn() -> bool,
     /// Set when the embedder failed: later files do not try it again.
     embedder_failed: bool,
@@ -94,6 +99,8 @@ impl<'a> Importer<'a> {
             embedder: None,
             links: Vec::new(),
             replaces: None,
+            origin: Origin::User,
+            title: None,
             cancel,
             embedder_failed: false,
         }
@@ -127,7 +134,10 @@ impl<'a> Importer<'a> {
         }
 
         let loaded = self.load(candidate)?;
-        let title = title_of(&loaded.extracted, &candidate.name);
+        let title = match &self.title {
+            Some(title) => clean::title(title)?,
+            None => title_of(&loaded.extracted, &candidate.name),
+        };
         let text_bytes: usize = loaded.extracted.sections.iter().map(|section| section.text.len()).sum();
 
         if text_bytes > TEXT_BYTES_MAX {
@@ -201,7 +211,10 @@ impl<'a> Importer<'a> {
             chunk_count: 0,
             created_at: previous.as_ref().map_or(now, |doc| doc.created_at),
             updated_at: now,
-            origin: previous.as_ref().map_or(Origin::User, |doc| doc.origin),
+            origin: match &previous {
+                Some(doc) if self.replaces.is_none() => doc.origin,
+                _ => self.origin,
+            },
             warnings: warnings.clone(),
         };
 

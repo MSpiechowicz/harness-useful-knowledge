@@ -64,7 +64,7 @@ use ctx::{Ctx, Fail};
 use schema::IndexState;
 
 use super::{Chunk, ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{RepoCounts, Scope, Stats, StoreError, clean};
+use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 
 /// The database used when the URL path names none.
 pub const DEFAULT_DATABASE: &str = "harness_knowledge";
@@ -126,9 +126,17 @@ impl MongoStore {
     }
 
     fn open(url: &str, mode: Mode) -> Result<Option<Self>, StoreError> {
+        Ok(Self::open_checked(url, mode)?)
+    }
+
+    /// [`Self::open`], telling a server without `mongot` apart from other failures.
+    fn open_checked(url: &str, mode: Mode) -> Result<Option<Self>, Opening> {
         let (client, db) = connect_client(url)?;
         let transactions = transactions(&client)?;
-        let failed = |error: Error| connection::backend(&error);
+        let failed = |error: Error| match connection::missing(&error) {
+            Some((code, message)) => Opening::Missing { code, message },
+            None => Opening::Failed(connection::backend(&error)),
+        };
 
         let version = schema::version(&db).map_err(failed)?;
 
@@ -138,9 +146,9 @@ impl MongoStore {
 
         let newer = match mode {
             Mode::ReadOnly if version < schema::SCHEMA_VERSION => {
-                return Err(StoreError::Backend(
+                return Err(Opening::Failed(StoreError::Backend(
                     "the database is from an older server and has not been upgraded yet".to_owned(),
-                ));
+                )));
             }
             Mode::ReadOnly => version > schema::SCHEMA_VERSION,
             Mode::Existing | Mode::Create => schema::migrate(&db).map_err(failed)?,
@@ -289,6 +297,16 @@ impl KnowledgeStore for MongoStore {
         self.read(|ctx| documents::reusable_embeddings(ctx, model_id, chunk_shas))
     }
 
+    fn pending_chunks(&mut self, model_id: &str, after: i64, limit: usize) -> Result<Vec<PendingChunk>, StoreError> {
+        self.read(|ctx| documents::pending_chunks(ctx, model_id, after, limit))
+    }
+
+    fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError> {
+        clean::embeddings(model_id, embeddings)?;
+
+        self.write(|ctx| documents::set_embeddings(ctx, model_id, embeddings))
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -360,11 +378,33 @@ pub fn open_boxed(url: &str, access: Access, secrets: &Secrets) -> Result<Option
         Access::Create => Mode::Create,
     };
 
-    match MongoStore::open(url, mode) {
+    match MongoStore::open_checked(url, mode) {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
-        Err(error) => Err(OpenError::Failed(
+        Err(Opening::Missing { code, message }) => Err(OpenError::Missing { code, message }),
+        Err(Opening::Failed(error)) => Err(OpenError::Failed(
             secrets.scrub(&format!("cannot open the MongoDB database: {error}")),
         )),
+    }
+}
+
+/// Why opening stopped: the server lacks a search engine, or something else failed.
+enum Opening {
+    Missing { code: &'static str, message: String },
+    Failed(StoreError),
+}
+
+impl From<StoreError> for Opening {
+    fn from(error: StoreError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<Opening> for StoreError {
+    fn from(opening: Opening) -> Self {
+        match opening {
+            Opening::Missing { message, .. } => Self::Backend(message),
+            Opening::Failed(error) => error,
+        }
     }
 }
 

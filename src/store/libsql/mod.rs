@@ -47,14 +47,14 @@ use hrana::{Client, Stream};
 use sql::Sql;
 use wire::{Outcome, execute};
 
-pub use probe::{Capabilities, Trouble, probe};
+pub use probe::{Capabilities, NO_VECTOR_MESSAGE, Trouble, probe};
 pub use schema::SCHEMA_VERSION;
 
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 
 use super::{ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{RepoCounts, Scope, Stats, StoreError, clean};
+use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 
 /// How long a write keeps asking for a lock the server reports busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -254,6 +254,16 @@ impl KnowledgeStore for LibsqlStore {
         self.read(|db| documents::reusable_embeddings(db, model_id, chunk_shas))
     }
 
+    fn pending_chunks(&mut self, model_id: &str, after: i64, limit: usize) -> Result<Vec<PendingChunk>, StoreError> {
+        self.read(|db| documents::pending_chunks(db, model_id, after, limit))
+    }
+
+    fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError> {
+        clean::embeddings(model_id, embeddings)?;
+
+        self.write(|db| documents::set_embeddings(db, model_id, embeddings))
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -347,9 +357,18 @@ pub fn open_boxed(
 
     match opened {
         Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
-        Err(StoreError::NoFts5) => Err(OpenError::NoFts5),
-        Err(error) => Err(OpenError::Failed(
-            secrets.scrub(&format!("cannot open the libSQL database: {error}")),
-        )),
+        Err(error) => Err(open_error(error, secrets)),
+    }
+}
+
+/// What a failed open is called: a server without FTS5 or without vectors lacks a capability.
+fn open_error(error: StoreError, secrets: &Secrets) -> OpenError {
+    match error {
+        StoreError::NoFts5 => OpenError::no_fts5(),
+        StoreError::Backend(message) if message == NO_VECTOR_MESSAGE => OpenError::Missing {
+            code: "libsql-no-vector",
+            message,
+        },
+        error => OpenError::Failed(secrets.scrub(&format!("cannot open the libSQL database: {error}"))),
     }
 }

@@ -1,16 +1,18 @@
 //! The `harness-knowledge` executable: `harness-knowledge --version` prints the version and
-//! `harness-knowledge features` lists what this build can do for Harness Desktop. The commands of
-//! the knowledge itself are added as they are built: so far `docs`, `repos`, `stats`, `project-key`
-//! and `check` (see [`harness_knowledge::cli_docs`]) and `embedder` (see
-//! [`harness_knowledge::cli_embedder`]).
+//! `harness-knowledge features` lists what this build can do for Harness Desktop. `harness-knowledge`
+//! alone or `harness-knowledge mcp` serves MCP over stdio (see [`harness_knowledge::mcp`]). The
+//! commands of the knowledge itself are added as they are built: so far `docs`, `repos`, `stats`,
+//! `project-key` and `check` (see [`harness_knowledge::cli_docs`]), `embedder` (see
+//! [`harness_knowledge::cli_embedder`]), `search` (see [`harness_knowledge::cli_search`]), `recall`
+//! (see [`harness_knowledge::recall`]) and `held` (see [`harness_knowledge::cli_held`]).
 
 use std::process::ExitCode;
 
-use harness_knowledge::{cli, cli_docs, cli_embedder, extract};
+use harness_knowledge::{cli, cli_docs, cli_embedder, cli_held, cli_search, extract, mcp, recall};
 
 /// What this build can do, as `harness-knowledge features` lists it: one token per line, for Harness
 /// Desktop to tell what it can offer. A token is added in the same change that makes the feature work.
-const FEATURES: [&str; 3] = ["docs", "embedder", "import-ndjson"];
+const FEATURES: [&str; 7] = ["docs", "embedder", "import-ndjson", "search", "recall", "held", "mcp"];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
 /// the model relies on (glibc's allocator keeps it).
@@ -22,6 +24,7 @@ fn main() -> ExitCode {
     let args: Vec<Option<&str>> = args.iter().map(|arg| arg.to_str()).collect();
 
     match args.as_slice() {
+        [] | [Some("mcp")] => mcp::run(),
         [Some("--version")] => {
             println!("harness-knowledge {}", env!("HARNESS_KNOWLEDGE_VERSION"));
             ExitCode::SUCCESS
@@ -39,12 +42,17 @@ fn main() -> ExitCode {
         [Some("project-key"), rest @ ..] => cli_docs::project_key(rest),
         [Some("check"), rest @ ..] => cli_docs::check(rest),
         [Some("embedder"), rest @ ..] => cli_embedder::embedder(rest),
+        [Some("search"), rest @ ..] => cli_search::search(rest),
+        [Some("recall"), rest @ ..] => recall::recall(rest),
+        [Some("held"), rest @ ..] => cli_held::held(rest),
         // Hidden: the child process an import runs to read a PDF (see `extract::worker`).
         [Some("extract-worker"), rest @ ..] => extract::worker::run(rest),
         _ => cli::usage(&format!(
-            "[features | --version | {} | {}]",
+            "[mcp | features | --version | {} | {} | {} | {}]",
             cli_docs::USAGE,
-            cli_embedder::USAGE
+            cli_embedder::USAGE,
+            cli_search::USAGE,
+            cli_held::USAGE
         )),
     }
 }

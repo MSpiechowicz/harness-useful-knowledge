@@ -7,8 +7,8 @@
 //! process, so there is no index to build and the vector index is always ready.
 //!
 //! A SQLite without FTS5 cannot keep the keyword index: `ok` is false, `capabilities.keyword` too,
-//! `problem` is `no-fts5` with a `message`, and the exit code is 3. A team database has no store
-//! yet and exits 2 (see [`crate::backend`]).
+//! `problem` is `no-fts5` with a `message`, and the exit code is 3. The team databases print the
+//! same JSON with their own problem codes, also exit 3.
 
 use serde_json::{Value, json};
 
@@ -177,9 +177,12 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
     };
 
     if !found.vector {
-        let message = "this libSQL server has no vector support (F32_BLOB, vector32, vector_top_k), use a libSQL \
-                       server build that has it";
-        return Ok(problem("libsql-no-vector", message, found.keyword, false));
+        return Ok(problem(
+            "libsql-no-vector",
+            libsql::NO_VECTOR_MESSAGE,
+            found.keyword,
+            false,
+        ));
     }
 
     if !found.keyword {

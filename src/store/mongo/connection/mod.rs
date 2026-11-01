@@ -279,6 +279,12 @@ pub(super) fn error_code(error: &Error) -> Option<i32> {
     }
 }
 
+/// The capability the server of `error` lacks, as its `check` problem code and the text to show:
+/// only a server without `mongot` (`no-mongot`).
+pub(super) fn missing(error: &Error) -> Option<(&'static str, String)> {
+    (error_code(error) == Some(SEARCH_NOT_ENABLED)).then(|| ("no-mongot", NO_MONGOT.to_owned()))
+}
+
 /// The text shown for a server without `mongot`.
 pub(super) const NO_MONGOT: &str = "this MongoDB server has no search engine (mongot), use MongoDB Atlas or \
                                     MongoDB 8.2 or newer with mongot";

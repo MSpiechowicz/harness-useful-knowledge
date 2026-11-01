@@ -8,8 +8,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::schema::EMBEDDING_BYTES;
 use super::sql_shared::DOCUMENT_COLUMNS;
-use crate::limits::DELETE_IDS_MAX;
-use crate::store::{Chunk, Document, Link, Origin, StoreError};
+use crate::chunk::passage;
+use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
+use crate::store::{Chunk, Document, Link, Origin, PendingChunk, StoreError};
 
 /// A [`Document`] from a row of [`DOCUMENT_COLUMNS`].
 pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
@@ -216,6 +217,48 @@ pub(super) fn reusable_embeddings(
     }
 
     Ok(found)
+}
+
+/// The next `limit` chunks after chunk `after` that have no embedding of `model_id`.
+pub(super) fn pending_chunks(
+    conn: &Connection,
+    model_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<PendingChunk>, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT id, doc_id, title, heading_path, text FROM knowledge_chunks
+         WHERE id > ?1 AND (model_id IS NULL OR model_id != ?2) ORDER BY id LIMIT ?3",
+    )?;
+    let limit = limit.min(EMBED_BATCH_MAX);
+    let rows = statement.query_map(params![after, model_id, limit], |row| {
+        let (title, heading, text): (String, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
+
+        Ok(PendingChunk {
+            chunk_id: row.get(0)?,
+            doc_id: row.get(1)?,
+            embed_text: passage(&title, &heading, &text),
+        })
+    })?;
+
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Stores the embeddings; the number of chunks that existed. The keyword index is not touched (its
+/// trigger fires on title, heading and text only).
+pub(super) fn set_embeddings(
+    tx: &Transaction,
+    model_id: &str,
+    embeddings: &[(i64, Vec<f32>)],
+) -> Result<usize, StoreError> {
+    let mut update = tx.prepare("UPDATE knowledge_chunks SET embedding = ?2, model_id = ?3 WHERE id = ?1")?;
+    let mut changed = 0;
+
+    for (chunk_id, vector) in embeddings {
+        changed += update.execute(params![chunk_id, encode(vector), model_id])?;
+    }
+
+    Ok(changed)
 }
 
 /// The links of document `id`, by repository key.

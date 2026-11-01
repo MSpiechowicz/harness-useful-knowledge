@@ -148,3 +148,117 @@ fn the_floats_of_a_vector_survive_their_text() {
 
     assert_eq!(back, vector);
 }
+
+/// A server whose every statement succeeds with no rows, except the ones that mention
+/// `refuse`: those fail with `message`.
+fn refusing_server(refuse: &'static str, message: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let body = read_body(&mut stream);
+            let requests = serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body")["requests"].clone();
+
+            let results: Vec<serde_json::Value> = requests
+                .as_array()
+                .expect("requests")
+                .iter()
+                .map(|request| {
+                    let sql = request["sql"]
+                        .as_str()
+                        .or(request["stmt"]["sql"].as_str())
+                        .unwrap_or("");
+
+                    if sql.contains(refuse) {
+                        serde_json::json!({ "type": "error", "error": { "message": message, "code": "SQLITE_ERROR" } })
+                    } else if request["type"] == "close" {
+                        serde_json::json!({ "type": "ok", "response": { "type": "close" } })
+                    } else {
+                        serde_json::json!({ "type": "ok", "response": { "type": "execute", "result": {
+                            "cols": [], "rows": [], "affected_row_count": 0, "last_insert_rowid": null } } })
+                    }
+                })
+                .collect();
+
+            // A transaction's stream stays open: it gets a baton, a one-shot stream is closed.
+            let closing = requests
+                .as_array()
+                .is_some_and(|all| all.iter().any(|one| one["type"] == "close"));
+            let baton = if closing {
+                serde_json::Value::Null
+            } else {
+                "baton".into()
+            };
+            let reply = serde_json::json!({ "baton": baton, "results": results }).to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                reply.len()
+            );
+            stream.write_all(head.as_bytes()).ok();
+            stream.write_all(reply.as_bytes()).ok();
+        }
+    });
+
+    url
+}
+
+/// The body of the HTTP request on `stream`.
+fn read_body(stream: &mut std::net::TcpStream) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buffer = [0; 8192];
+
+    loop {
+        let read = stream.read(&mut buffer).expect("request bytes");
+        bytes.extend_from_slice(&buffer[..read]);
+
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse::<usize>())
+                })
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+            if body.len() >= length || read == 0 {
+                return body.to_owned();
+            }
+        }
+    }
+}
+
+#[test]
+fn opening_a_server_without_vectors_is_a_missing_capability() {
+    let url = refusing_server("libsql_vector_idx", "SQLite error: no such function: libsql_vector_idx");
+    let secrets = Secrets::of(&url, None);
+
+    let error = open_boxed(&url, None, Access::Create, &secrets)
+        .err()
+        .expect("the migration fails");
+
+    assert_eq!(
+        error,
+        OpenError::Missing {
+            code: "libsql-no-vector",
+            message: crate::store::libsql::NO_VECTOR_MESSAGE.to_owned()
+        }
+    );
+}
+
+#[test]
+fn opening_a_server_without_fts5_is_a_missing_capability() {
+    let url = refusing_server("fts5", "SQLite error: no such module: fts5");
+    let secrets = Secrets::of(&url, None);
+
+    let error = open_boxed(&url, None, Access::Create, &secrets)
+        .err()
+        .expect("the migration fails");
+
+    assert_eq!(error, OpenError::no_fts5());
+}

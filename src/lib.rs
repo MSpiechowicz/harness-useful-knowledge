@@ -11,15 +11,22 @@
 //!   failure report.
 //! - [`cli_docs`]: the `docs`, `repos`, `stats`, `project-key` and `check` commands.
 //! - [`cli_embedder`]: the `embedder` command.
+//! - [`cli_held`]: the review queue commands: `held list|get|approve|reject`.
+//! - [`cli_search`]: the `search` command.
 //! - [`config`]: which database to use (the local file, or a team database from the environment or
 //!   the config file).
 //! - [`digest`]: SHA-256 as hex.
 //! - [`embed`]: the embedder: the e5 model on tract, its worker threads, its local socket and client.
 //! - [`extract`]: reads Markdown, text, HTML, OpenAPI, AsciiDoc, RST and PDF into sections.
+//! - [`held`]: the review queue of an agent's proposals (`knowledge_add`), one file each.
 //! - [`import`]: `docs import` and `docs reindex`: the manifest, the folder walk, dedupe, events.
 //! - [`limits`]: per-call limits.
 //! - [`location`]: where the local database lives.
+//! - [`mcp`]: the MCP server (`knowledge_search`, `knowledge_get`, `knowledge_list`, `knowledge_add`).
 //! - [`project`]: which repository a call is about.
+//! - [`recall`]: `recall --hook`, the pointers a prompt gets.
+//! - [`search`]: one query through the keyword index and the vectors, fused and ranked, and the
+//!   untrusted-documentation wrapping of what it finds.
 //! - [`store`]: what a backend stores and answers, the local SQLite file, the search fusion and ranking.
 //! - [`tokens`]: token counts for the chunker (the model's tokenizer, or an estimate).
 //! - [`support`]: the environment, git runner, secret masking and text checks the rest uses.
@@ -32,14 +39,20 @@ pub mod chunk;
 pub mod cli;
 pub mod cli_docs;
 pub mod cli_embedder;
+pub mod cli_held;
+pub mod cli_search;
 pub mod config;
 pub mod digest;
 pub mod embed;
 pub mod extract;
+pub mod held;
 pub mod import;
 pub mod limits;
 pub mod location;
+pub mod mcp;
 pub mod project;
+pub mod recall;
+pub mod search;
 pub mod store;
 pub mod support;
 pub mod tokens;

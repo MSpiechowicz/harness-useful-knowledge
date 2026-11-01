@@ -177,3 +177,15 @@ Feature branches in each repo, commits per milestone, `cargo clean` before commi
   - mongo:8 community → code 31082 `SearchNotEnabled`.
   - libSQL missing index → `vector index(search): failed to parse vector index parameters`.
 - **X8 brute force** (384-d, top-10): 100k vectors take 3.7 ms in RAM on 1 thread (146 MB), or 54–87 ms when scanned from SQLite. Use a multi-accumulator dot product (a naive one is 6x slower).
+
+## Calibration (X6) and embedder numbers
+- **Embedder pool** (tract, one shared plan): 4 threads give about 7 passages/s (350 tokens) at about 580 MB RSS, and 8 threads give about 12/s. Idle unload drops to 130 MB, and the reload takes about 0.9 s. A query jumps ahead of an import (about 0.15 s).
+- **Real reindex:** 759 chunks in 62 s.
+- **Corpus:** the docs of desktop, memory and skills: 20 docs, 1144 chunks. 40 queries (25 English, 15 Polish) plus 6 off-topic.
+  - recall@3 fused: 38/40.
+  - keyword: 31/40 (Polish only 6/15).
+  - vector: 38/40.
+- **Constants** (`src/store/rank.rs`):
+  - `COSINE_FLOOR` 0.80, `FLOOR` 400, `MARGIN` 0.4, `LINKED_BOOST` 1.1, `GLOB_BOOST` 1.3, `KEYWORD_FLOOR` 0. Keyword scores are not comparable across backends, so cosine is the portable signal.
+  - Recall: `RECALL_COSINE_FLOOR` 0.82 with a 0.02 band (0/6 off-topic answered, found@3 37/40), and `RECALL_KEYWORD_FLOOR` 10 when the embedder is down (SQLite/libSQL scale, uncalibrated on Postgres and Atlas).
+- **Reproduce:** `cargo test --release --lib search::tests::calibration -- --nocapture` with `HARNESS_KNOWLEDGE_TEST_MODEL_DIR` and `HARNESS_KNOWLEDGE_TEST_CORPUS_ROOT`.

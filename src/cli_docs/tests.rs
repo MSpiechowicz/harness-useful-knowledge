@@ -435,21 +435,29 @@ fn stats_and_check_describe_the_database() {
 }
 
 #[test]
-fn a_team_database_is_unsupported_until_its_store_is_built() {
-    let fixture = Fixture::new();
-    let backend = crate::config::backend_for(Some("postgres://u:secret@db/k".to_owned()), None).expect("backend");
-
-    for args in [
-        &["list", "--json"][..],
-        &["check", "--json"],
-        &["stats", "--json"],
-        &["repos", "--json"],
+fn a_missing_capability_of_the_database_exits_3_in_every_command_and_a_failed_open_exits_1() {
+    for code in [
+        "no-fts5",
+        "no-mongot",
+        "no-pgvector",
+        "pgvector-no-privilege",
+        "pgvector-too-old",
+        "libsql-no-vector",
+        "index-building",
     ] {
-        match fixture.run_on(&backend, args, "") {
-            Err(Failure::Unsupported(message)) => assert!(!message.contains("secret"), "{message}"),
-            other => panic!("{args:?}: {other:?}"),
-        }
+        let message = format!("the database lacks {code}");
+        let failure = Failure::from(OpenError::Missing {
+            code,
+            message: message.clone(),
+        });
+
+        assert_eq!(failure, Failure::Missing { code, message });
+        assert_eq!(finish(Err(failure)), ExitCode::from(3), "{code}");
     }
+
+    let failed = Failure::from(OpenError::Failed("cannot open".to_owned()));
+    assert_eq!(failed, Failure::Failed("cannot open".to_owned()));
+    assert_eq!(finish(Err(failed)), ExitCode::FAILURE);
 }
 
 #[test]

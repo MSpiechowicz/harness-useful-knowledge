@@ -91,6 +91,12 @@ impl Problem {
         }
     }
 
+    /// True for a capability the database lacks (exit 3 of a command), false for a server that
+    /// could not be reached or refused the login.
+    pub fn is_missing(&self) -> bool {
+        !matches!(self, Self::Unreachable(_) | Self::Auth)
+    }
+
     /// What to tell the person, in a sentence or two. It never holds the URL or a password.
     pub fn message(&self) -> String {
         match self {

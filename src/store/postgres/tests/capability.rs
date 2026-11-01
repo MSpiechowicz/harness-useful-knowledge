@@ -1,10 +1,11 @@
 //! What `check` finds on servers that cannot (or can) serve knowledge, see [`probe`].
 
 use super::support::{client, database, plain_database, unique, url_of, with_database, with_login};
-use crate::backend::Access;
+use crate::backend::{Access, OpenError};
+use crate::config::Secrets;
 use crate::store::KnowledgeStore;
-use crate::store::postgres::vector::{Fault, Problem};
-use crate::store::postgres::{PostgresStore, probe};
+use crate::store::postgres::vector::{Fault, Problem, Version};
+use crate::store::postgres::{PostgresStore, open_boxed, open_error, probe};
 use crate::store::testing::Seed;
 
 /// A database of its own on the pgvector server, dropped on drop.
@@ -197,4 +198,61 @@ fn team_a_server_without_pgvector_is_the_no_pgvector_problem_and_stays_untouched
         url_of(super::support::PLAIN_URL_VAR).is_some(),
         "the variable is still set"
     );
+}
+
+#[test]
+fn a_missing_capability_is_told_apart_from_an_open_that_failed() {
+    let url = "postgres://someone:hunter2-secret@db.example.com/knowledge";
+    let secrets = Secrets::of(url, None);
+
+    let missing = [
+        (Problem::NoPgvector, "no-pgvector"),
+        (Problem::NoPrivilege, "pgvector-no-privilege"),
+        (Problem::TooOld(Version(0, 4, 4)), "pgvector-too-old"),
+        (Problem::IndexBuilding, "index-building"),
+    ];
+
+    for (problem, code) in missing {
+        let message = problem.message();
+
+        assert_eq!(
+            open_error(Fault::Problem(problem), &secrets),
+            OpenError::Missing { code, message }
+        );
+    }
+
+    for problem in [Problem::Unreachable("no route".to_owned()), Problem::Auth] {
+        match open_error(Fault::Problem(problem), &secrets) {
+            OpenError::Failed(message) => {
+                assert!(message.starts_with("cannot open the PostgreSQL database"), "{message}")
+            }
+            other => panic!("not a missing capability: {other:?}"),
+        }
+    }
+
+    let leaked = Problem::Unreachable(format!("cannot reach {url}"));
+    match open_error(Fault::Problem(leaked), &secrets) {
+        OpenError::Failed(message) => assert!(!message.contains("hunter2-secret"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn team_opening_a_server_without_pgvector_is_a_missing_capability() {
+    let Some(db) = plain_database() else { return };
+    let secrets = Secrets::of(db.url(), None);
+
+    for access in [Access::Create, Access::Existing, Access::Read] {
+        let opened = open_boxed(db.url(), access, &secrets);
+
+        match (access, opened) {
+            (Access::Create, Err(OpenError::Missing { code, message })) => {
+                assert_eq!(code, "no-pgvector");
+                assert!(message.contains("pgvector"), "{message}");
+            }
+            // Nothing was created, so there is nothing to read or change.
+            (_, Ok(None)) => {}
+            (access, other) => panic!("{access:?}: {:?}", other.map(|_| ())),
+        }
+    }
 }

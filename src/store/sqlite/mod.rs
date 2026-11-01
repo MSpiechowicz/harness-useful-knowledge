@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
+use super::PendingChunk;
 use super::{ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
 use super::{RepoCounts, Scope, Stats, StoreError, clean};
 use schema::SchemaState;
@@ -210,6 +211,16 @@ impl KnowledgeStore for SqliteStore {
         chunk_shas: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, StoreError> {
         documents::reusable_embeddings(self.conn()?, model_id, chunk_shas)
+    }
+
+    fn pending_chunks(&mut self, model_id: &str, after: i64, limit: usize) -> Result<Vec<PendingChunk>, StoreError> {
+        documents::pending_chunks(self.conn()?, model_id, after, limit)
+    }
+
+    fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError> {
+        clean::embeddings(model_id, embeddings)?;
+
+        self.write(|tx| documents::set_embeddings(tx, model_id, embeddings))
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {

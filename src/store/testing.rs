@@ -1,7 +1,7 @@
 //! Test-only helpers: documents with chunks and fake embeddings, inserted without an importer
 //! (the real import is built on `put_document` too).
 
-use super::{Chunk, DIMS, Document, KnowledgeStore, Link, Origin, SqliteStore};
+use super::{Chunk, DIMS, Detail, Document, KnowledgeStore, Link, Origin, SqliteStore, StoreError};
 
 /// The model the fake embeddings claim to come from.
 pub const MODEL: &str = "test-model";
@@ -154,4 +154,165 @@ pub fn fake_vector(seed: u64) -> Vec<f32> {
     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
     vector.iter_mut().for_each(|value| *value /= norm);
     vector
+}
+
+/// The ids of the chunks of document `doc`, in order.
+fn chunk_ids(store: &mut dyn KnowledgeStore, doc: i64) -> Vec<i64> {
+    let detail = Detail {
+        sections: true,
+        chunk: None,
+    };
+    let found = store.get(doc, &detail).expect("get").expect("the document exists");
+
+    found
+        .sections
+        .expect("sections")
+        .iter()
+        .map(|section| section.chunk_id)
+        .collect()
+}
+
+/// What every backend answers about the chunks that need a vector (the same checks run on each,
+/// on an empty database):
+///
+/// - [`KnowledgeStore::pending_chunks`] lists the chunks without a vector of the model, the text
+///   to embed as an import builds it, lowest ids first, in pages after a given id, and every chunk
+///   for another model (a model switch).
+/// - [`KnowledgeStore::set_chunk_embeddings`] stores vectors without changing a chunk id or text,
+///   bumps the generation, skips a chunk that is gone and refuses a vector that is not [`DIMS`]
+///   finite numbers.
+pub fn pending_chunks_contract(store: &mut dyn KnowledgeStore) {
+    const OTHER: &str = "other-model";
+
+    let (doc, chunks, links) = Seed::new("Guide")
+        .chunk("Intro", "alpha words")
+        .embedded("Setup > Linux", "beta words", axis(2))
+        .chunk("", "gamma words")
+        .parts();
+    let guide = store.put_document(&doc, &chunks, &links).expect("put the guide");
+
+    let (doc, chunks, links) = Seed::new("Other").chunk("Notes", "delta words").parts();
+    let other = store.put_document(&doc, &chunks, &links).expect("put the other");
+
+    let guide_ids = chunk_ids(store, guide);
+    let other_ids = chunk_ids(store, other);
+    let (alpha, beta, gamma, delta) = (guide_ids[0], guide_ids[1], guide_ids[2], other_ids[0]);
+
+    let pending = store.pending_chunks(MODEL, 0, 10).expect("pending");
+    let ids: Vec<(i64, i64)> = pending.iter().map(|chunk| (chunk.chunk_id, chunk.doc_id)).collect();
+    let texts: Vec<&str> = pending.iter().map(|chunk| chunk.embed_text.as_str()).collect();
+
+    assert_eq!(ids, [(alpha, guide), (gamma, guide), (delta, other)]);
+    assert_eq!(
+        texts,
+        [
+            "Guide › Intro\nalpha words",
+            "Guide\ngamma words",
+            "Other › Notes\ndelta words"
+        ]
+    );
+
+    // A page after a chunk id starts behind it, and the last page is empty.
+    let first = store.pending_chunks(MODEL, 0, 2).expect("first page");
+    assert_eq!(
+        first.iter().map(|chunk| chunk.chunk_id).collect::<Vec<_>>(),
+        [alpha, gamma]
+    );
+
+    let second = store.pending_chunks(MODEL, gamma, 2).expect("second page");
+    assert_eq!(second.iter().map(|chunk| chunk.chunk_id).collect::<Vec<_>>(), [delta]);
+    assert!(store.pending_chunks(MODEL, delta, 2).expect("last page").is_empty());
+
+    // Another model makes every chunk pending, the embedded one too.
+    let all: Vec<i64> = store
+        .pending_chunks(OTHER, 0, 10)
+        .expect("pending for another model")
+        .iter()
+        .map(|chunk| chunk.chunk_id)
+        .collect();
+    assert_eq!(all, [alpha, beta, gamma, delta]);
+
+    let before = store.generation().expect("generation");
+    let embedded_before = store.stats().expect("stats").embedded_chunks;
+    let changed = store
+        .set_chunk_embeddings(MODEL, &[(alpha, axis(0)), (gamma, axis(1))])
+        .expect("set embeddings");
+
+    assert_eq!(changed, 2);
+    assert!(store.generation().expect("generation") > before, "the write is counted");
+    assert_eq!(store.stats().expect("stats").embedded_chunks, embedded_before + 2);
+    assert_eq!(chunk_ids(store, guide), guide_ids, "no chunk id changed");
+
+    let still: Vec<i64> = store
+        .pending_chunks(MODEL, 0, 10)
+        .expect("pending")
+        .iter()
+        .map(|chunk| chunk.chunk_id)
+        .collect();
+    assert_eq!(still, [delta]);
+
+    let kept = store
+        .get(
+            guide,
+            &Detail {
+                sections: false,
+                chunk: Some(alpha),
+            },
+        )
+        .expect("get")
+        .and_then(|found| found.chunk)
+        .expect("the chunk");
+    assert_eq!(
+        (kept.heading_path.as_str(), kept.text.as_str()),
+        ("Intro", "alpha words")
+    );
+
+    let stored = store
+        .reusable_embeddings(MODEL, &["sha-alpha words".to_owned()])
+        .expect("embeddings");
+    let vector = &stored["sha-alpha words"];
+    assert!(
+        vector.iter().zip(axis(0)).all(|(a, b)| (a - b).abs() < 1e-6),
+        "the vector is stored exactly"
+    );
+
+    // A chunk that is gone is skipped, a bad vector or model is refused and changes nothing.
+    assert_eq!(
+        store
+            .set_chunk_embeddings(MODEL, &[(987_654, axis(0))])
+            .expect("skipped"),
+        0
+    );
+
+    for bad in [vec![0.5; DIMS - 1], vec![f32::NAN; DIMS], Vec::new()] {
+        assert!(matches!(
+            store.set_chunk_embeddings(MODEL, &[(delta, bad)]),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    assert!(matches!(
+        store.set_chunk_embeddings("", &[(delta, axis(0))]),
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.pending_chunks(MODEL, 0, 10).expect("pending").len(), 1);
+
+    // Embedding again with another model replaces the vector and the model.
+    store
+        .set_chunk_embeddings(OTHER, &[(alpha, axis(3))])
+        .expect("re-embed");
+    let for_model: Vec<i64> = store
+        .pending_chunks(MODEL, 0, 10)
+        .expect("pending")
+        .iter()
+        .map(|c| c.chunk_id)
+        .collect();
+    let for_other: Vec<i64> = store
+        .pending_chunks(OTHER, 0, 10)
+        .expect("pending")
+        .iter()
+        .map(|c| c.chunk_id)
+        .collect();
+    assert_eq!(for_model, [alpha, delta]);
+    assert_eq!(for_other, [beta, gamma, delta]);
 }

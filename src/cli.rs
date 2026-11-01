@@ -1,8 +1,8 @@
 //! What the commands share: their options, the settings, the repository `--project` names and the
 //! paging options of the lists.
 //!
-//! Usage errors and unsupported databases exit 2, failures (settings, database) exit 1, a missing
-//! capability of the database (`check`'s problem codes) exit 3. A failure ends stderr with the line
+//! Usage errors exit 2, failures (settings, database) exit 1, a missing capability of the
+//! database (`check`'s problem codes) exit 3. A failure ends stderr with the line
 //! that says why (`harness-knowledge: …`, after any warning), so a caller may show the last line.
 
 use std::path::PathBuf;
@@ -218,8 +218,8 @@ pub fn failed(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Prints a command this build does not support (a team database that has no store yet) as
-/// `{"error": "unsupported", "message"}` on stdout and the message on stderr; exit 2.
+/// Prints a command this build does not support as `{"error": "unsupported", "message"}` on stdout
+/// and the message on stderr; exit 2.
 pub fn unsupported(message: &str) -> ExitCode {
     println!("{}", serde_json::json!({ "error": "unsupported", "message": message }));
     eprintln!("harness-knowledge: {message}");

@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use postgres::{GenericClient, Row};
 
 use super::error::{backend, column, count, int};
-use crate::limits::DELETE_IDS_MAX;
-use crate::store::{Chunk, Document, Link, Origin, StoreError};
+use crate::chunk::passage;
+use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
+use crate::store::{Chunk, Document, Link, Origin, PendingChunk, StoreError};
 
 /// How many chunks one `INSERT` carries.
 const CHUNK_BATCH: usize = 100;
@@ -276,6 +277,56 @@ pub(super) fn reusable_embeddings(
     }
 
     Ok(found)
+}
+
+/// The next `limit` chunks after chunk `after` that have no embedding of `model_id`.
+pub(super) fn pending_chunks(
+    client: &mut impl GenericClient,
+    model_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<PendingChunk>, StoreError> {
+    let limit = int(limit.min(EMBED_BATCH_MAX));
+    let rows = client
+        .query(
+            "SELECT id, doc_id, title, heading_path, text FROM knowledge_chunks
+             WHERE id > $1 AND model_id IS DISTINCT FROM $2 ORDER BY id LIMIT $3",
+            &[&after, &model_id, &limit],
+        )
+        .map_err(backend)?;
+
+    rows.iter()
+        .map(|row| {
+            let (title, heading, body): (String, String, String) = (column(row, 2)?, column(row, 3)?, column(row, 4)?);
+
+            Ok(PendingChunk {
+                chunk_id: column(row, 0)?,
+                doc_id: column(row, 1)?,
+                embed_text: passage(&title, &heading, &body),
+            })
+        })
+        .collect()
+}
+
+/// Stores the embeddings in one statement; the number of chunks that existed. The generated
+/// keyword column does not depend on the embedding.
+pub(super) fn set_embeddings(
+    tx: &mut impl GenericClient,
+    model_id: &str,
+    embeddings: &[(i64, Vec<f32>)],
+) -> Result<usize, StoreError> {
+    let ids: Vec<i64> = embeddings.iter().map(|(id, _)| *id).collect();
+    let vectors: Vec<String> = embeddings.iter().map(|(_, vector)| literal(vector)).collect();
+
+    let changed = tx
+        .execute(
+            "UPDATE knowledge_chunks c SET embedding = t.embedding::vector, model_id = $3
+             FROM unnest($1::bigint[], $2::text[]) AS t(id, embedding) WHERE c.id = t.id",
+            &[&ids, &vectors, &model_id],
+        )
+        .map_err(backend)?;
+
+    Ok(usize::try_from(changed).unwrap_or(usize::MAX))
 }
 
 /// The links of each of `ids`, by document.

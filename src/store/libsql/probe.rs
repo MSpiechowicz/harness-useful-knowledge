@@ -28,6 +28,10 @@ const NO_VECTOR: [&str; 5] = [
     "F32_BLOB",
 ];
 
+/// What a store error says when the server has no vector support (`libsql-no-vector`).
+pub const NO_VECTOR_MESSAGE: &str = "this libSQL server has no vector support (F32_BLOB, vector32, \
+     vector_top_k), use a libSQL server build that has it";
+
 /// The capability `message` (a server's error text) says is missing.
 pub(super) fn problem_of(message: &str) -> Option<Problem> {
     if message.contains("no such module: fts5") {

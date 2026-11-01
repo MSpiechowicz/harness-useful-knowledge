@@ -17,6 +17,7 @@
 
 mod capability;
 mod documents;
+mod embeddings;
 mod listing;
 mod ordered;
 mod search;

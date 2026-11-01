@@ -10,6 +10,7 @@
 
 mod access;
 mod documents;
+mod embeddings;
 mod listing;
 mod search;
 mod support;

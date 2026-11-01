@@ -7,8 +7,9 @@
 //!   end of stdin does not: it carries the manifest). The exit code is 0 even when files failed,
 //!   each file's status is in its event, and 1 when the manifest itself is refused.
 //! - `docs reindex --json (ID... | --all)` gives the chunks that have no vector one and prints
-//!   `{"documents", "embedded", "reused", "failed": [{"id", "reason"}], "cancelled", "model"}`. It
-//!   fails (exit 1) while no embedder is available.
+//!   `{"documents", "embedded", "failed": [{"id", "reason"}], "cancelled", "model"}`: the documents
+//!   and chunks that got a vector, in batches of 64 that are stored as they are made (ids, texts and
+//!   the keyword index do not change). It fails (exit 1) while no embedder is available.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -157,7 +158,6 @@ pub(super) fn reindex_with(
     Ok(Done::ok(json!({
         "documents": done.documents,
         "embedded": done.embedded,
-        "reused": done.reused,
         "failed": done
             .failed
             .iter()
@@ -251,7 +251,7 @@ mod tests {
         let reindexed = reindex_with(&context, &Which::All, &mut Fixed, &|| false).expect("reindex");
         assert_eq!(
             reindexed.json,
-            json!({ "documents": 1, "embedded": 1, "reused": 0, "failed": [], "cancelled": false, "model": MODEL })
+            json!({ "documents": 1, "embedded": 1, "failed": [], "cancelled": false, "model": MODEL })
         );
 
         let stats = super::super::overview::stats(&context, &args(&["--json"])).expect("stats");

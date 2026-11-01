@@ -17,18 +17,67 @@ use super::glob;
 
 /// Multiplies the score of a chunk of a document linked to the repository of the search (a global
 /// document is 1.0): an equally relevant linked document wins, a clearly more relevant global one
-/// still beats a weak linked one. Provisional, calibrated in X6.
-pub const LINKED_BOOST: f64 = 1.25;
+/// still beats a weak linked one. X6 (every family document linked to its own repository, 40
+/// queries): 1.1 puts the right answer first 36 times instead of 31 and the copy of the working
+/// repository first for 6 of 6 twin documents (3 of 6 without a boost), and costs a question
+/// whose answer is in another repository one place in the first three (38 to 37). 1.25 costs 8
+/// first places, 1.5 costs 9 and loses 3 of the first three.
+pub const LINKED_BOOST: f64 = 1.1;
 
 /// The whole boost of a chunk whose document's link has a glob that matches a given path (it
-/// replaces [`LINKED_BOOST`], it does not multiply it). Provisional, calibrated in X6.
-pub const GLOB_BOOST: f64 = 1.5;
+/// replaces [`LINKED_BOOST`], it does not multiply it). X6 (the hooks and the routines document
+/// answering the same 6 questions, working in the code of one or the other): 1.1 resolves 4 of 12,
+/// 1.25 and everything above resolves 8 of 12, and the cost to unrelated questions grows with the
+/// boost (the right answer first 28 times at 1.3 and 25 at 1.75, of 31 without a boost).
+pub const GLOB_BOOST: f64 = 1.3;
 
-/// The least a chunk may score after the boosts. Provisional, calibrated in X6.
-pub const FLOOR: f64 = 250.0;
+/// The least a chunk may score after the boosts. A chunk first in one list scores 500 and one in
+/// the first 16 of one list at least 400, so this trims the tail of weak single-list matches. X6:
+/// 250 and 400 give the same answers once the cosine floor below is applied.
+/// Above 500 only chunks both lists found survive, which loses 14 of 40 answers.
+pub const FLOOR: f64 = 400.0;
 
-/// The share of the best chunk's score a chunk must reach. Provisional, calibrated in X6.
+/// The share of the best chunk's score a chunk must reach. X6: 0.4 and 0.6 give the same answers.
 pub const MARGIN: f64 = 0.4;
+
+/// The least cosine a vector candidate needs to reach the fusion. The e5 cosines of a query and
+/// its answer are compressed: the best chunk of 40 answerable queries reached 0.813 to 0.931 (all
+/// the English ones 0.848 and up), and the best chunk of 6 queries with no answer 0.723 to 0.816.
+/// X6: 0.80 leaves every one of the 40 queries a candidate and recall@3 at 38 of 40, 0.82 loses 2 more.
+pub const COSINE_FLOOR: f64 = 0.80;
+
+/// The least keyword relevance a candidate needs to reach the fusion: none. The relevance is the
+/// backend's own score (the negated BM25 of FTS5, `ts_rank_cd` of PostgreSQL, the `searchScore` of
+/// Atlas), so no number means the same on all of them, and it grows with the size of the corpus
+/// (the inverse document frequency), so a floor that fits 1144 chunks silences the keyword list of
+/// a corpus of 20. X6 (1144 chunks on SQLite): a floor of 8 puts the right answer first 34 times
+/// of 40 instead of 31 and returns nothing for 4 of 6 off-topic queries instead of for none, with
+/// the same recall@3 of 38. That does not justify a number only SQLite understands, so the vectors
+/// (whose cosines are comparable everywhere) do the rejecting, and only the recall hook has a
+/// keyword floor ([`RECALL_KEYWORD_FLOOR`]).
+pub const KEYWORD_FLOOR: f64 = 0.0;
+
+/// The cosine floor of the recall hook, which adds text to a prompt unasked, so it is stricter:
+/// 0.82 is above every off-topic query of X6 (0.816 at most) and keeps 37 of 40 answers in the
+/// first three documents (0.83 keeps 32).
+pub const RECALL_COSINE_FLOOR: f64 = 0.82;
+
+/// How far under the best chunk's cosine a chunk may be to be recalled with it: a prompt gets
+/// the pointers that are as good as the best one, not three because three fit. X6: 0.02 keeps
+/// recall@3 at 37 of 40 and cuts the pointers per answer from 2.8 to 2.2, 0.01 loses one answer.
+pub const RECALL_COSINE_BAND: f64 = 0.02;
+
+/// The relevance floor of the recall hook when the embedder is not available and only the keyword
+/// list is read, in the scale of SQLite and libSQL (FTS5 BM25, see [`KEYWORD_FLOOR`]): 10 is above
+/// every off-topic query of X6 (8.5 at most) and keeps 23 of 40 answers (the English half, a
+/// Polish prompt over English documentation has no words in common). A corpus much smaller than
+/// X6's scores lower and a team database scores in its own scale, so there the hook says less
+/// without the embedder, never more.
+pub const RECALL_KEYWORD_FLOOR: f64 = 10.0;
+
+/// The least a chunk may score after the boosts to be recalled into a prompt. The recall hook
+/// reads one list at a time, so a chunk scores 30500 / (60 + rank): 450 keeps the first 7.
+pub const RECALL_FLOOR: f64 = 450.0;
 
 /// Most chunks of one document in an answer.
 pub const PER_DOCUMENT_MAX: usize = 2;

@@ -87,8 +87,6 @@ pub enum Failure {
     Usage,
     /// The command failed: exit 1.
     Failed(String),
-    /// The selected database has no support here yet: exit 2.
-    Unsupported(String),
     /// The database lacks something (a `check` problem code): exit 3.
     Missing { code: &'static str, message: String },
 }
@@ -108,11 +106,7 @@ impl From<StoreError> for Failure {
 impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Self {
         match error {
-            OpenError::NotBuilt(message) => Self::Unsupported(message),
-            OpenError::NoFts5 => Self::Missing {
-                code: "no-fts5",
-                message: error.to_string(),
-            },
+            OpenError::Missing { code, message } => Self::Missing { code, message },
             OpenError::Failed(message) => Self::Failed(message),
         }
     }
@@ -174,7 +168,6 @@ fn finish(reply: Reply) -> ExitCode {
         }
         Err(Failure::Usage) => cli::usage(USAGE),
         Err(Failure::Failed(message)) => cli::failed(&message),
-        Err(Failure::Unsupported(message)) => cli::unsupported(&message),
         Err(Failure::Missing { code, message }) => cli::missing_capability(code, &message),
     }
 }

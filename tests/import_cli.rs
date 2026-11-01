@@ -1,5 +1,5 @@
 //! `harness-knowledge docs import --ndjson` as a real process: the PDF worker child, the event
-//! stream and a cancel by signal.
+//! stream and a cancel by signal, and the exit code of a team database that lacks a capability.
 
 mod support;
 
@@ -29,7 +29,18 @@ fn command(root: &Path, args: &[&str]) -> Command {
 
 /// Runs a command with `stdin` and returns its stdout lines as JSON, and its exit code.
 fn run(root: &Path, args: &[&str], stdin: &str) -> (Vec<Value>, Option<i32>) {
-    let mut child = command(root, args)
+    run_on(root, None, args, stdin)
+}
+
+/// [`run`] against the team database at `url`, when there is one.
+fn run_on(root: &Path, url: Option<&str>, args: &[&str], stdin: &str) -> (Vec<Value>, Option<i32>) {
+    let mut command = command(root, args);
+
+    if let Some(url) = url {
+        command.env("HARNESS_KNOWLEDGE_DATABASE_URL", url);
+    }
+
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -228,5 +239,48 @@ fn a_termination_signal_stops_between_documents_and_leaves_whole_ones() {
             "{} is whole",
             item["title"]
         );
+    }
+}
+
+#[test]
+fn team_a_database_without_pgvector_or_mongot_exits_3_with_its_problem_code() {
+    let servers = [
+        ("HARNESS_KNOWLEDGE_TEST_POSTGRES_PLAIN_URL", "postgres", "no-pgvector"),
+        ("HARNESS_KNOWLEDGE_TEST_MONGO_PLAIN_URL", "mongodb", "no-mongot"),
+    ];
+
+    for (variable, backend, problem) in servers {
+        let Some(url) = std::env::var(variable).ok().filter(|url| !url.trim().is_empty()) else {
+            eprintln!("skipped: set {variable} to run the missing capability tests");
+            continue;
+        };
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let file = root.path().join("guide.md");
+        std::fs::write(&file, "# Guide\n\nHow the gateway routes requests.").expect("write");
+
+        // `check` keeps its own JSON.
+        let (checked, code) = run_on(root.path(), Some(&url), &["check", "--json"], "");
+        assert_eq!(code, Some(3), "{backend}: {checked:?}");
+        assert_eq!(checked[0]["ok"], false);
+        assert_eq!(checked[0]["backend"], backend);
+        assert_eq!(checked[0]["problem"], problem);
+
+        // The first import needs the capability: exit 3 with the code, and no event of a file.
+        let manifest = json!({ "paths": [file] }).to_string();
+        let (events, code) = run_on(root.path(), Some(&url), &["docs", "import", "--ndjson"], &manifest);
+        assert_eq!(code, Some(3), "{backend}: {events:?}");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["error"], "missing");
+        assert_eq!(events[0]["code"], problem);
+        assert!(events[0]["message"].as_str().is_some_and(|message| !message.is_empty()));
+
+        // Nothing was written, so a read finds an empty database like any other that nobody wrote to.
+        let (listed, code) = run_on(root.path(), Some(&url), &["docs", "list", "--json"], "");
+        assert_eq!((code, &listed[0]["total"]), (Some(0), &json!(0)), "{backend}");
+
+        let (stats, code) = run_on(root.path(), Some(&url), &["stats", "--json"], "");
+        assert_eq!(code, Some(0), "{backend}: {stats:?}");
+        assert_eq!(stats[0]["documents"], 0);
     }
 }

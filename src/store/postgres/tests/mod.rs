@@ -5,6 +5,7 @@
 
 mod capability;
 mod documents;
+mod embeddings;
 mod files;
 mod listing;
 mod search;

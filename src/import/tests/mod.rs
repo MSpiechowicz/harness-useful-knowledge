@@ -24,6 +24,9 @@ impl PdfPages for InProcess {
 /// An embedder that records what it was asked, and can fail or run a hook on each call.
 struct Fake {
     passages: Vec<String>,
+    /// How many passages each call carried.
+    calls: Vec<usize>,
+    model: String,
     fail: bool,
     on_call: Option<Box<dyn Fn()>>,
 }
@@ -32,6 +35,8 @@ impl Fake {
     fn new() -> Self {
         Self {
             passages: Vec::new(),
+            calls: Vec::new(),
+            model: MODEL.to_owned(),
             fail: false,
             on_call: None,
         }
@@ -40,7 +45,7 @@ impl Fake {
 
 impl Embedder for Fake {
     fn model_id(&self) -> &str {
-        MODEL
+        &self.model
     }
 
     fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -53,6 +58,7 @@ impl Embedder for Fake {
         }
 
         self.passages.extend(passages.iter().cloned());
+        self.calls.push(passages.len());
 
         Ok(passages
             .iter()
@@ -414,35 +420,6 @@ fn a_confluence_page_is_updated_by_its_page_id_wherever_it_is_imported_from() {
 }
 
 #[test]
-fn pending_chunks_are_embedded_by_a_reindex_that_reuses_what_exists() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let a = write(dir.path(), "a.md", &guide("Middle of a."));
-    let b = write(dir.path(), "b.md", &guide("Middle of b."));
-    let mut db = store();
-
-    let events = run_import(&mut db, &manifest(&[&a, &b], &[]), None, &never);
-    assert_eq!(done(&events)["embeddingPending"], 6);
-    assert_eq!(db.stats().expect("stats").embedded_chunks, 0);
-
-    // The two guides share their first and last sections, so those vectors are made once.
-    let mut embedder = Fake::new();
-    let first = reindex::run(&mut db, &mut embedder, &reindex::Which::All, &never).expect("reindex");
-
-    assert_eq!((first.documents, first.embedded, first.reused), (2, 4, 2));
-    assert!(first.failed.is_empty() && !first.cancelled);
-    assert_eq!(db.stats().expect("stats").embedded_chunks, 6);
-    assert_eq!(db.stats().expect("stats").model_id.as_deref(), Some(MODEL));
-
-    // A second pass finds everything embedded.
-    let again = reindex::run(&mut db, &mut embedder, &reindex::Which::All, &never).expect("reindex");
-    assert_eq!((again.embedded, again.reused), (0, 6));
-    assert_eq!(embedder.passages.len(), 4);
-
-    let missing = reindex::run(&mut db, &mut embedder, &reindex::Which::Ids(vec![99]), &never).expect("reindex");
-    assert_eq!(missing.failed, [(99, "document 99 not found".to_owned())]);
-}
-
-#[test]
 fn a_failing_embedder_leaves_the_chunks_pending_and_is_not_asked_again() {
     let dir = tempfile::tempdir().expect("temp dir");
     let a = write(dir.path(), "a.md", &guide("Middle of a."));
@@ -460,3 +437,4 @@ fn a_failing_embedder_leaves_the_chunks_pending_and_is_not_asked_again() {
 }
 
 mod flow;
+mod reindex;

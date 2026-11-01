@@ -261,6 +261,15 @@ pub struct DocumentDetail {
     pub chunk: Option<Chunk>,
 }
 
+/// A chunk that has no vector of the current model, with the text to embed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChunk {
+    pub chunk_id: i64,
+    pub doc_id: i64,
+    /// What the embedder is given, as an import builds it (see [`crate::chunk::passage`]).
+    pub embed_text: String,
+}
+
 /// How many documents each repository has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoCounts {
@@ -354,6 +363,16 @@ pub trait KnowledgeStore: Send {
         model_id: &str,
         chunk_shas: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, StoreError>;
+
+    /// The chunks that have no embedding or one of another model than `model_id`, with an id
+    /// greater than `after` (0 for the first page), the lowest ids first, at most `limit` (and
+    /// [`crate::limits::EMBED_BATCH_MAX`]). Give the last id of a page as `after` for the next.
+    fn pending_chunks(&mut self, model_id: &str, after: i64, limit: usize) -> Result<Vec<PendingChunk>, StoreError>;
+
+    /// Stores each `(chunk id, vector)` as the embedding of that chunk, made by `model_id`, and
+    /// bumps the generation. Chunk ids, texts and the keyword index stay as they are. A chunk that
+    /// does not exist (deleted meanwhile) is skipped. How many chunks were updated.
+    fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError>;
 
     /// Replaces the links of a document; false when there is no such document.
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError>;
