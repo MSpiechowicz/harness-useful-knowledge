@@ -74,6 +74,7 @@ fn assemble(objects: &[String]) -> Vec<u8> {
 /// A zlib stream of `blocks` MiB of spaces: one block compressed once, then repeated (a sync flush
 /// ends each block on a byte boundary, and every back-reference points at spaces), so it takes no
 /// time to make and is about a thousandth of its inflated size.
+#[allow(dead_code)]
 fn zlib_spaces(blocks: usize) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::DeflateEncoder;

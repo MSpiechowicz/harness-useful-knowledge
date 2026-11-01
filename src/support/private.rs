@@ -205,6 +205,7 @@ fn check_owner(_file: &std::fs::File, _shown: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use super::*;
 
     #[test]

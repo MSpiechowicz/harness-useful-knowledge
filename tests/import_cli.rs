@@ -3,13 +3,17 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use support::pdf::{flate_bomb, pdf};
+#[cfg(target_os = "linux")]
+use support::pdf::flate_bomb;
+use support::pdf::pdf;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_harness-knowledge");
 
