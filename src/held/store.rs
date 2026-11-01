@@ -119,7 +119,15 @@ impl HeldStore {
         match std::fs::rename(&home, &aside) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Windows refuses a rename while another claim is moving the same file: that claim won.
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
             Err(error) => return Err(format!("moving the held proposal failed: {error}")),
+        }
+
+        // Two claims racing on Windows can both see their rename succeed while only one file
+        // moved: a claim that finds nothing where it moved the proposal lost the race.
+        if !aside.exists() {
+            return Ok(None);
         }
 
         match parse(&aside, held_id) {
