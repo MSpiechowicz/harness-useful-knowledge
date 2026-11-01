@@ -152,8 +152,9 @@ fn a_page_of_two_hundred_thousand_nested_tags_is_read_in_linear_time() {
         let started = std::time::Instant::now();
         let extracted = extract(Format::Html, "deep.html", page.as_bytes()).expect("readable");
 
-        // Debug builds tokenize 400k tags in about 0.6 s: a quadratic walk takes minutes.
-        assert!(started.elapsed().as_millis() < 2000, "{:?}", started.elapsed());
+        // Debug builds tokenize 400k tags in about 0.6 s (2 s on a slow CI runner): a quadratic
+        // walk takes minutes.
+        assert!(started.elapsed().as_secs() < 15, "{:?}", started.elapsed());
         assert_eq!(extracted.title.as_deref(), Some("Deep"));
         assert!(
             extracted

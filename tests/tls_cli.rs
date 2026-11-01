@@ -3,6 +3,9 @@
 //! this computer and starting the cooldown. The server is a local TLS listener with a self-signed
 //! certificate (`openssl s_server`), so the test skips when `openssl` cannot be run.
 
+// The two tests that need `openssl s_server` run on Unix only, so its helpers are unused elsewhere.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -103,6 +106,8 @@ fn run(root: &Path, url: &str, layout: &str, args: &[&str]) -> (Option<i32>, Str
     )
 }
 
+// The stand-in TLS server (`openssl s_server`) does not listen on Windows runners.
+#[cfg(unix)]
 #[test]
 fn a_mongodb_whose_certificate_is_refused_fails_with_a_tls_message_and_is_never_offline() {
     let root = tempfile::tempdir().expect("temp dir");
@@ -181,6 +186,8 @@ fn closing_after_tls_request() -> u16 {
     port
 }
 
+// The stand-in TLS server (`openssl s_server`) does not listen on Windows runners.
+#[cfg(unix)]
 #[test]
 fn a_postgres_server_whose_tls_is_refused_is_a_setting_to_fix_and_check_starts_no_cooldown() {
     let root = tempfile::tempdir().expect("temp dir");
