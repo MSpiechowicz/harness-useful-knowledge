@@ -202,3 +202,11 @@ At parity with Harness Memory's "Kept in".
 - **Writes:** `docs import` and `held approve` take `--place remote|local`, defaulting to remote in `remote+local`. `check` and `stats` report both places.
 - **Desktop:** Kept in rows in Settings → Remote knowledge (memory's 3-way component) with a routing-change warning, a "Save to" choice in Add documents when a row is `remote+local`, and a Kept in filter and place chip in the view.
 - **Not included:** copying local documents to remote, and hide on this computer (follow-up issue).
+
+## Offline fallback (approved 2026-11-01)
+At parity with Harness Memory.
+- In `remote+local`, an unreachable remote (timeout, refused connection, DNS failure) makes the routed store answer from this computer only. `docs list`, `search`, `stats` and the MCP replies then carry `offline: true`, and MCP and recall add one notice line.
+- A shared cooldown file stops every call from waiting out the remote timeout again (memory's `store/reach.rs` pattern).
+- Remote-only routing still fails clearly.
+- Writes meant for remote are refused while it is unreachable, never redirected.
+- Desktop: an offline banner in the Knowledge view, like Memory's.
