@@ -78,7 +78,7 @@ pub(super) fn check(env: &Env, root: &Path) -> Result<(), String> {
             .to_owned()
     };
 
-    if root == canonical_home(env) || root.parent().is_none() || is_system(root) {
+    if root == canonical_home(env) || root.parent().is_none() || is_system(root) || holds_secrets(root) {
         return Err(refused());
     }
 
@@ -87,6 +87,15 @@ pub(super) fn check(env: &Env, root: &Path) -> Result<(), String> {
     }
 
     Err(refused())
+}
+
+/// Folders that keep keys and passwords, refused even when they are git work trees
+/// (`~/.password-store` is one).
+const SECRET_FOLDERS: [&str; 6] = [".ssh", ".gnupg", ".aws", ".password-store", ".kube", ".docker"];
+
+fn holds_secrets(root: &Path) -> bool {
+    root.components()
+        .any(|part| SECRET_FOLDERS.iter().any(|secret| part.as_os_str() == *secret))
 }
 
 #[cfg(unix)]
@@ -101,4 +110,16 @@ fn is_system(root: &Path) -> bool {
         .iter()
         .filter_map(std::env::var_os)
         .any(|folder| root.starts_with(dunce::canonicalize(&folder).unwrap_or_else(|_| folder.into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn folders_that_keep_keys_are_refused_even_as_projects() {
+        assert!(super::holds_secrets(Path::new("/home/u/.password-store")));
+        assert!(super::holds_secrets(Path::new("/home/u/.ssh/keys")));
+        assert!(!super::holds_secrets(Path::new("/home/u/code/sshd-config")));
+    }
 }

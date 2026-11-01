@@ -221,7 +221,7 @@ fn a_claim_left_behind_by_a_dead_process_is_put_back_after_ten_minutes() {
         .collect();
     assert_eq!(aside.len(), 1);
 
-    let old = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+    let old = std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60);
     std::fs::File::options()
         .write(true)
         .open(aside[0].path())

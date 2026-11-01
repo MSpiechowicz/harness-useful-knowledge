@@ -189,7 +189,11 @@ pub fn extract(format: Format, name: &str, bytes: &[u8]) -> Result<Extracted> {
         Format::OpenApi => openapi::extract(&text)?,
         Format::AsciiDoc => asciidoc::extract(&text),
         Format::Rst => rst::extract(&text),
-        Format::Transcript => subtitles::extract(&text)?,
+        // A `.txt` that only looked like a transcript (it starts with "WebVTT …") is read as text.
+        Format::Transcript => match subtitles::extract(&text) {
+            Err(_) if format_of_name(name) == Some(Format::Text) => plain::extract(&text),
+            other => other?,
+        },
         Format::Pdf => unreachable!("handled above"),
     };
 

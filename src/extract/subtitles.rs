@@ -158,6 +158,18 @@ fn speakers(raw: &str) -> Vec<(Option<String>, String)> {
     while let Some(open) = rest.find('<') {
         current.push_str(&rest[..open]);
 
+        // A cue tag starts with a letter, `/` or a timestamp digit; `x < 5 and y > 3` is text.
+        let starts_tag = rest[open + 1..]
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_alphanumeric() || next == '/');
+
+        if !starts_tag {
+            current.push('<');
+            rest = &rest[open + 1..];
+            continue;
+        }
+
         let Some(close) = rest[open..].find('>') else {
             // A lone `<` is text.
             current.push_str(&rest[open..]);

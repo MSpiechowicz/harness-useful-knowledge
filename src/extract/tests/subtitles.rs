@@ -116,3 +116,26 @@ fn a_file_without_cues_is_refused() {
         "{refusal:?}"
     );
 }
+
+#[test]
+fn a_text_file_that_only_starts_like_a_transcript_is_read_as_text() {
+    let bytes = b"WebVTT is the caption format of the web.\n\nIt has cues.\n";
+    let format = detect("notes.txt", bytes).expect("format");
+    let extracted = extract(format, "notes.txt", bytes).expect("read as text");
+
+    assert!(
+        extracted
+            .sections
+            .iter()
+            .any(|section| section.text.contains("caption format"))
+    );
+}
+
+#[test]
+fn a_lone_angle_bracket_in_a_cue_is_text() {
+    let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nkeep x < 5 and y > 3 in <i>mind</i>\n";
+    let extracted = extract(Format::Transcript, "maths.vtt", vtt.as_bytes()).expect("transcript");
+    let text: String = extracted.sections.iter().map(|section| section.text.as_str()).collect();
+
+    assert!(text.contains("keep x < 5 and y > 3 in mind"), "{text}");
+}

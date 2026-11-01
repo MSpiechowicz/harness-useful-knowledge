@@ -12,9 +12,10 @@ use crate::support::private::{check_folders, private_folder, read_private, write
 /// How long a proposal is kept.
 const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// How long a claim may last: an approval embeds a document, which takes minutes at most. A claim
-/// older than this was left behind by a process that died, and its proposal waits again.
-const CLAIM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long a claim may last: an approval embeds one document (4000 chunks at most, minutes on a
+/// slow computer), so a claim older than this was left behind by a process that died, and its
+/// proposal waits again. Well above any approval, so a slow one is never put back mid-flight.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The prefix of the temporary files a proposal is written through or claimed under.
 const TEMP_PREFIX: &str = ".held-";
@@ -111,17 +112,18 @@ impl HeldStore {
         let aside = self.folder.join(format!("{TEMP_PREFIX}{id}.tmp"));
         let home = item_path(&self.folder, held_id);
 
+        // A rename keeps the file's time, so the claim's start is stamped before the move: a
+        // `restore_stranded` running between the two never sees a fresh claim as an old one.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&home)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+
         match std::fs::rename(&home, &aside) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("moving the held proposal failed: {error}")),
         }
-
-        // A rename keeps the time the proposal was written: the claim starts now.
-        let _ = std::fs::File::options()
-            .write(true)
-            .open(&aside)
-            .and_then(|file| file.set_modified(SystemTime::now()));
 
         match parse(&aside, held_id) {
             Some(item) => Ok(Some(Claim {
