@@ -148,3 +148,32 @@ DocumentDB, live connectors, code auto-links (#49), OCR, attachments, an agent d
 5. B: release.
 
 Feature branches in each repo, commits per milestone, `cargo clean` before commits. No push, PR or release without your explicit go.
+
+## Experiment results (2026-11-01)
+- **X1/X2 model:** `Xenova/multilingual-e5-small` at HF commit `761b726dd34fb83930e26aab4e9ac3899aa1fa78`.
+  - Use `onnx/model_quantized.onnx` (118308185 B, sha256 `f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193`) and `tokenizer.json` (17082730 B, sha256 `0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39`).
+  - The graph takes 3 i64 inputs (`input_ids`, `attention_mask`, `token_type_ids`) and outputs the last hidden state `[b,s,384]`.
+  - Cosine against fp32: mean 0.9965, min 0.9958 (512-token text 0.992). Token ids match HF exactly.
+  - Batching changes vectors slightly (dynamic quantisation, min 0.9939), so embed one text per call.
+  - The Xenova repo has no licence file. Base model intfloat is MIT. The release needs a NOTICE.
+- **X3 throughput** (tract, 350-token chunks):
+  - 1 thread: 1.6/s at b1, 2.8/s at b16. Rayon matmul: up to 4.9/s.
+  - 4 processes: 10.4/s total.
+  - 128 tokens: 4.1/s at b1, 8.8/s at b16.
+  - RSS: 457 MB loaded, about 670–860 MB while running.
+  - onnxruntime (reference): about 10x faster.
+- **X4 PDF:** pdf-extract 0.12.1.
+  - Quality is good for single-column documents. NFKC-normalise the output (ligatures).
+  - Panics on 8 of 48 fuzzed mutants, so it needs the worker process.
+  - Text-less rule: average non-whitespace chars per page < 100, or ≥ half of pages under 25 chars.
+  - cargo-deny: add an ignore for RUSTSEC-2026-0192 (ttf-parser unmaintained, via lopdf).
+- **X7 YAML:** `saphyr` 0.3.3 (no advisories, alias-bomb safe, parses the 10.7 MB GitHub spec in 0.19 s). serde_yaml_ng fails deny, and yaml-rust2 aborts on an alias bomb.
+- **X5 backends:**
+  - **Atlas local** (mongod 8.3.13): search and vectorSearch indexes are READY in about 0.9 s at 1k docs, and new docs are searchable after about 1 s (eventually consistent, so tests poll).
+  - **pgvector** 0.8.7: HNSW, `ts_rank_cd` and `websearch_to_tsquery('simple')` work, and `hnsw.iterative_scan` is accepted.
+  - **libSQL:** memory's pinned digest already supports `F32_BLOB`, `libsql_vector_idx`, `vector_top_k` and FTS5. ANN filtering is post-filter only, so over-fetch. `ł` is not folded by `remove_diacritics 2`.
+- **Negative probes:**
+  - postgres:17 → SQLSTATE 0A000 `extension "vector" is not available`.
+  - mongo:8 community → code 31082 `SearchNotEnabled`.
+  - libSQL missing index → `vector index(search): failed to parse vector index parameters`.
+- **X8 brute force** (384-d, top-10): 100k vectors take 3.7 ms in RAM on 1 thread (146 MB), or 54–87 ms when scanned from SQLite. Use a multi-accumulator dot product (a naive one is 6x slower).
