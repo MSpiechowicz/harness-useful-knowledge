@@ -15,12 +15,16 @@ use serde_json::{Value, json};
 use super::{Context, Done, Failure, Reply};
 use crate::backend::{self, Access};
 use crate::cli::Args;
-use crate::config::Backend;
+use crate::config::{Backend, Place};
 use crate::store::DIMS;
 use crate::store::libsql::{self, Trouble};
 use crate::store::postgres::{self, Fault, Problem};
 use crate::store::sqlite::{fts5_available, schema::SCHEMA_VERSION};
 
+/// `check --json` reports each place in use under `places` (`{"remote": {...}, "local": {...}}`, each
+/// as described above), and the top-level fields are those of the remote database, or of this
+/// computer when that is the only place, unless the remote database is fine and this computer is
+/// not: then the problem is the one reported at the top and in the exit code.
 pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
     let parsed = Args::parse(args, &["--json"], &[]).ok_or(Failure::Usage)?;
 
@@ -28,16 +32,37 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
         return Err(Failure::Usage);
     }
 
-    match context.backend {
-        Backend::Sqlite => local(context),
-        Backend::Postgres { url } => postgres_check(context, url),
-        Backend::Libsql { url, token } => libsql_check(context, url, token.as_deref()),
-        Backend::Mongodb { url } => mongodb_check(context, url),
+    let mut reports: Vec<(Place, Done)> = Vec::new();
+
+    for place in context.routing.places() {
+        reports.push((place, check_place(context, place)?));
+    }
+
+    let first = reports.iter().position(|(_, done)| done.code != 0).unwrap_or(0);
+    let mut shown = reports[first].1.clone();
+
+    let places: serde_json::Map<String, Value> = reports
+        .into_iter()
+        .map(|(place, done)| (place.as_str().to_owned(), done.json))
+        .collect();
+    shown.json["places"] = Value::Object(places);
+
+    Ok(shown)
+}
+
+/// The check of one place.
+fn check_place(context: &Context, place: Place) -> Reply {
+    match (place, context.backend) {
+        (Place::Local, _) => local(context),
+        (Place::Remote, Backend::Sqlite) => Err(Failure::Failed("no remote database is configured".to_owned())),
+        (Place::Remote, Backend::Postgres { url }) => postgres_check(context, url),
+        (Place::Remote, Backend::Libsql { url, token }) => libsql_check(context, url, token.as_deref()),
+        (Place::Remote, Backend::Mongodb { url }) => mongodb_check(context, url),
     }
 }
 
 fn local(context: &Context) -> Reply {
-    let name = backend::name(context.backend);
+    let name = "sqlite";
 
     if !fts5_available() {
         let message = "this SQLite build has no FTS5 full-text search, so the keyword index cannot be kept";
@@ -56,7 +81,7 @@ fn local(context: &Context) -> Reply {
         });
     }
 
-    let (schema, model_id) = match context.open(Access::Read)? {
+    let (schema, model_id) = match context.open_place(Place::Local, Access::Read)? {
         Some(mut store) => {
             let schema = store
                 .meta("schema_version")?
@@ -190,7 +215,7 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
         return Ok(problem("no-fts5", message, false, true));
     }
 
-    let (schema, model_id) = match context.open(Access::Read)? {
+    let (schema, model_id) = match context.open_place(Place::Remote, Access::Read)? {
         Some(mut store) => {
             let schema = store
                 .meta("schema_version")?
@@ -275,6 +300,7 @@ mod postgres_tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::config::{Routing, Where};
     use crate::support::Env;
 
     /// A server with pgvector, and one without, for the `team_*` tests (they skip when unset).
@@ -284,10 +310,7 @@ mod postgres_tests {
     fn check_url(url: &str) -> Done {
         let env = Env::for_tests("/home/u");
         let backend = crate::config::backend_for(Some(url.to_owned()), None).expect("backend");
-        let context = Context {
-            env: &env,
-            backend: &backend,
-        };
+        let context = Context::new(&env, &backend, Routing::new(Where::Remote, Where::Remote));
 
         check(&context, &[Some("--json")]).expect("a check answers")
     }

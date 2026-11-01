@@ -7,6 +7,8 @@
 //!   for the last two (and for an `updated` that replaced a document of the same name from another
 //!   repository). `embedding` is `done` or `pending` (no embedder was available, so the chunks
 //!   wait for `docs reindex`).
+//!   `docId` is a number, or the string `local:12` for a document on this computer when both places
+//!   are in use.
 //! - `{"type":"progress","done":N,"total":N}` after each file.
 //! - `{"type":"done","counts":{...},"cancelled":bool,"counter":"tokenizer"|"approximate",
 //!   "embeddingPending":N}` last: `counter` is what counted the tokens, `embeddingPending` how many
@@ -15,6 +17,9 @@
 use std::io::Write;
 
 use serde_json::{Value, json};
+
+use crate::config::Place;
+use crate::store::routed::ids;
 
 /// What became of one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,11 +105,23 @@ impl FileEvent {
 pub struct Events<'a> {
     out: &'a mut dyn Write,
     closed: bool,
+    /// The place of the documents when two are in use: their ids are written with it (`local:12`).
+    place: Option<Place>,
 }
 
 impl<'a> Events<'a> {
     pub fn new(out: &'a mut dyn Write) -> Self {
-        Self { out, closed: false }
+        Self {
+            out,
+            closed: false,
+            place: None,
+        }
+    }
+
+    /// Writes document ids tagged with `place` (when both places are in use).
+    pub fn in_place(mut self, place: Option<Place>) -> Self {
+        self.place = place;
+        self
     }
 
     /// True once a write failed (the reader closed the pipe): nobody is watching, so the import
@@ -125,7 +142,10 @@ impl<'a> Events<'a> {
         }
 
         if let Some(id) = event.doc_id {
-            line["docId"] = json!(id);
+            line["docId"] = match self.place {
+                Some(place) => ids::json(ids::tag(place, id)),
+                None => json!(id),
+            };
         }
 
         if let Some(chunks) = event.chunks {

@@ -57,10 +57,7 @@ impl Fixture {
     }
 
     fn run_on(&self, backend: &Backend, args: &[&str], stdin: &str) -> Reply {
-        let context = Context {
-            env: &self.env,
-            backend,
-        };
+        let context = Context::new(&self.env, backend, Routing::local());
         let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
 
         let mut input = stdin.as_bytes();
@@ -436,15 +433,18 @@ fn stats_and_check_describe_the_database() {
 
     let check = fixture.run(&["check", "--json"], "").expect("check");
     assert_eq!(check.code, 0);
+    let local = json!({
+        "ok": true,
+        "backend": "sqlite",
+        "schema": 1,
+        "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
+        "model": { "dims": 384 },
+    });
+    let mut expected = local.clone();
+    expected["places"] = json!({ "local": local });
     assert_eq!(
-        check.json,
-        json!({
-            "ok": true,
-            "backend": "sqlite",
-            "schema": 1,
-            "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
-            "model": { "dims": 384 },
-        })
+        check.json, expected,
+        "one place in use: the top level is it, `places` has it alone"
     );
 
     let mut store = SqliteStore::open(&fixture.folder.join(FILE_NAME)).expect("open");

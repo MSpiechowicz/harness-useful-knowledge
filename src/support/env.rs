@@ -27,6 +27,8 @@ pub const CAPTURED_VARS: &[&str] = &[
     "HARNESS_KNOWLEDGE_DATABASE_URL",
     "HARNESS_KNOWLEDGE_DATABASE_TOKEN",
     "HARNESS_KNOWLEDGE_CONFIG",
+    "HARNESS_KNOWLEDGE_REPOSITORY_DOCUMENTS",
+    "HARNESS_KNOWLEDGE_GLOBAL_DOCUMENTS",
     // Where the embedding model is downloaded from, for tests and mirrors.
     "HARNESS_KNOWLEDGE_MODEL_BASE_URL",
     // The chat Harness Desktop started this server's harness for.

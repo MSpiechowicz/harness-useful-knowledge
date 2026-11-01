@@ -228,14 +228,14 @@ fn team_mongo_the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plai
         "a word prefix in the title"
     );
     assert_eq!(
-        text(&mut store, "REQUESTS routing"),
+        text(&mut store, "ROUTING of Requ"),
         ["Gateway guide"],
-        "all words, any case, in the text"
+        "the words in order, any case, the last as a prefix"
     );
     assert_eq!(
         text(&mut store, "guide routing"),
-        ["Gateway guide"],
-        "a title word and a text word"
+        Vec::<String>::new(),
+        "a title word and a text word are no phrase"
     );
     assert_eq!(
         text(&mut store, "invoice"),
@@ -269,6 +269,53 @@ fn team_mongo_the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plai
         "a regular expression is plain text"
     );
     assert_eq!(text(&mut store, "cafe PROTEGE"), ["Politique"], "accents do not matter");
+}
+
+#[test]
+fn team_mongo_the_text_filter_is_a_phrase_and_the_chunks_of_a_document_that_match_are_listed() {
+    let Some((_db, mut store)) = store() else { return };
+    let releases = insert(
+        &mut store,
+        &Seed::new("Releases")
+            .chunk("Version notes", "Upgrade to version 1.2 today")
+            .chunk("Other", "version two, then section 10 and 1")
+            .chunk("Later", "and version 10 after that"),
+    );
+    insert(
+        &mut store,
+        &Seed::new("Scattered").chunk("Notes", "the version is stable, see section 10 and 1"),
+    );
+
+    let text = |store: &mut MongoStore, text: &str| {
+        let page = store
+            .list(&ListQuery {
+                text: text.to_owned(),
+                sort: Sort::Title,
+                descending: false,
+                ..everything()
+            })
+            .expect("list");
+        page.items.into_iter().map(|row| row.doc.title).collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        text(&mut store, "version 1"),
+        ["Releases"],
+        "next to each other, not scattered"
+    );
+    assert_eq!(text(&mut store, "version"), ["Releases", "Scattered"]);
+    assert_eq!(text(&mut store, "1 version"), Vec::<String>::new());
+
+    let found = store.matching_chunks(releases, "version 1", 10).expect("matches");
+    assert_eq!(found.total, 2);
+    assert_eq!(
+        found.chunks.iter().map(|chunk| chunk.ordinal).collect::<Vec<_>>(),
+        [0, 2]
+    );
+    assert_eq!(found.chunks[0].heading_path, "Version notes");
+
+    let titled = store.matching_chunks(releases, "releases", 10).expect("matches");
+    assert_eq!(titled.total, 0, "the title is in every chunk, so it does not count");
 }
 
 #[test]

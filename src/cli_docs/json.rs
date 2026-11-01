@@ -2,15 +2,16 @@
 
 use serde_json::{Value, json};
 
+use crate::store::routed::ids;
 use crate::store::{Chunk, Document, Link, Section};
 use crate::support::time::rfc3339;
 
 /// A document with its links: `id`, `title`, `sourceName`, `sourceKey`, `format`, `contentSha256`,
 /// `fileSha256`, `bytes`, `chunkCount`, `createdAt`, `updatedAt` (RFC 3339), `origin` (`user` or
-/// `agentApproved`), `warnings` and `links`.
+/// `agentApproved`), `warnings`, `links` and, when both places are in use, `place` (`local` or `remote`). `id` is the number, or the string `local:12` for a document on this computer.
 pub fn document(doc: &Document, links: &[Link]) -> Value {
-    json!({
-        "id": doc.id,
+    let mut shown = json!({
+        "id": ids::json(doc.id),
         "title": doc.title,
         "sourceName": doc.source_name,
         "sourceKey": doc.source_key,
@@ -24,7 +25,13 @@ pub fn document(doc: &Document, links: &[Link]) -> Value {
         "origin": doc.origin.as_str(),
         "warnings": doc.warnings,
         "links": links.iter().map(link).collect::<Vec<_>>(),
-    })
+    });
+
+    if let Some(place) = ids::place_name(doc.id) {
+        shown["place"] = json!(place);
+    }
+
+    shown
 }
 
 /// A link: `repo` and `globs`.
@@ -35,7 +42,7 @@ pub fn link(link: &Link) -> Value {
 /// One entry of a document's outline.
 pub fn section(section: &Section) -> Value {
     json!({
-        "chunkId": section.chunk_id,
+        "chunkId": ids::json(section.chunk_id),
         "ordinal": section.ordinal,
         "headingPath": section.heading_path,
         "tokens": section.tokens,
@@ -47,8 +54,8 @@ pub fn section(section: &Section) -> Value {
 /// A chunk with its text.
 pub fn chunk(chunk: &Chunk) -> Value {
     json!({
-        "id": chunk.id,
-        "docId": chunk.doc_id,
+        "id": ids::json(chunk.id),
+        "docId": ids::json(chunk.doc_id),
         "ordinal": chunk.ordinal,
         "headingPath": chunk.heading_path,
         "text": chunk.text,

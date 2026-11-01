@@ -12,7 +12,17 @@ use harness_knowledge::{cli, cli_docs, cli_embedder, cli_held, cli_search, extra
 
 /// What this build can do, as `harness-knowledge features` lists it: one token per line, for Harness
 /// Desktop to tell what it can offer. A token is added in the same change that makes the feature work.
-const FEATURES: [&str; 7] = ["docs", "embedder", "import-ndjson", "search", "recall", "held", "mcp"];
+const FEATURES: [&str; 9] = [
+    "docs",
+    "embedder",
+    "import-ndjson",
+    "search",
+    "recall",
+    "held",
+    "mcp",
+    "routing",
+    "doc-matches",
+];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
 /// the model relies on (glibc's allocator keeps it).

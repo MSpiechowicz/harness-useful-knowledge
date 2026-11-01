@@ -118,8 +118,30 @@ exits with code 3. Tables and collections are prefixed `knowledge_`, so the data
 with `harness-memory`. TLS is required for every server that is not on this computer. Amazon
 DocumentDB is not supported yet.
 
+### Where documents are kept
+
+With a team database set, `[routing]` says where each kind of document lives: `remote` (the
+default), `local` (this computer's file) or `remote+local` (both are read, new documents go
+remote unless `--place local` says otherwise).
+
+```toml
+[routing]
+repository_documents = "remote"      # documents linked to a repository
+global_documents = "remote+local"    # documents linked to none
+```
+
+When both places are in use, ids from this computer are written `local:12` (`local:12:340` for a
+chunk) and remote ids stay plain numbers. Every command and MCP tool takes both forms, and a plain
+number is the remote database's. JSON documents then carry `"place": "remote" | "local"`.
+`docs import` takes `"place"` in the manifest, `held approve` takes `--place remote|local`, and a
+place the routing does not keep that kind of document in is refused. A list merges both places, a
+search runs in each place and fuses the two result lists by rank, and `check` and `stats` report
+each place under `places`.
+
 | Variable | Meaning |
 | --- | --- |
+| `HARNESS_KNOWLEDGE_REPOSITORY_DOCUMENTS` | Routing of documents linked to a repository (overrides the file) |
+| `HARNESS_KNOWLEDGE_GLOBAL_DOCUMENTS` | Routing of documents linked to no repository (overrides the file) |
 | `HARNESS_KNOWLEDGE_DIR` | Folder of the local database and the model (absolute) |
 | `HARNESS_KNOWLEDGE_CONFIG` | Config file to use instead of the default one |
 | `HARNESS_KNOWLEDGE_DATABASE_URL` | Team database URL (overrides the config file) |

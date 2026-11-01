@@ -209,9 +209,14 @@ fn the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plain_character
         "a word prefix in the title"
     );
     assert_eq!(
-        text(&mut store, "REQUESTS routing"),
+        text(&mut store, "ROUTING of Requ"),
         ["Gateway guide"],
-        "all words, any case, in the text"
+        "the words in order, any case, the last as a prefix"
+    );
+    assert_eq!(
+        text(&mut store, "requests routing"),
+        Vec::<String>::new(),
+        "the same words in another order are no phrase"
     );
     assert_eq!(
         text(&mut store, "invoice"),
@@ -239,6 +244,109 @@ fn the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plain_character
         Vec::<String>::new(),
         "query syntax is plain text"
     );
+}
+
+#[test]
+fn the_text_filter_is_a_phrase_whose_last_word_is_a_prefix() {
+    let mut store = store();
+    insert(
+        &mut store,
+        &Seed::new("Releases")
+            .chunk("Notes", "Upgrade to version 1.2 today")
+            .chunk("More", "and version 10 later"),
+    );
+    insert(
+        &mut store,
+        &Seed::new("Scattered").chunk("Notes", "the version is stable, see section 10 and 1"),
+    );
+    insert(&mut store, &Seed::new("Single").chunk("Notes", "versions"));
+
+    let found = |store: &mut SqliteStore, text: &str| {
+        let page = store
+            .list(&ListQuery {
+                text: text.to_owned(),
+                sort: Sort::Title,
+                descending: false,
+                ..everything()
+            })
+            .expect("list");
+        page.items.into_iter().map(|row| row.doc.title).collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        found(&mut store, "version 1"),
+        ["Releases"],
+        "next to each other, not scattered"
+    );
+    assert_eq!(found(&mut store, "Version 1.2"), ["Releases"]);
+    assert_eq!(found(&mut store, "version 10"), ["Releases"]);
+    assert_eq!(
+        found(&mut store, "version"),
+        ["Releases", "Scattered", "Single"],
+        "one word is a prefix"
+    );
+    assert_eq!(found(&mut store, "1 version"), Vec::<String>::new(), "order matters");
+    assert_eq!(
+        found(&mut store, "elease"),
+        ["Releases"],
+        "the title stays a substring match"
+    );
+}
+
+#[test]
+fn the_chunks_that_match_are_the_ones_of_the_list_filter_by_position() {
+    let mut store = store();
+    let id = insert(
+        &mut store,
+        &Seed::new("Releases")
+            .chunk("Intro", "nothing to see")
+            .chunk("Version notes", "Upgrade to version 1.2 today")
+            .chunk("Other", "version two, then section 10 and 1")
+            .chunk("Later", "and version 10 after that"),
+    );
+    let other = insert(&mut store, &Seed::new("Other doc").chunk("Notes", "version 1 here too"));
+
+    let matches = |store: &mut SqliteStore, doc: i64, text: &str, limit: usize| {
+        let found = store.matching_chunks(doc, text, limit).expect("matches");
+        (
+            found.total,
+            found.chunks.into_iter().map(|chunk| chunk.ordinal).collect::<Vec<_>>(),
+        )
+    };
+
+    assert_eq!(matches(&mut store, id, "version 1", 10), (2, vec![1, 3]));
+    assert_eq!(matches(&mut store, id, "VERSION 1.2", 10), (1, vec![1]));
+    assert_eq!(
+        matches(&mut store, id, "version", 2),
+        (3, vec![1, 2]),
+        "the total counts past the limit"
+    );
+    assert_eq!(
+        matches(&mut store, id, "notes", 10),
+        (1, vec![1]),
+        "the heading path counts"
+    );
+    assert_eq!(
+        matches(&mut store, id, "releases", 10),
+        (0, vec![]),
+        "the title is in every chunk, so it does not count"
+    );
+    assert_eq!(matches(&mut store, id, " ?! ", 10), (0, vec![]));
+    assert_eq!(
+        matches(&mut store, id, "\"( OR *", 10),
+        (0, vec![]),
+        "query syntax is plain text"
+    );
+    assert_eq!(matches(&mut store, other, "version 1", 10), (1, vec![0]));
+    assert_eq!(matches(&mut store, 9999, "version", 10), (0, vec![]));
+
+    let first = store
+        .matching_chunks(id, "version 1", 1)
+        .expect("matches")
+        .chunks
+        .remove(0);
+    assert_eq!(first.heading_path, "Version notes");
+    assert!(first.text.contains("1.2"));
 }
 
 #[test]

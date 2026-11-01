@@ -1,6 +1,6 @@
 //! `repos`, `stats` and `project-key`: what the database holds, and which repository a folder is.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Context, Done, Failure, Reply};
 use crate::backend::Access;
@@ -32,18 +32,46 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
 /// `repositories`, `generation`, `schema` (the version a new file gets without a database) and `model` (the id
 /// of the model that embedded the chunks, `null` before any was) and `held` (how many proposals wait in the
 /// review queue, counted from its files, so it is right without a database). All counts are zero without a database.
+///
+/// `places` is `{"remote": {...}, "local": {...}}` with the same counts (not `held`) of each place in
+/// use, and the top-level counts are those of the remote database, or of this computer when that is
+/// the only place. A database is counted whatever the routing shows of it.
 pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     json_only(args)?;
 
-    let stats = match context.open(Access::Read)? {
-        Some(mut store) => store.stats()?,
-        None => Stats {
+    let places = context.routing.places();
+    let mut by_place = serde_json::Map::new();
+    let mut primary: Option<Value> = None;
+
+    for place in places {
+        let stats = match context.open_place(place, Access::Read)? {
+            Some(mut store) => store.stats()?,
+            None => Stats {
+                schema_version: SCHEMA_VERSION,
+                ..Stats::default()
+            },
+        };
+
+        let counts = counts(&stats);
+        primary.get_or_insert_with(|| counts.clone());
+        by_place.insert(place.as_str().to_owned(), counts);
+    }
+
+    let mut shown = primary.unwrap_or_else(|| {
+        counts(&Stats {
             schema_version: SCHEMA_VERSION,
             ..Stats::default()
-        },
-    };
+        })
+    });
+    shown["held"] = json!(crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()));
+    shown["places"] = Value::Object(by_place);
 
-    Ok(Done::ok(json!({
+    Ok(Done::ok(shown))
+}
+
+/// The counts of a database as `stats` prints them.
+fn counts(stats: &Stats) -> Value {
+    json!({
         "documents": stats.documents,
         "chunks": stats.chunks,
         "embeddedChunks": stats.embedded_chunks,
@@ -53,8 +81,7 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
         "generation": stats.generation,
         "schema": stats.schema_version,
         "model": stats.model_id,
-        "held": crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()),
-    })))
+    })
 }
 
 /// `project-key --json --path PATH`: `{"key", "root", "remote"}` of the repository holding the

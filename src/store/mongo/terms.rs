@@ -74,9 +74,50 @@ pub(super) fn query_words(text: &str) -> Vec<String> {
     words
 }
 
+/// The words of `text` in order, folded, repeats kept: what a phrase is made of.
+pub(super) fn phrase_words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(QUERY_TOKENS_MAX)
+        .map(folded)
+        .collect()
+}
+
+/// True when `text` holds the `phrase` words next to each other in that order, the last as a
+/// prefix of a word (the check of the phrase filter, with the folding of the `terms` index).
+pub(super) fn has_phrase(text: &str, phrase: &[String]) -> bool {
+    let Some((last, head)) = phrase.split_last() else {
+        return false;
+    };
+
+    let words: Vec<String> = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(folded)
+        .collect();
+
+    words
+        .windows(phrase.len())
+        .any(|window| window[..head.len()] == *head && window[head.len()].starts_with(last.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phrase_is_the_words_next_to_each_other_the_last_as_a_prefix() {
+        let phrase = phrase_words("Version 1");
+
+        assert!(has_phrase("Release notes, version 1", &phrase));
+        assert!(has_phrase("version 1.2 is out", &phrase), "the last word is a prefix");
+        assert!(has_phrase("VERSION\n10", &phrase));
+        assert!(!has_phrase("version two and 1 more", &phrase), "scattered words");
+        assert!(!has_phrase("1 version", &phrase), "wrong order");
+        assert!(has_phrase("Café menu", &phrase_words("cafe me")), "accents fold");
+        assert!(!has_phrase("anything", &[]));
+        assert!(has_phrase("a b", &phrase_words("b")), "one word is a prefix match");
+    }
 
     #[test]
     fn words_are_lowercase_without_latin_accents_and_l_with_stroke_stays() {

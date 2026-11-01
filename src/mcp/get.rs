@@ -10,6 +10,7 @@ use super::reply::{cut, date};
 use super::scope::{repository, scope_arg};
 use super::{GET_BYTES_DEFAULT, GET_BYTES_MAX, NEIGHBORS_MAX, Server};
 use crate::search::render::{DOC_TAG, FRAME, block, chunk_ref, doc_ref};
+use crate::store::routed::ids;
 use crate::store::{Detail, DocumentDetail, KnowledgeStore, Section};
 
 /// Most lines of the outline of a document.
@@ -50,7 +51,8 @@ impl Visible {
         }
 
         Err(Failure::Message(format!(
-            "document {doc} is linked to other repositories. Pass scope \"all\" to read it"
+            "document {} is linked to other repositories. Pass scope \"all\" to read it",
+            doc_ref(doc)
         )))
     }
 }
@@ -62,9 +64,14 @@ enum Target {
     Chunk(i64, i64),
 }
 
-/// `12` (or the number 12) is a document, `12:340` a chunk of it.
+/// `12` (or the number 12) is a document, `12:340` a chunk of it, and `local:12`, `local:12:340`
+/// the same on this computer when both places are in use.
 fn target(raw: &Value) -> Result<Target, String> {
-    let wrong = || "id must be a document id like 12 or a chunk id like 12:340, as a search shows it".to_owned();
+    let wrong = || {
+        "id must be a document id like 12 or a chunk id like 12:340, as a search shows it (local:12 and \
+         local:12:340 on this computer)"
+            .to_owned()
+    };
 
     let text = match raw {
         Value::Number(number) => number.to_string(),
@@ -72,14 +79,10 @@ fn target(raw: &Value) -> Result<Target, String> {
         _ => return Err(wrong()),
     };
 
-    let number = |part: &str| part.parse::<i64>().ok().filter(|number| *number >= 1);
-
-    match text.split_once(':') {
-        None => number(&text).map(Target::Document).ok_or_else(wrong),
-        Some((doc, chunk)) => match (number(doc), number(chunk)) {
-            (Some(doc), Some(chunk)) => Ok(Target::Chunk(doc, chunk)),
-            _ => Err(wrong()),
-        },
+    match ids::parse_reference(&text) {
+        Some(ids::Reference::Document(doc)) => Ok(Target::Document(doc)),
+        Some(ids::Reference::Chunk(doc, chunk)) => Ok(Target::Chunk(doc, chunk)),
+        None => Err(wrong()),
     }
 }
 
@@ -172,7 +175,13 @@ fn chunk_text(store: &mut dyn KnowledgeStore, doc: i64, section: &Section) -> Re
             },
         )?
         .and_then(|detail| detail.chunk)
-        .ok_or_else(|| Failure::Message(format!("chunk {} of document {doc} is gone", section.chunk_id)))?;
+        .ok_or_else(|| {
+            Failure::Message(format!(
+                "chunk {} of document {} is gone",
+                ids::split(section.chunk_id).1,
+                doc_ref(doc)
+            ))
+        })?;
 
     let marker = if section.heading_path.is_empty() {
         format!("[{}]", chunk_ref(doc, section.chunk_id))
@@ -192,7 +201,7 @@ fn document(store: &mut dyn KnowledgeStore, visible: &Visible, doc: i64, budget:
                 chunk: None,
             },
         )?
-        .ok_or_else(|| Failure::Message(format!("no document {doc}")))?;
+        .ok_or_else(|| Failure::Message(format!("no document {}", doc_ref(doc))))?;
     let detail = visible.check(doc, detail)?;
     let sections = detail.sections.clone().unwrap_or_default();
 
@@ -244,12 +253,16 @@ fn chunk_with_neighbors(
                 chunk: Some(chunk),
             },
         )?
-        .ok_or_else(|| Failure::Message(format!("no document {doc}")))?;
+        .ok_or_else(|| Failure::Message(format!("no document {}", doc_ref(doc))))?;
     let detail = visible.check(doc, detail)?;
     let sections = detail.sections.clone().unwrap_or_default();
 
     let Some(at) = sections.iter().position(|section| section.chunk_id == chunk) else {
-        return Err(Failure::Message(format!("document {doc} has no chunk {chunk}")));
+        return Err(Failure::Message(format!(
+            "document {} has no chunk {}",
+            doc_ref(doc),
+            ids::split(chunk).1
+        )));
     };
 
     let first = at.saturating_sub(neighbors);

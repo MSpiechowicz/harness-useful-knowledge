@@ -5,8 +5,12 @@
 use super::documents::{document, links_of, links_of_many};
 use super::meta;
 use super::sql::{Sql, Value, args, query_row};
-use crate::store::sqlite::sql_shared::{DOCUMENT_COLUMNS, GLOBAL, list_conditions, page_limit, page_sql};
-use crate::store::{Chunk, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts};
+use crate::store::sqlite::sql_shared::{
+    DOCUMENT_COLUMNS, GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
+};
+use crate::store::{
+    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+};
 use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
@@ -40,6 +44,32 @@ pub(super) fn list(db: &mut dyn Sql, query: &ListQuery) -> Result<DocumentPage, 
         .collect();
 
     Ok(DocumentPage { items, total })
+}
+
+/// The chunks of document `id` that match `text`, at most `limit`.
+pub(super) fn matching_chunks(db: &mut dyn Sql, id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
+    let Some(query) = matches_query(text) else {
+        return Ok(ChunkMatches::default());
+    };
+
+    let total = query_row(db, MATCHES_COUNT_SQL, args![query.clone(), id])?;
+    let total: usize = total.map_or(Ok(0), |row| row.get(0))?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    let chunks = db
+        .query(MATCHES_SQL, args![query, id, limit])?
+        .iter()
+        .map(|row| {
+            Ok(ChunkMatch {
+                chunk_id: row.get(0)?,
+                ordinal: row.get(1)?,
+                heading_path: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    Ok(ChunkMatches { total, chunks })
 }
 
 /// Document `id` with its links, and what `detail` asks for.

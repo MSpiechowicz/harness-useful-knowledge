@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::backend::{self, Access};
 use crate::cli::Args;
-use crate::config::{self, Backend};
+use crate::config::{self, Backend, Routing};
 use crate::project::ProjectResolver;
 use crate::search::render::{self, DOC_TAG, Pointer, attribute, defang, plain_text, words_of};
 use crate::search::{self, Query, QueryEmbedder, SocketEmbedder, Tuning, Vectors};
@@ -86,6 +86,7 @@ fn run(args: &[Option<&str>], mut input: Box<dyn Read + Send>, deadline: Duratio
                 embedder: Box::new(SocketEmbedder::new(&root)),
                 env,
                 backend: selection.backend,
+                routing: selection.routing,
                 project,
             },
         )
@@ -100,6 +101,7 @@ fn run(args: &[Option<&str>], mut input: Box<dyn Read + Send>, deadline: Duratio
 pub struct Setup {
     pub env: Env,
     pub backend: Backend,
+    pub routing: Routing,
     pub project: Option<String>,
     pub embedder: Box<dyn QueryEmbedder + Send>,
 }
@@ -157,7 +159,9 @@ pub fn pointers(prompt: &str, mut setup: Setup) -> Option<String> {
     let repo = projects.resolve(setup.project.as_deref()).ok().flatten();
     let scope = Scope::from_repo(repo);
 
-    let mut store = backend::open(&setup.env, &setup.backend, Access::Read).ok().flatten()?;
+    let mut store = backend::open(&setup.env, &setup.backend, setup.routing, Access::Read)
+        .ok()
+        .flatten()?;
     let query = Query {
         text: &text,
         scope: &scope,

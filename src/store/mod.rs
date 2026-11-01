@@ -8,6 +8,7 @@
 //! - [`fuse`]: merges the keyword and the vector candidates of one query (reciprocal rank fusion).
 //! - [`rank`]: the repository and glob boosts, the floor and the per-document collapse.
 //! - [`glob`]: the path globs of a link.
+//! - [`routed`]: this computer's file and a remote database as one store, ids carrying their place.
 //! - [`clean`]: the checks every backend runs before it opens a write transaction.
 //!
 //! `updated_at` is the time the content was last imported: only [`KnowledgeStore::put_document`]
@@ -20,6 +21,7 @@ pub mod libsql;
 pub mod mongo;
 pub mod postgres;
 pub mod rank;
+pub mod routed;
 pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -28,6 +30,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use routed::{Kinds, Part, RoutedStore};
 pub use sqlite::SqliteStore;
 
 use crate::project::ProjectKey;
@@ -205,6 +208,8 @@ pub enum RepoFilter {
     Global,
     /// Documents linked to this repository key.
     Repo(String),
+    /// Documents linked to at least one repository.
+    Linked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,8 +229,8 @@ pub struct ListQuery {
     pub filter: RepoFilter,
     /// Exactly this format.
     pub format: Option<String>,
-    /// Keeps the documents whose title contains it, or whose text has all its words (the last as
-    /// a prefix). Blank keeps all.
+    /// Keeps the documents whose title contains it, or whose text has all its words next to each
+    /// other in that order (the last as a prefix). Blank keeps all.
     pub text: String,
     pub sort: Sort,
     pub descending: bool,
@@ -263,6 +268,23 @@ pub struct DocumentDetail {
     pub sections: Option<Vec<Section>>,
     /// The chunk asked for, with its text and no vector.
     pub chunk: Option<Chunk>,
+}
+
+/// A chunk of a document that matches a text, with the text to cut a snippet from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMatch {
+    pub chunk_id: i64,
+    pub ordinal: usize,
+    pub heading_path: String,
+    pub text: String,
+}
+
+/// The chunks of one document that match a text, in document order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkMatches {
+    /// Every chunk that matches, over the `limit`.
+    pub total: usize,
+    pub chunks: Vec<ChunkMatch>,
 }
 
 /// A chunk that has no vector of the current model, with the text to embed.
@@ -401,6 +423,17 @@ pub trait KnowledgeStore: Send {
 
     /// The `k` chunks closest to `vector` (L2-normalised, [`DIMS`] floats), the closest first.
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError>;
+
+    /// The chunks of document `doc_id` that match `text` the way the list's text filter reads it
+    /// (see [`ListQuery::text`]), by position, at most `limit`; none for a text with no word or a
+    /// document that does not exist.
+    fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError>;
+
+    /// The stores a routed store reads, with the kinds of document each may show: `None` for a
+    /// store that is one place. A search runs its pipeline in each and fuses the results.
+    fn routed_parts(&mut self) -> Option<Vec<Part<'_>>> {
+        None
+    }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError>;
 

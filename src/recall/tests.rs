@@ -49,6 +49,7 @@ fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> (tempfile::
     let setup = Setup {
         env,
         backend: Backend::Sqlite,
+        routing: Routing::local(),
         project: None,
         embedder,
     };

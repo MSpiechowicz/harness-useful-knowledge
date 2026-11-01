@@ -63,7 +63,9 @@ use crate::config::Secrets;
 use ctx::{Ctx, Fail};
 use schema::IndexState;
 
-use super::{Chunk, ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
+use super::{
+    Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
+};
 use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 
 /// The database used when the URL path names none.
@@ -346,6 +348,10 @@ impl KnowledgeStore for MongoStore {
         let model = self.meta("model_id")?;
 
         self.read(|ctx| search::vector_top_k(ctx, vector, scope, model.as_deref(), k))
+    }
+
+    fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
+        self.read(|ctx| listing::matching_chunks(ctx, doc_id, text, limit))
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

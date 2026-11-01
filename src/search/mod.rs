@@ -19,7 +19,8 @@ pub use embedder::{AutoEmbedder, QueryEmbedder, SocketEmbedder};
 pub use render::Pointer;
 
 use crate::store::fuse::{Scored, fuse};
-use crate::store::{KnowledgeStore, Scope, StoreError, rank};
+use crate::store::routed::{ids, merge_found};
+use crate::store::{Kinds, KnowledgeStore, Part, Scope, StoreError, rank};
 
 /// How many candidates each list asks the store for.
 pub const CANDIDATES: usize = 50;
@@ -97,13 +98,31 @@ pub struct Found {
 }
 
 /// Answers `query` from `store`, with `embedder` for the vector side (none: keyword-only).
+///
+/// A routed store (see [`KnowledgeStore::routed_parts`]) is searched place by place, each with the
+/// whole pipeline, and the lists are fused by rank ([`fuse_places`]).
 pub fn run(
     store: &mut dyn KnowledgeStore,
     embedder: Option<&mut dyn QueryEmbedder>,
     query: &Query,
     tuning: Tuning,
 ) -> Result<Found, StoreError> {
-    let (fused, vectors) = candidates(store, embedder, query, tuning)?;
+    if let Some(parts) = store.routed_parts() {
+        return run_parts(parts, embedder, query, tuning);
+    }
+
+    run_in(store, embedder, query, tuning, Kinds::ALL)
+}
+
+/// The pipeline in one store, which shows the document `kinds` only.
+fn run_in(
+    store: &mut dyn KnowledgeStore,
+    embedder: Option<&mut dyn QueryEmbedder>,
+    query: &Query,
+    tuning: Tuning,
+    kinds: Kinds,
+) -> Result<Found, StoreError> {
+    let (fused, vectors) = candidates(store, embedder, query, tuning, kinds)?;
 
     Ok(Found {
         hits: rank::rank(fused, query.paths, query.limit),
@@ -111,19 +130,77 @@ pub fn run(
     })
 }
 
+/// The pipeline in each part, the query embedded once.
+fn run_parts(
+    parts: Vec<Part<'_>>,
+    embedder: Option<&mut dyn QueryEmbedder>,
+    query: &Query,
+    tuning: Tuning,
+) -> Result<Found, StoreError> {
+    let mut cached = embedder.map(Cached::new);
+    let mut founds = Vec::new();
+
+    for part in parts {
+        if part.kinds.is_none() {
+            continue;
+        }
+
+        let embedder = cached.as_mut().map(|cached| cached as &mut dyn QueryEmbedder);
+        let mut found = run_in(part.store, embedder, query, tuning, part.kinds)?;
+
+        // From here on the ids say which place the chunk is in.
+        for scored in &mut found.hits {
+            scored.hit.chunk_id = ids::tag(part.place, scored.hit.chunk_id);
+            scored.hit.doc_id = ids::tag(part.place, scored.hit.doc_id);
+        }
+
+        founds.push(found);
+    }
+
+    Ok(merge_found(founds, query.limit))
+}
+
+/// An embedder that answers the same text twice from its first answer.
+struct Cached<'a> {
+    inner: &'a mut dyn QueryEmbedder,
+    last: Option<(String, Result<Vec<f32>, String>)>,
+}
+
+impl<'a> Cached<'a> {
+    fn new(inner: &'a mut dyn QueryEmbedder) -> Self {
+        Self { inner, last: None }
+    }
+}
+
+impl QueryEmbedder for Cached<'_> {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        if let Some((asked, answer)) = &self.last
+            && asked == text
+        {
+            return answer.clone();
+        }
+
+        let answer = self.inner.embed_query(text);
+        self.last = Some((text.to_owned(), answer.clone()));
+        answer
+    }
+}
+
 /// The fused candidates of `query`, before the boosts, the floor and the margin of [`rank`].
-pub(crate) fn candidates(
+fn candidates(
     store: &mut dyn KnowledgeStore,
     embedder: Option<&mut dyn QueryEmbedder>,
     query: &Query,
     tuning: Tuning,
+    kinds: Kinds,
 ) -> Result<(Vec<Scored>, Vectors), StoreError> {
     let text = query.text.trim();
 
     let mut keyword = if tuning.lists == Lists::VectorOnly || text.is_empty() {
         Vec::new()
     } else {
-        store.keyword_top_k(text, query.scope, CANDIDATES)?
+        let found = store.keyword_top_k(text, query.scope, CANDIDATES)?;
+        kinds.keep(store, found)?
     };
 
     keyword.retain(|hit| hit.score >= tuning.keyword);
@@ -132,7 +209,10 @@ pub(crate) fn candidates(
         (Lists::KeywordOnly, _) | (_, None) => (Vec::new(), Vectors::NotAsked),
         _ if text.is_empty() => (Vec::new(), Vectors::NotAsked),
         (_, Some(embedder)) => match embedder.embed_query(text) {
-            Ok(embedding) => (store.vector_top_k(&embedding, query.scope, CANDIDATES)?, Vectors::Used),
+            Ok(embedding) => {
+                let found = store.vector_top_k(&embedding, query.scope, CANDIDATES)?;
+                (kinds.keep(store, found)?, Vectors::Used)
+            }
             Err(reason) => (Vec::new(), Vectors::Unavailable(reason)),
         },
     };

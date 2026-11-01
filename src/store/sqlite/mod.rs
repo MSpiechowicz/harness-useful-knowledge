@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use super::PendingChunk;
-use super::{ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
+use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
 use super::{RepoCounts, Scope, Stats, StoreError, clean};
 use schema::SchemaState;
 
@@ -253,6 +253,10 @@ impl KnowledgeStore for SqliteStore {
 
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
         search::vector_top_k(self.conn()?, vector, scope, k)
+    }
+
+    fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
+        listing::matching_chunks(self.conn()?, doc_id, text, limit)
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

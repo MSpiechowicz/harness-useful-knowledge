@@ -5,9 +5,9 @@
 //! FTS5) is an [`OpenError::Missing`] with the `check` problem code, which every command answers
 //! with exit 3.
 
-use crate::config::Backend;
+use crate::config::{Backend, Layout, Place, Routing};
 use crate::location::{DIR_VAR, database_path, override_is_relative};
-use crate::store::{KnowledgeStore, SqliteStore, StoreError};
+use crate::store::{KnowledgeStore, RoutedStore, SqliteStore, StoreError};
 use crate::support::Env;
 
 /// What a command needs from the database.
@@ -44,16 +44,48 @@ impl OpenError {
     }
 }
 
-/// The store of `backend`, or `None` when `access` does not create the database and it does not
-/// exist (callers answer as for an empty one).
-pub fn open(env: &Env, backend: &Backend, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
-    match backend {
-        Backend::Sqlite => open_local(env, access),
-        Backend::Postgres { url } => crate::store::postgres::open_boxed(url, access, &backend.secrets()),
-        Backend::Libsql { url, token } => {
+/// The store the `routing` selects: the one place in use as it is (plain ids), or both as a
+/// [`RoutedStore`] (ids carry their place). `None` when `access` does not create the database
+/// and none of the places in use exists (callers answer as for an empty one).
+pub fn open(
+    env: &Env,
+    backend: &Backend,
+    routing: Routing,
+    access: Access,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    match routing.layout() {
+        Layout::Local => open_place(env, backend, Place::Local, access),
+        Layout::Remote => open_place(env, backend, Place::Remote, access),
+        Layout::Both => {
+            let local = open_place(env, backend, Place::Local, access)?;
+            let remote = open_place(env, backend, Place::Remote, access)?;
+
+            if local.is_none() && remote.is_none() {
+                return Ok(None);
+            }
+
+            Ok(Some(Box::new(RoutedStore::new(local, remote, routing))))
+        }
+    }
+}
+
+/// The store of one place, whatever the routing: the local file or the remote database.
+pub fn open_place(
+    env: &Env,
+    backend: &Backend,
+    place: Place,
+    access: Access,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    match (place, backend) {
+        (Place::Local, _) => open_local(env, access),
+        (Place::Remote, Backend::Sqlite) => Err(OpenError::Failed("no remote database is configured".to_owned())),
+        (Place::Remote, Backend::Postgres { url }) => {
+            crate::store::postgres::open_boxed(url, access, &backend.secrets())
+        }
+        (Place::Remote, Backend::Libsql { url, token }) => {
             crate::store::libsql::open_boxed(url, token.as_deref(), access, &backend.secrets())
         }
-        Backend::Mongodb { url } => crate::store::mongo::open_boxed(url, access, &backend.secrets()),
+        (Place::Remote, Backend::Mongodb { url }) => crate::store::mongo::open_boxed(url, access, &backend.secrets()),
     }
 }
 
@@ -104,18 +136,30 @@ mod tests {
         let folder = dir.path().join("knowledge");
         let env = env_in(&folder);
 
-        assert!(open(&env, &Backend::Sqlite, Access::Read).expect("read").is_none());
         assert!(
-            open(&env, &Backend::Sqlite, Access::Existing)
+            open(&env, &Backend::Sqlite, Routing::local(), Access::Read)
+                .expect("read")
+                .is_none()
+        );
+        assert!(
+            open(&env, &Backend::Sqlite, Routing::local(), Access::Existing)
                 .expect("existing")
                 .is_none()
         );
         assert!(!folder.exists());
 
-        assert!(open(&env, &Backend::Sqlite, Access::Create).expect("create").is_some());
+        assert!(
+            open(&env, &Backend::Sqlite, Routing::local(), Access::Create)
+                .expect("create")
+                .is_some()
+        );
         assert!(folder.join(FILE_NAME).is_file());
 
-        assert!(open(&env, &Backend::Sqlite, Access::Read).expect("read").is_some());
+        assert!(
+            open(&env, &Backend::Sqlite, Routing::local(), Access::Read)
+                .expect("read")
+                .is_some()
+        );
     }
 
     #[test]
@@ -123,7 +167,7 @@ mod tests {
         let env = Env::for_tests("/home/u").with_var(DIR_VAR, "relative");
 
         assert!(matches!(
-            open(&env, &Backend::Sqlite, Access::Read),
+            open(&env, &Backend::Sqlite, Routing::local(), Access::Read),
             Err(OpenError::Failed(_))
         ));
     }

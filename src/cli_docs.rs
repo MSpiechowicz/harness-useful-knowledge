@@ -13,6 +13,13 @@
 //! - `docs get --json ID [--sections] [--chunk CID]` prints `{"document": {... "links"}}` and, as
 //!   asked, `"sections"` (the outline: every chunk's id, position, heading path and size) and
 //!   `"chunk"` (that chunk of the document, with its text).
+//! - `docs matches --json ID --query Q [--limit N]` prints `{"matches": [{"chunkId", "ordinal",
+//!   "section", "snippet"}], "total": N}`: the chunks of one document whose heading path or text
+//!   hold the words of `Q` next to each other in that order, the last as a prefix (the filter
+//!   `docs list --query` applies to the text of documents, see [`crate::store::ListQuery::text`]), by
+//!   position, at most `--limit` (1 to 50, 20 when not given). `total` counts every match. A
+//!   `snippet` is at most 240 characters of the chunk around the first word found, as it is
+//!   written (untrusted text). Read only: it never creates the database.
 //! - `docs links set --json ID` reads `[{"repo": "git:host/owner/repo", "globs": ["src/**"]}]` from
 //!   stdin (at most 32 links with 32 globs of 256 characters, see [`crate::store::clean`]) and
 //!   replaces the document's links; prints `{"id", "links"}`. An empty array makes it global.
@@ -33,6 +40,7 @@
 mod check;
 mod import;
 mod json;
+mod matches;
 mod overview;
 
 use std::io::Read;
@@ -42,15 +50,16 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, Access, OpenError};
 use crate::cli::{self, Args};
-use crate::config::Backend;
+use crate::config::{Backend, Place, Routing};
 use crate::limits::{DELETE_IDS_MAX, LIST_PAGE_DEFAULT, LIST_PAGE_MAX, STDIN_MAX};
+use crate::store::routed::ids;
 use crate::store::{Detail, KnowledgeStore, Link, ListQuery, RepoFilter, Sort, StoreError, clean};
 use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
                          [--sort title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] | docs get --json ID \
-                         [--sections] [--chunk CID] | docs links set --json ID < links.json | docs rename --json ID \
+                         [--sections] [--chunk CID] | docs matches --json ID --query Q [--limit N] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
                          --json (ID... | --all) | repos --json | stats --json | project-key --json \
                          --path PATH | check --json";
@@ -59,11 +68,22 @@ pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--for
 pub struct Context<'a> {
     pub env: &'a Env,
     pub backend: &'a Backend,
+    pub routing: Routing,
 }
 
-impl Context<'_> {
+impl<'a> Context<'a> {
+    pub fn new(env: &'a Env, backend: &'a Backend, routing: Routing) -> Self {
+        Self { env, backend, routing }
+    }
+
+    /// The store of the routing: one place as it is, or both routed.
     fn open(&self, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, Failure> {
-        Ok(backend::open(self.env, self.backend, access)?)
+        Ok(backend::open(self.env, self.backend, self.routing, access)?)
+    }
+
+    /// The store of one place alone, for what is done to a place (an import, a reindex, a check).
+    fn open_place(&self, place: Place, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, Failure> {
+        Ok(backend::open_place(self.env, self.backend, place, access)?)
     }
 }
 
@@ -120,6 +140,16 @@ pub fn docs(args: &[Option<&str>]) -> ExitCode {
     run(args, docs_reply)
 }
 
+/// The reply of `stats <args>`.
+pub fn stats_reply(context: &Context, args: &[Option<&str>]) -> Reply {
+    overview::stats(context, args)
+}
+
+/// The reply of `check <args>`.
+pub fn check_reply(context: &Context, args: &[Option<&str>]) -> Reply {
+    check::check(context, args)
+}
+
 /// `harness-knowledge repos <args>`.
 pub fn repos(args: &[Option<&str>]) -> ExitCode {
     run(args, |context, args, _| overview::repos(context, args))
@@ -148,10 +178,7 @@ fn run(args: &[Option<&str>], command: Command) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let context = Context {
-        env: &env,
-        backend: &selection.backend,
-    };
+    let context = Context::new(&env, &selection.backend, selection.routing);
 
     finish(command(&context, args, &mut std::io::stdin().lock()))
 }
@@ -178,6 +205,7 @@ pub fn docs_reply(context: &Context, args: &[Option<&str>], input: &mut dyn Read
     match args {
         [Some("list"), rest @ ..] => list(context, rest),
         [Some("get"), rest @ ..] => get(context, rest),
+        [Some("matches"), rest @ ..] => matches::matches(context, rest),
         [Some("links"), Some("set"), rest @ ..] => links_set(context, rest, input),
         [Some("rename"), rest @ ..] => rename(context, rest),
         [Some("delete"), rest @ ..] => delete(context, rest),
@@ -284,9 +312,10 @@ fn parse_format(raw: &str) -> Result<String, Failure> {
     if fine { Ok(raw.to_owned()) } else { Err(Failure::Usage) }
 }
 
-/// A document or chunk id: a positive number.
+/// A document or chunk id as written: `12`, or `local:12` for one on this computer (see
+/// [`crate::store::routed::ids`]).
 fn parse_id(raw: &str) -> Result<i64, Failure> {
-    raw.parse::<i64>().ok().filter(|id| *id >= 1).ok_or(Failure::Usage)
+    ids::parse(raw).ok_or(Failure::Usage)
 }
 
 /// The id every document command takes as its one positional argument.
@@ -298,7 +327,7 @@ fn the_id(parsed: &Args) -> Result<i64, Failure> {
 }
 
 fn not_found(id: i64) -> Failure {
-    Failure::Failed(format!("document {id} not found"))
+    Failure::Failed(format!("document {} not found", ids::show(id)))
 }
 
 /// `docs get`.
@@ -359,7 +388,7 @@ fn links_set(context: &Context, args: &[Option<&str>], input: &mut dyn Read) -> 
     }
 
     Ok(Done::ok(
-        json!({ "id": id, "links": links.iter().map(json::link).collect::<Vec<_>>() }),
+        json!({ "id": ids::json(id), "links": links.iter().map(json::link).collect::<Vec<_>>() }),
     ))
 }
 
@@ -401,7 +430,7 @@ fn rename(context: &Context, args: &[Option<&str>]) -> Reply {
         return Err(not_found(id));
     }
 
-    Ok(Done::ok(json!({ "id": id, "title": title })))
+    Ok(Done::ok(json!({ "id": ids::json(id), "title": title })))
 }
 
 /// `docs delete`.
@@ -429,5 +458,7 @@ fn delete(context: &Context, args: &[Option<&str>]) -> Reply {
     Ok(Done::ok(json!({ "deleted": store.delete(&ids)? })))
 }
 
+#[cfg(test)]
+mod routing_tests;
 #[cfg(test)]
 mod tests;

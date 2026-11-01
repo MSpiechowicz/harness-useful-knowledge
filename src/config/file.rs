@@ -14,6 +14,15 @@ use super::secrets::Secrets;
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigFile {
     pub database: Option<DatabaseTable>,
+    pub routing: Option<RoutingTable>,
+}
+
+/// The `[routing]` table of the config file (see [`super::routing`]).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RoutingTable {
+    pub repository_documents: Option<String>,
+    pub global_documents: Option<String>,
 }
 
 /// The `[database]` table of the config file.

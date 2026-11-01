@@ -8,7 +8,10 @@ use super::documents::{COLUMNS, document, links_of};
 use super::error::{backend, column, count, int};
 use super::{meta, schema};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
-use crate::store::{Chunk, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts, RepoFilter};
+use crate::store::{
+    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+    RepoFilter,
+};
 use crate::store::{Section, Sort, Stats, StoreError};
 
 /// A document of no repository (aliased `d`).
@@ -83,6 +86,7 @@ fn conditions(query: &ListQuery) -> (String, Vec<Param>) {
     match &query.filter {
         RepoFilter::All => {}
         RepoFilter::Global => clauses.push(GLOBAL.to_owned()),
+        RepoFilter::Linked => clauses.push(format!("NOT ({GLOBAL})")),
         RepoFilter::Repo(key) => {
             params.push(Box::new(key.clone()));
             clauses.push(format!(
@@ -123,18 +127,89 @@ fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
-/// The words of `text` as a `tsquery` that wants all of them, each as a prefix: `'api':* & 'gat':*`.
-/// The words are lowercase letters and digits, so nothing in it is `tsquery` syntax. `None` when
-/// there is no word.
+/// The words of `text` as a `tsquery` for a phrase: the words next to each other in that order,
+/// the last as a prefix, `'api' <-> 'gat':*`. The words are lowercase letters and digits, so
+/// nothing in it is `tsquery` syntax. `None` when there is no word.
 fn prefix_query(text: &str) -> Option<String> {
+    phrase_query(text, "")
+}
+
+/// [`prefix_query`] with every word restricted to the weights `weights` (`BD`: the heading path
+/// and the text, not the title).
+fn phrase_query(text: &str, weights: &str) -> Option<String> {
     let words: Vec<String> = text
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .take(QUERY_TOKENS_MAX)
-        .map(|word| format!("'{}':*", word.to_lowercase()))
+        .map(str::to_lowercase)
         .collect();
 
-    (!words.is_empty()).then(|| words.join(" & "))
+    let last = words.len().checked_sub(1)?;
+    let terms: Vec<String> = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| {
+            let suffix = format!("{}{weights}", if index == last { "*" } else { "" });
+
+            if suffix.is_empty() {
+                format!("'{word}'")
+            } else {
+                format!("'{word}':{suffix}")
+            }
+        })
+        .collect();
+
+    Some(terms.join(" <-> "))
+}
+
+/// The chunks of document `id` that match `text` in their heading path or text, at most `limit`.
+pub(super) fn matching_chunks(
+    client: &mut impl GenericClient,
+    id: i64,
+    text: &str,
+    limit: usize,
+) -> Result<ChunkMatches, StoreError> {
+    let Some(tsquery) = phrase_query(text, "BD") else {
+        return Ok(ChunkMatches::default());
+    };
+
+    let condition = format!(
+        "c.doc_id = $1 AND c.tsv @@ to_tsquery('simple'::regconfig, {})",
+        schema::fold("$2")
+    );
+    let total = client
+        .query_one(
+            &format!("SELECT count(*) FROM knowledge_chunks c WHERE {condition}"),
+            &[&id, &tsquery],
+        )
+        .map_err(backend)?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = client
+        .query(
+            &format!(
+                "SELECT c.id, c.ordinal, c.heading_path, c.text FROM knowledge_chunks c
+                 WHERE {condition} ORDER BY c.ordinal LIMIT $3"
+            ),
+            &[&id, &tsquery, &limit],
+        )
+        .map_err(backend)?;
+
+    let chunks = rows
+        .iter()
+        .map(|row| {
+            Ok(ChunkMatch {
+                chunk_id: column(row, 0)?,
+                ordinal: count(row, 1)?,
+                heading_path: column(row, 2)?,
+                text: column(row, 3)?,
+            })
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    Ok(ChunkMatches {
+        total: count(&total, 0)?,
+        chunks,
+    })
 }
 
 /// Document `id` with its links, and what `detail` asks for.
@@ -295,11 +370,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_words_of_a_text_become_quoted_prefixes_that_all_must_match() {
-        assert_eq!(prefix_query("API gat").as_deref(), Some("'api':* & 'gat':*"));
+    fn the_words_of_a_text_become_a_quoted_phrase_whose_last_word_is_a_prefix() {
+        assert_eq!(prefix_query("API gat").as_deref(), Some("'api' <-> 'gat':*"));
+        assert_eq!(
+            prefix_query("one two three").as_deref(),
+            Some("'one' <-> 'two' <-> 'three':*")
+        );
         assert_eq!(prefix_query("\"( OR *").as_deref(), Some("'or':*"));
         assert_eq!(prefix_query("'; DROP").as_deref(), Some("'drop':*"));
         assert_eq!(prefix_query(" ?! "), None);
+        assert_eq!(
+            phrase_query("Version 1", "BD").as_deref(),
+            Some("'version':BD <-> '1':*BD")
+        );
     }
 
     #[test]

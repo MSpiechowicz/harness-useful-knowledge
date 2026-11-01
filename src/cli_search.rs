@@ -5,7 +5,7 @@
 //! It prints a JSON array, best first, and `[]` (exit 0) when nothing matches or there is no
 //! database: a read never creates it. An item is `{"docId", "chunkId", "id", "title", "section",
 //! "score", "snippet", "block"}` for `--mode pointers` (the default) and `"text"` instead of
-//! `"snippet"` for `--mode chunks`. `id` is what `knowledge_get` takes (`12:340`). The `snippet`
+//! `"snippet"` for `--mode chunks`. `id` is what `knowledge_get` takes (`12:340`, `local:12:340` for a document on this computer when both places are in use, where `docId` and `chunkId` are the string `local:12`). The `snippet`
 //! and the `text` are the document's own words: whatever shows them to an agent must wrap them as
 //! untrusted, and `block` is that wrapping, ready to use. `--project` names the repository the
 //! search is for (else the working folder's), `--path` (repeatable) the repository-relative files
@@ -21,9 +21,10 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, Access, OpenError};
 use crate::cli::{self, Args};
-use crate::config::Backend;
+use crate::config::{Backend, Routing};
 use crate::search::render::{DOC_TAG, Pointer, block, chunk_ref, words_of};
 use crate::search::{self, AutoEmbedder, Query, QueryEmbedder, Tuning, Vectors};
+use crate::store::routed::ids;
 use crate::store::{Scope, StoreError, clean};
 use crate::support::Env;
 
@@ -87,7 +88,7 @@ pub fn search(args: &[Option<&str>]) -> ExitCode {
 
     let mut embedder = AutoEmbedder::new(&root);
 
-    match answer(&env, &selection.backend, args, &mut embedder) {
+    match answer(&env, &selection.backend, selection.routing, args, &mut embedder) {
         Ok(answer) => {
             if let Some(notice) = &answer.notice {
                 eprintln!("harness-knowledge: {notice}");
@@ -193,6 +194,7 @@ fn parse(args: &[Option<&str>]) -> Result<Options, Failure> {
 pub fn answer(
     env: &Env,
     backend: &Backend,
+    routing: Routing,
     args: &[Option<&str>],
     embedder: &mut dyn QueryEmbedder,
 ) -> Result<Answer, Failure> {
@@ -204,7 +206,7 @@ pub fn answer(
         ));
     };
 
-    let Some(mut store) = backend::open(env, backend, Access::Read)? else {
+    let Some(mut store) = backend::open(env, backend, routing, Access::Read)? else {
         return Ok(Answer {
             json: json!([]),
             notice: None,
@@ -237,8 +239,8 @@ pub fn answer(
             };
 
             let mut item = json!({
-                "docId": pointer.doc_id,
-                "chunkId": pointer.chunk_id,
+                "docId": ids::json(pointer.doc_id),
+                "chunkId": ids::json(pointer.chunk_id),
                 "id": chunk_ref(pointer.doc_id, pointer.chunk_id),
                 "title": pointer.title,
                 "section": pointer.section,

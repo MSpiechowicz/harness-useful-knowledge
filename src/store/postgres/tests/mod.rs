@@ -8,5 +8,6 @@ mod documents;
 mod embeddings;
 mod files;
 mod listing;
+mod routed;
 mod search;
 mod support;

@@ -53,7 +53,7 @@ pub use schema::SCHEMA_VERSION;
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 
-use super::{ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
+use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
 use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 
 /// How long a write keeps asking for a lock the server reports busy.
@@ -294,6 +294,10 @@ impl KnowledgeStore for LibsqlStore {
 
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
         self.read(|db| search::vector_top_k(db, vector, scope, k))
+    }
+
+    fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
+        self.read(|db| listing::matching_chunks(db, doc_id, text, limit))
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

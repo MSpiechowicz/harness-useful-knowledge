@@ -4,12 +4,15 @@
 //! - `held list --json` prints `{"held": [...]}`: the waiting proposals (camelCase, as written,
 //!   without their text, with a `preview` of its start), newest first.
 //! - `held get --json ID` prints `{"held": {...}}`: one proposal with its whole text.
-//! - `held approve --json ID [--expect REVISION]` imports the proposal as a document (origin
+//! - `held approve --json ID [--expect REVISION] [--place remote|local]` imports the proposal as a document (origin
 //!   `agentApproved`, embedded when the embedder runs, else its chunks wait for `docs reindex`) and
 //!   removes it, printing `{"approved": {"heldId", "docId", "status", "title", "chunks",
 //!   "embedding"}}`. `status` is `added`, `updated` or `unchanged` (the same text was imported
 //!   already, and its links now include the proposal's). With `--expect` it approves only the
-//!   proposal of that `revision` (what the person saw).
+//!   proposal of that `revision` (what the person saw). `--place` says where the document is saved
+//!   (the routing's default for its kind otherwise, see [`crate::config::routing`]) and a place the
+//!   routing does not keep that kind in is `refused`. `docId` is a number, or `local:12` for a
+//!   document on this computer when both places are in use.
 //! - `held reject --json ID [--expect REVISION]` removes it, printing `{"rejected": "<heldId>"}`.
 //!
 //! Approving and rejecting claim the proposal first (see [`crate::held`]), so two decisions about one
@@ -26,18 +29,19 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, Access, OpenError};
 use crate::cli::{self, Args};
-use crate::config::Backend;
+use crate::config::{Backend, Kind, Layout, Place, Routing};
 use crate::extract::pdf::PdfPages;
 use crate::held::{Claim, HeldItem, HeldStore};
 use crate::import::events::Status;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
+use crate::store::routed::ids;
 use crate::store::{Origin, clean};
 use crate::support::Env;
 use crate::tokens::counter_for;
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "held list --json | held get --json ID | held approve --json ID [--expect REVISION] | held \
+pub const USAGE: &str = "held list --json | held get --json ID | held approve --json ID [--expect REVISION] [--place remote|local] | held \
      reject --json ID [--expect REVISION]";
 
 /// Characters of the start of a proposal's text that `held list` shows.
@@ -82,7 +86,7 @@ pub fn held(args: &[Option<&str>]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    match reply(&env, &selection.backend, args) {
+    match reply(&env, &selection.backend, selection.routing, args) {
         Reply::Done(json) => {
             println!("{json}");
             ExitCode::SUCCESS
@@ -100,7 +104,7 @@ pub fn held(args: &[Option<&str>]) -> ExitCode {
 }
 
 /// The reply to `held <args>`.
-pub fn reply(env: &Env, backend: &Backend, args: &[Option<&str>]) -> Reply {
+pub fn reply(env: &Env, backend: &Backend, routing: Routing, args: &[Option<&str>]) -> Reply {
     let Some(held) = HeldStore::open(env) else {
         return Reply::Failed("the data folder is unknown".to_owned());
     };
@@ -108,21 +112,43 @@ pub fn reply(env: &Env, backend: &Backend, args: &[Option<&str>]) -> Reply {
     match args {
         [Some("list"), rest @ ..] => list(&held, rest),
         [Some("get"), rest @ ..] => get(&held, rest),
-        [Some("approve"), rest @ ..] => approve(env, backend, &held, rest),
+        [Some("approve"), rest @ ..] => approve(env, backend, routing, &held, rest),
         [Some("reject"), rest @ ..] => reject(&held, rest),
         _ => Reply::Usage,
     }
 }
 
-/// The id and the `--expect` revision of a decision.
-fn decision<'a>(args: &'a [Option<&'a str>]) -> Option<(&'a str, Option<&'a str>)> {
-    let parsed = Args::parse(args, &["--json"], &["--expect"])?;
+/// What a decision names: the id, the `--expect` revision and, for an approval, the `--place`.
+struct Decision<'a> {
+    id: &'a str,
+    expect: Option<&'a str>,
+    place: Option<Place>,
+}
+
+/// The decision in `args`; `None` for a usage error. `--place` is only for an approval and is
+/// `remote` or `local`.
+fn decision<'a>(args: &'a [Option<&'a str>], approval: bool) -> Option<Decision<'a>> {
+    let valued: &[&str] = if approval {
+        &["--expect", "--place"]
+    } else {
+        &["--expect"]
+    };
+    let parsed = Args::parse(args, &["--json"], valued)?;
 
     if !parsed.flag("--json") || parsed.positional.len() != 1 {
         return None;
     }
 
-    Some((parsed.positional[0], parsed.value("--expect")))
+    let place = match parsed.value("--place") {
+        Some(raw) => Some(Place::parse(raw)?),
+        None => None,
+    };
+
+    Some(Decision {
+        id: parsed.positional[0],
+        expect: parsed.value("--expect"),
+        place,
+    })
 }
 
 fn list(held: &HeldStore, args: &[Option<&str>]) -> Reply {
@@ -179,7 +205,7 @@ fn not_found() -> Reply {
 }
 
 fn reject(held: &HeldStore, args: &[Option<&str>]) -> Reply {
-    let Some((id, expect)) = decision(args) else {
+    let Some(Decision { id, expect, .. }) = decision(args, false) else {
         return Reply::Usage;
     };
 
@@ -229,8 +255,8 @@ impl PdfPages for NoPdf {
     }
 }
 
-fn approve(env: &Env, backend: &Backend, held: &HeldStore, args: &[Option<&str>]) -> Reply {
-    let Some((id, expect)) = decision(args) else {
+fn approve(env: &Env, backend: &Backend, routing: Routing, held: &HeldStore, args: &[Option<&str>]) -> Reply {
+    let Some(Decision { id, expect, place }) = decision(args, true) else {
         return Reply::Usage;
     };
 
@@ -239,7 +265,7 @@ fn approve(env: &Env, backend: &Backend, held: &HeldStore, args: &[Option<&str>]
         Err(reply) => return reply,
     };
 
-    match import(env, backend, &claim.item) {
+    match import(env, backend, routing, place, &claim.item) {
         Ok(approved) => match claim.finish() {
             Ok(()) => Reply::Done(json!({ "approved": approved })),
             Err(message) => Reply::Failed(message),
@@ -253,10 +279,20 @@ fn approve(env: &Env, backend: &Backend, held: &HeldStore, args: &[Option<&str>]
 }
 
 /// Imports `item` as a document and describes the result.
-fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply> {
+fn import(
+    env: &Env,
+    backend: &Backend,
+    routing: Routing,
+    place: Option<Place>,
+    item: &HeldItem,
+) -> Result<Value, Reply> {
     let refused = |message: String| Reply::Refused(Code::Refused, message);
 
     let links = clean::links(&item.links).map_err(|error| refused(error.to_string()))?;
+
+    let kind = Kind::of(links.len());
+    let place = place.unwrap_or_else(|| routing.default_place(kind));
+    routing.check_write(kind, place).map_err(&refused)?;
 
     // The text goes through a file of the format's extension, the way an imported file does.
     let folder =
@@ -274,7 +310,7 @@ fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply>
         problem: None,
     };
 
-    let mut store = match backend::open(env, backend, Access::Create) {
+    let mut store = match backend::open_place(env, backend, place, Access::Create) {
         Ok(Some(store)) => store,
         Ok(None) => return Err(Reply::Failed("the database could not be created".to_owned())),
         Err(error) => return Err(open_failure(error)),
@@ -301,7 +337,7 @@ fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply>
     match event.status {
         Status::Added | Status::Updated | Status::Unchanged => Ok(json!({
             "heldId": item.held_id,
-            "docId": event.doc_id,
+            "docId": doc_id(event.doc_id, place, routing),
             "status": event.status.as_str(),
             "title": item.title,
             "chunks": event.chunks,
@@ -312,6 +348,15 @@ fn import(env: &Env, backend: &Backend, item: &HeldItem) -> Result<Value, Reply>
                 .reason
                 .unwrap_or_else(|| "the document could not be imported".to_owned()),
         )),
+    }
+}
+
+/// The id of the imported document as written: tagged with its place when both are in use.
+fn doc_id(id: Option<i64>, place: Place, routing: Routing) -> Value {
+    match id {
+        Some(id) if routing.layout() == Layout::Both => ids::json(ids::tag(place, id)),
+        Some(id) => json!(id),
+        None => Value::Null,
     }
 }
 

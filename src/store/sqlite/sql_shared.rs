@@ -100,7 +100,10 @@ pub(crate) use {keyword_index, tables};
 pub(crate) const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
      d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
 
-/// A document of no repository (aliased `d`).
+/// A document linked to some repository (aliased `d`).
+pub(crate) const LINKED: &str = "EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
+
+/// A document linked to no repository (aliased `d`).
 pub(crate) const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
 
 /// True for the documents of the scope: parameter `?{all}` is 1 for every document, else the
@@ -169,6 +172,7 @@ pub(crate) fn list_conditions<V: From<String>>(query: &ListQuery) -> (String, Ve
     match &query.filter {
         RepoFilter::All => {}
         RepoFilter::Global => clauses.push(GLOBAL.to_owned()),
+        RepoFilter::Linked => clauses.push(LINKED.to_owned()),
         RepoFilter::Repo(key) => {
             params.push(key.clone().into());
             clauses.push(format!(
@@ -236,18 +240,35 @@ fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
-/// The words of `text` as an FTS5 query that wants all of them, each as a prefix:
-/// `"api"* "gat"*`. `None` when there is no word.
-fn prefix_query(text: &str) -> Option<String> {
+/// The words of `text` as an FTS5 phrase query: the words next to each other in that order, the
+/// last as a prefix, `"api gat"*`. `None` when there is no word.
+pub(crate) fn prefix_query(text: &str) -> Option<String> {
     let words: Vec<String> = text
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .take(QUERY_TOKENS_MAX)
-        .map(|word| format!("\"{}\"*", word.to_lowercase()))
+        .map(str::to_lowercase)
         .collect();
 
-    (!words.is_empty()).then(|| words.join(" "))
+    (!words.is_empty()).then(|| format!("\"{}\"*", words.join(" ")))
 }
+
+/// The FTS5 query of `text` over the heading path and the text of the chunks only (the title is in
+/// every chunk of the document): the phrase of [`prefix_query`] in those columns.
+pub(crate) fn matches_query(text: &str) -> Option<String> {
+    prefix_query(text).map(|phrase| format!("{{heading_path text}} : {phrase}"))
+}
+
+/// The chunks of document `?2` that match the FTS5 query `?1`, by position, at most `?3`:
+/// id, ordinal, heading path, text.
+pub(crate) const MATCHES_SQL: &str = "SELECT c.id, c.ordinal, c.heading_path, c.text
+     FROM knowledge_chunks_fts JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
+     WHERE knowledge_chunks_fts MATCH ?1 AND c.doc_id = ?2 ORDER BY c.ordinal LIMIT ?3";
+
+/// How many chunks of document `?2` match the FTS5 query `?1`.
+pub(crate) const MATCHES_COUNT_SQL: &str = "SELECT count(*)
+     FROM knowledge_chunks_fts JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
+     WHERE knowledge_chunks_fts MATCH ?1 AND c.doc_id = ?2";
 
 #[cfg(test)]
 mod tests {

@@ -43,7 +43,7 @@ impl World {
     fn search(&self, args: &[&str], embedder: &mut Fake) -> Result<Answer, Failure> {
         let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
 
-        answer(&self.env, &Backend::Sqlite, &args, embedder)
+        answer(&self.env, &Backend::Sqlite, Routing::local(), &args, embedder)
     }
 }
 

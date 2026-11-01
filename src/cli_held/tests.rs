@@ -52,7 +52,7 @@ impl World {
     fn run(&self, args: &[&str]) -> Reply {
         let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
 
-        reply(&self.env, &Backend::Sqlite, &args)
+        reply(&self.env, &Backend::Sqlite, Routing::local(), &args)
     }
 
     fn done(&self, args: &[&str]) -> Value {
@@ -74,7 +74,7 @@ impl World {
     }
 
     fn store(&self) -> Box<dyn crate::store::KnowledgeStore> {
-        backend::open(&self.env, &Backend::Sqlite, Access::Read)
+        backend::open(&self.env, &Backend::Sqlite, Routing::local(), Access::Read)
             .expect("open")
             .expect("the database exists")
     }
@@ -355,3 +355,98 @@ fn bad_arguments_are_usage_errors() {
 }
 
 mod keys;
+
+/// A team database that is never reached: an approval into this computer's file does not open it.
+fn unreachable_remote() -> Backend {
+    crate::config::backend_for(Some("postgres://nobody@127.0.0.1:1/none".to_owned()), None).expect("backend")
+}
+
+#[test]
+fn an_approval_goes_where_place_says_and_the_routing_allows() {
+    use crate::config::Where;
+
+    let world = World::new();
+    let remote = unreachable_remote();
+    let both = Routing::new(Where::RemoteLocal, Where::RemoteLocal);
+    let approve = |held: &str, routing: Routing, extra: &[&str]| {
+        let mut args = vec!["approve", "--json", held];
+        args.extend_from_slice(extra);
+        let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
+
+        reply(&world.env, &remote, routing, &args)
+    };
+
+    // To this computer, with the id written as such because both places are in use.
+    let first = world.propose("Local runbook", TEXT, Vec::new(), None);
+    let Reply::Done(done) = approve(&first, both, &["--place", "local"]) else {
+        panic!("approved");
+    };
+    assert_eq!(done["approved"]["status"], "added");
+    assert_eq!(done["approved"]["docId"], json!("local:1"));
+    assert!(world.database_exists());
+    assert_eq!(world.store().stats().expect("stats").documents, 1);
+
+    // A place the routing does not keep that kind in is refused, and the proposal waits.
+    let second = world.propose(
+        "Linked runbook",
+        "Another zebrafish text.",
+        vec![link("git:github.com/o/r")],
+        None,
+    );
+    let local_only = Routing::new(Where::Local, Where::RemoteLocal);
+    let Reply::Refused(Code::Refused, message) = approve(&second, local_only, &["--place", "remote"]) else {
+        panic!("refused");
+    };
+    assert!(
+        message.contains("repository_documents") && message.contains("on this computer"),
+        "{message}"
+    );
+    assert_eq!(world.held().count(), 1, "the proposal is back in the queue");
+
+    // Without --place a kind kept local goes local, and a bad place is a usage error.
+    let Reply::Done(done) = approve(&second, local_only, &[]) else {
+        panic!("approved");
+    };
+    assert_eq!(done["approved"]["docId"], json!("local:2"));
+    assert_eq!(approve("whatever", both, &["--place", "cloud"]), Reply::Usage);
+
+    let reject = world.propose("Third", "More text here.", Vec::new(), None);
+    let args = [
+        Some("reject"),
+        Some("--json"),
+        Some(reject.as_str()),
+        Some("--place"),
+        Some("local"),
+    ];
+    assert_eq!(
+        reply(&world.env, &remote, both, &args),
+        Reply::Usage,
+        "only an approval takes --place"
+    );
+}
+
+#[test]
+fn without_a_remote_database_only_this_computer_can_be_chosen() {
+    let world = World::new();
+    let held = world.propose("Runbook", TEXT, Vec::new(), None);
+
+    let (code, message) = {
+        let args = [
+            Some("approve"),
+            Some("--json"),
+            Some(held.as_str()),
+            Some("--place"),
+            Some("remote"),
+        ];
+        match reply(&world.env, &Backend::Sqlite, Routing::local(), &args) {
+            Reply::Refused(code, message) => (code, message),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    assert_eq!(code, Code::Refused);
+    assert!(message.contains("no remote database"), "{message}");
+
+    let done = world.done(&["approve", "--json", &held, "--place", "local"]);
+    assert_eq!(done["approved"]["docId"], 1, "plain ids with one place in use");
+}

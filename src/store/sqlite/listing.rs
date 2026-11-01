@@ -5,9 +5,13 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::documents::{document, links_of, links_of_many};
-use super::sql_shared::{DOCUMENT_COLUMNS, GLOBAL, list_conditions, page_limit, page_sql};
+use super::sql_shared::{
+    DOCUMENT_COLUMNS, GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
+};
 use super::{meta, schema};
-use crate::store::{Chunk, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts};
+use crate::store::{
+    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+};
 use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
@@ -42,6 +46,38 @@ pub(super) fn list(conn: &Connection, query: &ListQuery) -> Result<DocumentPage,
     Ok(DocumentPage {
         items,
         total: usize::try_from(total).unwrap_or(0),
+    })
+}
+
+/// The chunks of document `id` that match `text`, at most `limit`.
+pub(super) fn matching_chunks(
+    conn: &Connection,
+    id: i64,
+    text: &str,
+    limit: usize,
+) -> Result<ChunkMatches, StoreError> {
+    let Some(query) = matches_query(text) else {
+        return Ok(ChunkMatches::default());
+    };
+
+    let total: i64 = conn.query_row(MATCHES_COUNT_SQL, params![query, id], |row| row.get(0))?;
+    let mut statement = conn.prepare(MATCHES_SQL)?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    let chunks = statement
+        .query_map(params![query, id, limit], |row| {
+            Ok(ChunkMatch {
+                chunk_id: row.get(0)?,
+                ordinal: row.get(1)?,
+                heading_path: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    Ok(ChunkMatches {
+        total: usize::try_from(total).unwrap_or(0),
+        chunks,
     })
 }
 

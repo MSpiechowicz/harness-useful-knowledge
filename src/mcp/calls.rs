@@ -98,10 +98,11 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
             embedder,
             env,
             backend,
+            routing,
             ..
         } = &mut *server;
 
-        match open_store(store, env, backend)? {
+        match open_store(store, env, backend, *routing)? {
             None => return Ok("no documents yet".to_owned()),
             Some(opened) => search::run(opened, Some(embedder.as_mut()), &query, Tuning::SEARCH),
         }

@@ -23,17 +23,21 @@
 //!
 //! [`TOKEN_VAR`] or `token` is the libSQL auth token.
 //!
+//! With a team database, `[routing]` says where the documents are kept (see [`routing`]).
+//!
 //! The URL and the token are secrets: errors show a [`redact_url`] form and pass through
 //! [`Secrets::scrub`]. On Unix a config file other users can change, or that another user owns, is
 //! refused, and one other users can read is reported as a warning.
 
 mod file;
+pub mod routing;
 mod secrets;
 
 use std::path::PathBuf;
 
 use crate::support::{Env, OsKind};
-use file::{ConfigRead, DatabaseTable, parse_config, permission_warning, read_config};
+use file::{ConfigRead, DatabaseTable, RoutingTable, parse_config, permission_warning, read_config};
+pub use routing::{Kind, Layout, Place, Routing, Where};
 pub use secrets::{Secrets, redact_url};
 
 /// Environment variable holding the team database URL (empty = unset). The URL can carry the
@@ -104,6 +108,8 @@ impl Backend {
 pub struct Selection {
     /// The database to use.
     pub backend: Backend,
+    /// Where each kind of document is kept (all local without a remote database).
+    pub routing: Routing,
     /// Problems that do not stop the server (a config file other users can read), for stderr.
     pub warnings: Vec<String>,
 }
@@ -134,6 +140,8 @@ pub enum ConfigError {
          only), mongodb:// or mongodb+srv://{0}"
     )]
     Scheme(String),
+    #[error("{0} must be \"remote\", \"local\" or \"remote+local\"")]
+    Routing(String),
     #[error("an http:// database URL is only allowed for this machine (localhost), use https:// or libsql://")]
     PlainHttp,
     #[error("a libSQL URL takes no user, password or query: give the token in {TOKEN_VAR} or token instead")]
@@ -179,11 +187,14 @@ pub fn config_path(env: &Env) -> Result<Option<(PathBuf, bool)>, ConfigError> {
 pub fn select(env: &Env) -> Result<Selection, ConfigError> {
     let mut warnings: Vec<String> = Vec::new();
     let mut table = DatabaseTable::default();
+    let mut routing_table = RoutingTable::default();
 
     if let Some((path, named)) = config_path(env)? {
         match read_config(&path) {
             Ok(text) => {
-                table = parse_config(&path, &text)?.database.unwrap_or_default();
+                let file = parse_config(&path, &text)?;
+                table = file.database.unwrap_or_default();
+                routing_table = file.routing.unwrap_or_default();
                 warnings.extend(permission_warning(&path));
             }
             Err(ConfigRead::Missing) if !named => {}
@@ -196,7 +207,38 @@ pub fn select(env: &Env) -> Result<Selection, ConfigError> {
     let token = env.var(TOKEN_VAR).map(str::to_owned).or(table.token);
     let backend = backend_for(url, token)?;
 
-    Ok(Selection { backend, warnings })
+    let routing = match backend {
+        Backend::Sqlite => {
+            // Checked all the same, so a misspelt value fails before a remote database is added.
+            routing_of(env, &routing_table)?;
+            Routing::local()
+        }
+        _ => routing_of(env, &routing_table)?,
+    };
+
+    Ok(Selection {
+        backend,
+        routing,
+        warnings,
+    })
+}
+
+/// The routing of the settings: the variables win over the `[routing]` table, remote is the default.
+fn routing_of(env: &Env, table: &RoutingTable) -> Result<Routing, ConfigError> {
+    let repository = routing::setting(
+        env.var(routing::REPOSITORY_VAR),
+        routing::REPOSITORY_VAR,
+        table.repository_documents.as_deref(),
+        "repository_documents",
+    )?;
+    let global = routing::setting(
+        env.var(routing::GLOBAL_VAR),
+        routing::GLOBAL_VAR,
+        table.global_documents.as_deref(),
+        "global_documents",
+    )?;
+
+    Ok(Routing::new(repository, global))
 }
 
 /// The backend for a URL (none or blank: [`Backend::Sqlite`]) and a token.

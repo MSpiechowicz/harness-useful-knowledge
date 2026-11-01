@@ -280,3 +280,61 @@ mod unix {
         assert!(readable(0o604));
     }
 }
+
+#[test]
+fn the_routing_comes_from_the_file_or_the_variables_and_is_remote_by_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let write = |text: &str| std::fs::write(&path, text).expect("write");
+    let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+
+    write("[database]\nurl = \"postgres://file/m\"\n");
+    assert_eq!(
+        select(&env).expect("default").routing,
+        Routing::new(Where::Remote, Where::Remote)
+    );
+
+    write(
+        "[database]\nurl = \"postgres://file/m\"\n[routing]\nrepository_documents = \"remote+local\"\nglobal_documents = \"local\"\n",
+    );
+    let selection = select(&env).expect("file");
+    assert_eq!(selection.routing, Routing::new(Where::RemoteLocal, Where::Local));
+    assert_eq!(selection.routing.layout(), Layout::Both);
+
+    let env = env.with_var(routing::GLOBAL_VAR, "Remote");
+    assert_eq!(
+        select(&env).expect("variable").routing,
+        Routing::new(Where::RemoteLocal, Where::Remote),
+        "the variable wins over the file, per setting"
+    );
+}
+
+#[test]
+fn the_routing_is_irrelevant_without_a_remote_database_but_still_checked() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[routing]\nglobal_documents = \"remote\"\n").expect("write");
+    let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+
+    let selection = select(&env).expect("no database");
+    assert_eq!(selection.backend, Backend::Sqlite);
+    assert_eq!(selection.routing, Routing::local());
+    assert_eq!(selection.routing.layout(), Layout::Local);
+
+    std::fs::write(&path, "[routing]\nglobal_documents = \"everywhere\"\n").expect("write");
+    let refused = select(&env).expect_err("unknown value").to_string();
+    assert!(refused.contains("global_documents in the config file"), "{refused}");
+    assert!(refused.contains("remote+local"), "{refused}");
+
+    std::fs::write(&path, "[routing]\nglobal = \"local\"\n").expect("write");
+    let typo = select(&env).expect_err("unknown key").to_string();
+    assert!(typo.contains("global"), "{typo}");
+
+    let bad_variable = Env::for_tests("/home/u").with_var(routing::REPOSITORY_VAR, "some");
+    assert!(
+        select(&bad_variable)
+            .expect_err("variable")
+            .to_string()
+            .contains(routing::REPOSITORY_VAR)
+    );
+}

@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use super::{Context, Done, Failure, Reply, parse_id};
 use crate::backend::Access;
 use crate::cli::Args;
+use crate::config::{Kind, Layout, Place};
 use crate::extract::pdf::{PdfPages, WorkerProcess};
 use crate::import::embed::{self, Embedder};
 use crate::import::events::Events;
@@ -27,6 +28,7 @@ use crate::import::reindex::{self, Which};
 use crate::import::{self, Importer, manifest};
 use crate::limits::{DELETE_IDS_MAX, MANIFEST_MAX};
 use crate::store::clean;
+use crate::store::routed::ids;
 use crate::tokens::counter_for;
 
 /// `docs import`.
@@ -67,16 +69,35 @@ pub(super) fn import_with(
 ) -> Result<import::Report, Failure> {
     let links = clean::links(&manifest.links)?;
     let counter = counter_for(context.env);
+    let place = import_place(context, manifest, Kind::of(links.len()))?;
     let mut store = context
-        .open(Access::Create)?
+        .open_place(place, Access::Create)?
         .ok_or_else(|| Failure::Failed("the database could not be created".to_owned()))?;
 
     let mut importer = Importer::new(store.as_mut(), counter.as_ref(), pdf, cancel);
     importer.embedder = embedder.as_deref_mut().map(|embedder| embedder as &mut dyn Embedder);
     importer.links = links;
-    importer.replaces = manifest.replaces;
+    importer.replaces = manifest.replaces.map(|id| ids::split(id).1);
 
-    import::run(&mut importer, manifest, &mut Events::new(out)).map_err(Failure::Failed)
+    // Ids are written with their place only when two places are in use.
+    let tagged = (context.routing.layout() == Layout::Both).then_some(place);
+
+    import::run(&mut importer, manifest, &mut Events::new(out).in_place(tagged)).map_err(Failure::Failed)
+}
+
+/// Where an import saves: the manifest's `place`, else the place of the document it replaces, else
+/// the routing's default for documents of `kind` (the manifest's links decide it). A place the
+/// routing does not keep that kind in is refused.
+fn import_place(context: &Context, manifest: &import::Manifest, kind: Kind) -> Result<Place, Failure> {
+    let replaced = manifest.replaces.map(ids::place_of);
+    let place = manifest
+        .place
+        .or(replaced.filter(|_| context.routing.layout() == Layout::Both))
+        .unwrap_or_else(|| context.routing.default_place(kind));
+
+    context.routing.check_write(kind, place).map_err(Failure::Failed)?;
+
+    Ok(place)
 }
 
 fn read_manifest(input: &mut dyn Read) -> Result<import::Manifest, Failure> {
@@ -141,7 +162,8 @@ pub(super) fn reindex(context: &Context, args: &[Option<&str>]) -> Reply {
     reindex_with(context, &which, embedder.as_mut(), &|| stopped.load(Ordering::SeqCst))
 }
 
-/// Reindexes `which` with `embedder`.
+/// Reindexes `which` with `embedder`, in each place in use: a document by id in its own place,
+/// `--all` in every place.
 pub(super) fn reindex_with(
     context: &Context,
     which: &Which,
@@ -149,11 +171,40 @@ pub(super) fn reindex_with(
     cancel: &dyn Fn() -> bool,
 ) -> Reply {
     let model = embedder.model_id().to_owned();
+    let both = context.routing.layout() == Layout::Both;
+    let mut done = reindex::Reindexed::default();
 
-    let done = match context.open(Access::Existing)? {
-        Some(mut store) => reindex::run(store.as_mut(), embedder, which, cancel)?,
-        None => reindex::Reindexed::default(),
-    };
+    for place in context.routing.places() {
+        let wanted = match which {
+            Which::All => Which::All,
+            Which::Ids(all) => {
+                let own: Vec<i64> = all
+                    .iter()
+                    .filter(|id| ids::place_of(**id) == place || (!both && ids::split(**id).0.is_none()))
+                    .map(|id| ids::split(*id).1)
+                    .collect();
+
+                if own.is_empty() {
+                    continue;
+                }
+
+                Which::Ids(own)
+            }
+        };
+
+        let Some(mut store) = context.open_place(place, Access::Existing)? else {
+            continue;
+        };
+
+        let part = reindex::run(store.as_mut(), embedder, &wanted, cancel)?;
+        done.documents += part.documents;
+        done.embedded += part.embedded;
+        done.cancelled |= part.cancelled;
+        done.failed.extend(part.failed.into_iter().map(|(id, reason)| {
+            let id = if both { ids::tag(place, id) } else { id };
+            (id, reason)
+        }));
+    }
 
     Ok(Done::ok(json!({
         "documents": done.documents,
@@ -161,7 +212,7 @@ pub(super) fn reindex_with(
         "failed": done
             .failed
             .iter()
-            .map(|(id, reason)| json!({ "id": id, "reason": reason }))
+            .map(|(id, reason)| json!({ "id": ids::json(*id), "reason": reason }))
             .collect::<Vec<_>>(),
         "cancelled": done.cancelled,
         "model": model,
@@ -173,7 +224,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::config::Backend;
+    use crate::config::{Backend, Routing};
     use crate::import::EmbedError;
     use crate::location::DIR_VAR;
     use crate::store::testing::{MODEL, fake_vector};
@@ -218,10 +269,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let folder = root.path().join("knowledge");
         let env = Env::for_tests("/home/u").with_var(DIR_VAR, folder.to_string_lossy());
-        let context = Context {
-            env: &env,
-            backend: &Backend::Sqlite,
-        };
+        let context = Context::new(&env, &Backend::Sqlite, Routing::local());
         let file = root.path().join("guide.md");
         std::fs::write(&file, "# Guide\n\nHow the gateway routes requests.").expect("write");
 
@@ -263,10 +311,7 @@ mod tests {
     fn a_reindex_of_nothing_reports_zero_and_bad_arguments_are_usage_errors() {
         let root = tempfile::tempdir().expect("temp dir");
         let env = Env::for_tests("/home/u").with_var(DIR_VAR, root.path().join("none").to_string_lossy());
-        let context = Context {
-            env: &env,
-            backend: &Backend::Sqlite,
-        };
+        let context = Context::new(&env, &Backend::Sqlite, Routing::local());
 
         let empty = reindex_with(&context, &Which::All, &mut Fixed, &|| false).expect("reindex");
         assert_eq!(empty.json["documents"], 0);
@@ -321,10 +366,7 @@ mod tests {
     fn links_that_break_a_rule_fail_the_import_up_front() {
         let root = tempfile::tempdir().expect("temp dir");
         let env = Env::for_tests("/home/u").with_var(DIR_VAR, root.path().join("k").to_string_lossy());
-        let context = Context {
-            env: &env,
-            backend: &Backend::Sqlite,
-        };
+        let context = Context::new(&env, &Backend::Sqlite, Routing::local());
         let manifest = import::Manifest {
             links: vec![crate::store::Link {
                 repo_key: "not-a-key".to_owned(),

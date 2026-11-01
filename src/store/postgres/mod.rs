@@ -48,7 +48,9 @@ use schema::{SCHEMA_VERSION, SchemaState};
 use vector::Version;
 pub use vector::{Fault, Problem};
 
-use super::{Chunk, ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
+use super::{
+    Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
+};
 use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
@@ -316,6 +318,10 @@ impl KnowledgeStore for PostgresStore {
         let pgvector = self.pgvector;
 
         self.read(|client| search::vector_top_k(client, pgvector, vector, scope, k))
+    }
+
+    fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
+        self.read(|client| listing::matching_chunks(client, doc_id, text, limit))
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

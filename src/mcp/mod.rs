@@ -28,7 +28,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::{Value, json};
 
 use crate::backend::{self, Access};
-use crate::config::{Backend, Selection};
+use crate::config::{Backend, Routing, Selection};
 use crate::held::HeldStore;
 use crate::project::ProjectResolver;
 use crate::search::{AutoEmbedder, QueryEmbedder};
@@ -66,6 +66,7 @@ pub const VECTORS_UNAVAILABLE: &str = "(vector search unavailable: keyword resul
 pub struct Server {
     env: Env,
     backend: Backend,
+    routing: Routing,
     store: Option<Box<dyn KnowledgeStore>>,
     projects: ProjectResolver,
     embedder: Box<dyn QueryEmbedder + Send>,
@@ -98,6 +99,7 @@ impl Server {
         Self {
             env,
             backend,
+            routing: Routing::local(),
             store: None,
             projects,
             embedder,
@@ -106,6 +108,12 @@ impl Server {
             session,
             vector_notice: false,
         }
+    }
+
+    /// The same server reading and writing where `routing` says.
+    pub fn with_routing(mut self, routing: Routing) -> Self {
+        self.routing = routing;
+        self
     }
 
     /// The server of this computer's settings: the embedder process first, then the model in this
@@ -118,13 +126,13 @@ impl Server {
             None => Box::new(NoEmbedder),
         };
 
-        Self::new(env.clone(), selection.backend.clone(), projects, embedder)
+        Self::new(env.clone(), selection.backend.clone(), projects, embedder).with_routing(selection.routing)
     }
 
     /// The store, opened now when it is not yet: `Ok(None)` while there is no database (a read
     /// never creates it).
     fn store(&mut self) -> Result<Option<&mut (dyn KnowledgeStore + 'static)>, String> {
-        open_store(&mut self.store, &self.env, &self.backend)
+        open_store(&mut self.store, &self.env, &self.backend, self.routing)
     }
 
     /// The message of a store failure, safe to show. A database failure drops the connection, so the
@@ -206,10 +214,11 @@ fn open_store<'a>(
     slot: &'a mut Option<Box<dyn KnowledgeStore>>,
     env: &Env,
     backend: &Backend,
+    routing: Routing,
 ) -> Result<Option<&'a mut (dyn KnowledgeStore + 'static)>, String> {
     if slot.is_none() {
-        *slot =
-            backend::open(env, backend, Access::Read).map_err(|error| backend.secrets().scrub(&error.to_string()))?;
+        *slot = backend::open(env, backend, routing, Access::Read)
+            .map_err(|error| backend.secrets().scrub(&error.to_string()))?;
     }
 
     Ok(slot.as_deref_mut())
