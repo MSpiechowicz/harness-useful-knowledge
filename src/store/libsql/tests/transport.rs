@@ -27,8 +27,8 @@ fn flaky_server(hangups: usize, body: &'static str) -> String {
                 continue;
             }
 
-            let mut buffer = [0; 8192];
-            let _read = stream.read(&mut buffer);
+            // The whole request first: answering a client still writing it fails on macOS.
+            let _request = read_body(&mut stream);
             let reply = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
