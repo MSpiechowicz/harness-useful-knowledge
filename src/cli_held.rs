@@ -11,7 +11,9 @@
 //!   already, and its links now include the proposal's). With `--expect` it approves only the
 //!   proposal of that `revision` (what the person saw). `--place` says where the document is saved
 //!   (the routing's default for its kind otherwise, see [`crate::config::routing`]) and a place the
-//!   routing does not keep that kind in is `refused`. `docId` is a number, or `local:12` for a
+//!   routing does not keep that kind in is `refused`. A proposal that replaces a document is saved
+//!   where that document is (`local:12` is on this computer, a plain id in the remote database), and
+//!   a `--place` that disagrees is `refused`. `docId` is a number, or `local:12` for a
 //!   document on this computer when both places are in use.
 //! - `held reject --json ID [--expect REVISION]` removes it, printing `{"rejected": "<heldId>"}`.
 //!
@@ -33,6 +35,7 @@ use crate::config::{Backend, Kind, Layout, Place, Routing};
 use crate::extract::pdf::PdfPages;
 use crate::held::{Claim, HeldItem, HeldStore};
 use crate::import::events::Status;
+use crate::import::place::write_place;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
@@ -73,6 +76,8 @@ pub enum Reply {
     Usage,
     /// The command failed (exit 1, see [`cli::failed`]).
     Failed(String),
+    /// The remote database cannot be reached (exit 1, see [`cli::unreachable`]).
+    Unreachable(String),
     /// The database lacks a capability, a `check` problem code (exit 3, see [`cli::missing_capability`]).
     Missing {
         code: &'static str,
@@ -99,6 +104,7 @@ pub fn held(args: &[Option<&str>]) -> ExitCode {
         }
         Reply::Usage => cli::usage(USAGE),
         Reply::Failed(message) => cli::failed(&selection.backend.secrets().scrub(&message)),
+        Reply::Unreachable(message) => cli::unreachable(&selection.backend.secrets().scrub(&message)),
         Reply::Missing { code, message } => cli::missing_capability(code, &selection.backend.secrets().scrub(&message)),
     }
 }
@@ -243,7 +249,7 @@ fn open_failure(error: OpenError) -> Reply {
     match error {
         OpenError::Missing { code, message } => Reply::Missing { code, message },
         OpenError::Failed(message) => Reply::Failed(message),
-        OpenError::Unreachable(_) => Reply::Failed(REMOTE_DOWN_WRITE.to_owned()),
+        OpenError::Unreachable(_) => Reply::Unreachable(REMOTE_DOWN_WRITE.to_owned()),
     }
 }
 
@@ -291,9 +297,9 @@ fn import(
 
     let links = clean::links(&item.links).map_err(|error| refused(error.to_string()))?;
 
+    // The proposal may replace a document, which is in the place its id carries.
     let kind = Kind::of(links.len());
-    let place = place.unwrap_or_else(|| routing.default_place(kind));
-    routing.check_write(kind, place).map_err(&refused)?;
+    let place = write_place(routing, place, item.replaces, kind).map_err(&refused)?;
 
     // The text goes through a file of the format's extension, the way an imported file does.
     let folder =
@@ -326,7 +332,7 @@ fn import(
         .as_deref_mut()
         .map(|embedder| embedder as &mut dyn embed::Embedder);
     importer.links = links;
-    importer.replaces = item.replaces;
+    importer.replaces = item.replaces.map(|id| ids::split(id).1);
     importer.origin = Origin::AgentApproved;
     importer.trust_extracted_key = false;
     importer.title = Some(item.title.clone());

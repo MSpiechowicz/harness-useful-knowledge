@@ -9,7 +9,9 @@
 //!
 //! With both places in use, a remote database that cannot be reached (it gets
 //! [`HOOK_PROBE_TIMEOUT`] to connect, then a shared cooldown applies) leaves the pointers to this
-//! computer's documents, and the block carries no notice about it: it stays the same shape.
+//! computer's documents, and the block carries no notice about it: it stays the same shape. The hook
+//! only reads the cooldown: a probe of 1 s that ran out is recorded as a wait of 1 s, which a reader
+//! that waits longer does not honour, so a slow remote is not turned away for a minute by a hook.
 //!
 //! While the embedder answers, only the vector list counts, above a stricter cosine floor, and only
 //! the pointers as close as the best one ([`rank::RECALL_COSINE_BAND`]). When it

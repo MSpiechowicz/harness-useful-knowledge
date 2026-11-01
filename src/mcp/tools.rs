@@ -151,7 +151,11 @@ fn knowledge_add() -> Value {
                 },
                 "description": "Repositories the document belongs to (default: this repository, an empty list makes it global)",
             },
-            "replaces": { "type": "integer", "minimum": 1, "description": "Id of the document this one replaces when approved" },
+            "replaces": {
+                "type": ["integer", "string"],
+                "minimum": 1,
+                "description": "Id of the document this one replaces when approved, as the tools show it (12, or local:12 for a document on this computer)",
+            },
         }),
         &["title", "project_path"],
     )

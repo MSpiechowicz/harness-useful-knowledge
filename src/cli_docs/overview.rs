@@ -44,6 +44,10 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
 /// use, and the top-level counts are those of the remote database, or of this computer when that is
 /// the only place. A database is counted whatever the routing shows of it.
 ///
+/// Every place's counts carry its own `generation` (it changes with every write there), and
+/// `generations` is `{"remote": N, "local": M}` of the places that were counted, so a client sees a
+/// change in either place without reading `places`. A remote database that is offline has none.
+///
 /// With both places in use, a remote database that cannot be reached (or is cooling down after it
 /// could not be, see [`crate::store::Reach`]) is not counted: `places.remote` is `{"offline": true}`,
 /// the top-level counts are this computer's, and `offline` is `true` at the top level too (it is
@@ -53,6 +57,7 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
 
     let places = context.routing.places();
     let mut by_place = serde_json::Map::new();
+    let mut generations = serde_json::Map::new();
     let mut primary: Option<Value> = None;
     let mut offline = false;
 
@@ -62,6 +67,8 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
             by_place.insert(place.as_str().to_owned(), json!({ "offline": true }));
             continue;
         };
+
+        generations.insert(place.as_str().to_owned(), json!(stats.generation));
 
         let counts = counts(&stats);
         primary.get_or_insert_with(|| counts.clone());
@@ -76,6 +83,7 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     });
     shown["held"] = json!(crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()));
     shown["places"] = Value::Object(by_place);
+    shown["generations"] = Value::Object(generations);
 
     if offline {
         shown["offline"] = json!(true);

@@ -15,7 +15,7 @@ use super::vector::{self, Fault};
 use crate::store::{DIMS, StoreError};
 
 /// The schema version this server writes: how many entries [`migrations`] has.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The advisory lock migrations take (database-wide, "knowledge" and 01). Writes hold it shared, so
 /// a migration waits for running writes and later writes see its version.
@@ -180,9 +180,30 @@ INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1'), ('dims',
     )
 }
 
+/// Version 2: a `tsvector` of the heading path alone and one of the text alone.
+///
+/// `tsv` concatenates the title, the heading path and the text, so the positions of the words of
+/// one field continue those of the one before it, and a phrase (`a <-> b`) would match the last word
+/// of the title and the first of the heading, or the last of the heading and the first of the text.
+/// A phrase is looked for in each of these two instead, so it cannot span fields. Adding a stored
+/// generated column rewrites the table, once.
+fn phrase_columns() -> String {
+    format!(
+        "
+ALTER TABLE knowledge_chunks
+    ADD COLUMN tsv_heading TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {heading})) STORED,
+    ADD COLUMN tsv_text TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {text})) STORED;
+CREATE INDEX knowledge_chunks_tsv_heading ON knowledge_chunks USING GIN (tsv_heading);
+CREATE INDEX knowledge_chunks_tsv_text ON knowledge_chunks USING GIN (tsv_text);
+",
+        heading = fold("heading_path"),
+        text = fold("text"),
+    )
+}
+
 /// The migrations in order: entry `n` takes a database from version `n` to `n + 1`.
 fn migrations() -> Vec<String> {
-    vec![format!("{META}{}", tables())]
+    vec![format!("{META}{}", tables()), phrase_columns()]
 }
 
 /// The version stored in the database: `None` for one that has no knowledge tables.

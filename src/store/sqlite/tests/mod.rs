@@ -6,3 +6,4 @@ mod embeddings;
 mod files;
 mod listing;
 mod search;
+mod titles;

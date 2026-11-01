@@ -218,6 +218,15 @@ pub fn failed(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Prints a remote database that cannot be reached as `{"error": "unreachable", "message"}` on stdout
+/// and the message on stderr; exit 1. Harness Desktop matches on the code. `message` must carry no
+/// credentials.
+pub fn unreachable(message: &str) -> ExitCode {
+    println!("{}", serde_json::json!({ "error": "unreachable", "message": message }));
+    eprintln!("harness-knowledge: {message}");
+    ExitCode::FAILURE
+}
+
 /// Prints a command this build does not support as `{"error": "unsupported", "message"}` on stdout
 /// and the message on stderr; exit 2.
 pub fn unsupported(message: &str) -> ExitCode {

@@ -8,7 +8,8 @@
 //!   keeps the documents linked to that repository key, `--global` those linked to none, `--all`
 //!   (the default) every one. `--query` keeps the documents whose title contains it or whose text has
 //!   all its words. Sorted by `updated` unless `--sort` says otherwise, ascending unless `--desc`,
-//!   ties by id. Pages count from 1, `--per-page` is 1 to 200 (50 when not given). `total` counts
+//!   ties by id (a title sorts with ASCII letters folded to lower case and the rest by bytes, the
+//!   same in every place, so merged pages equal each place's own order). Pages count from 1, `--per-page` is 1 to 200 (50 when not given). `total` counts
 //!   every page. `--place remote|local` keeps the documents kept in that place, paged and counted
 //!   over that set (only with both places in use does it tell two sets apart: with one place in use
 //!   the place that is not in use lists nothing, and a value other than those two is a usage error).
@@ -41,7 +42,9 @@
 //! A read never creates the local database: without it every list is empty and exit 0. With both
 //! places in use, a read of a document of the remote database (`docs get`, `docs matches`, or any
 //! change) while it cannot be reached exits 1 with `harness-knowledge: remote knowledge is
-//! unreachable right now`. A document that does not exist exits 1 with `harness-knowledge: document N not found` as the last stderr
+//! unreachable right now`, and its stdout is `{"error": "unreachable", "message": ...}` (the
+//! code `unreachable` also tells any command that fails because the remote database cannot be
+//! reached, an import or a reindex to it included, from `failed`). A document that does not exist exits 1 with `harness-knowledge: document N not found` as the last stderr
 //! line. Other exit codes and errors as in [`crate::cli`].
 
 mod check;
@@ -105,7 +108,7 @@ impl<'a> Context<'a> {
 
         match backend::attempt_remote(self.env, self.backend, access, false)? {
             Attempt::Opened(store) => Ok(store),
-            Attempt::Offline(_) => Err(Failure::Failed(REMOTE_DOWN_WRITE.to_owned())),
+            Attempt::Offline(_) => Err(Failure::Unreachable(REMOTE_DOWN_WRITE.to_owned())),
         }
     }
 }
@@ -130,6 +133,8 @@ pub enum Failure {
     Usage,
     /// The command failed: exit 1.
     Failed(String),
+    /// The remote database cannot be reached: exit 1, with the error code `unreachable`.
+    Unreachable(String),
     /// The database lacks something (a `check` problem code): exit 3.
     Missing { code: &'static str, message: String },
 }
@@ -142,6 +147,7 @@ impl From<StoreError> for Failure {
                 message: error.to_string(),
             },
             StoreError::Missing { code, message } => Self::Missing { code, message },
+            StoreError::Unreachable(message) => Self::Unreachable(message),
             other => Self::Failed(other.to_string()),
         }
     }
@@ -151,7 +157,8 @@ impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Self {
         match error {
             OpenError::Missing { code, message } => Self::Missing { code, message },
-            OpenError::Failed(message) | OpenError::Unreachable(message) => Self::Failed(message),
+            OpenError::Failed(message) => Self::Failed(message),
+            OpenError::Unreachable(message) => Self::Unreachable(message),
         }
     }
 }
@@ -219,6 +226,7 @@ fn finish(reply: Reply) -> ExitCode {
         }
         Err(Failure::Usage) => cli::usage(USAGE),
         Err(Failure::Failed(message)) => cli::failed(&message),
+        Err(Failure::Unreachable(message)) => cli::unreachable(&message),
         Err(Failure::Missing { code, message }) => cli::missing_capability(code, &message),
     }
 }

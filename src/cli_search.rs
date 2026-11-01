@@ -49,14 +49,20 @@ const QUERY_MAX: usize = 1000;
 pub enum Failure {
     Usage,
     Failed(String),
-    Missing { code: &'static str, message: String },
+    /// The remote database cannot be reached (the error code `unreachable`).
+    Unreachable(String),
+    Missing {
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl From<OpenError> for Failure {
     fn from(error: OpenError) -> Self {
         match error {
             OpenError::Missing { code, message } => Self::Missing { code, message },
-            OpenError::Failed(message) | OpenError::Unreachable(message) => Self::Failed(message),
+            OpenError::Failed(message) => Self::Failed(message),
+            OpenError::Unreachable(message) => Self::Unreachable(message),
         }
     }
 }
@@ -69,6 +75,7 @@ impl From<StoreError> for Failure {
                 message: error.to_string(),
             },
             StoreError::Missing { code, message } => Self::Missing { code, message },
+            StoreError::Unreachable(message) => Self::Unreachable(message),
             other => Self::Failed(other.to_string()),
         }
     }
@@ -111,6 +118,7 @@ pub fn search(args: &[Option<&str>]) -> ExitCode {
         }
         Err(Failure::Usage) => cli::usage(USAGE),
         Err(Failure::Failed(message)) => cli::failed(&selection.backend.secrets().scrub(&message)),
+        Err(Failure::Unreachable(message)) => cli::unreachable(&selection.backend.secrets().scrub(&message)),
         Err(Failure::Missing { code, message }) => cli::missing_capability(code, &message),
     }
 }

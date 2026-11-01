@@ -183,9 +183,12 @@
             "description": "Repositories the document belongs to (default: this repository, an empty list makes it global)"
           },
           "replaces": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "string"
+            ],
             "minimum": 1,
-            "description": "Id of the document this one replaces when approved"
+            "description": "Id of the document this one replaces when approved, as the tools show it (12, or local:12 for a document on this computer)"
           }
         },
         "required": [

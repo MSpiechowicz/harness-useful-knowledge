@@ -386,3 +386,21 @@ fn list_pages_this_repositorys_documents_then_the_global_ones() {
     let beyond = world.ok("knowledge_list", json!({ "project_path": project, "page": 9 }));
     assert!(beyond.contains("no page 9"), "{beyond}");
 }
+
+#[test]
+fn a_page_number_an_agent_makes_up_cannot_overflow_the_offset() {
+    let mut world = seeded();
+    let project = project_arg(&world);
+
+    for page in [json!(i64::MAX), json!(i64::MAX / 20 + 1), json!(10_000_000_000_i64)] {
+        let beyond = world.ok("knowledge_list", json!({ "project_path": project, "page": page }));
+
+        assert!(beyond.starts_with("no page "), "{page}: {beyond}");
+    }
+
+    let negative = world.ok("knowledge_list", json!({ "project_path": project, "page": i64::MIN }));
+    assert!(
+        negative.contains("Gateway guide"),
+        "a page below the first is the first"
+    );
+}

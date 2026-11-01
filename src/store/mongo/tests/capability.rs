@@ -41,7 +41,10 @@ fn team_mongo_opening_creates_the_schema_and_the_indexes_and_reopening_keeps_the
             .title,
         "Guide"
     );
-    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(
+        again.meta("schema_version").expect("meta").as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
     assert_eq!(again.database_name(), db.name);
     assert!(again.uses_transactions(), "a replica set runs writes in transactions");

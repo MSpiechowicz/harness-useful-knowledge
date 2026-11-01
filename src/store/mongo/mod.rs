@@ -41,6 +41,7 @@ mod ctx;
 mod documents;
 mod listing;
 mod meta;
+mod migrate;
 pub mod probe;
 pub mod schema;
 mod search;

@@ -243,9 +243,14 @@ fn team_the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plain_char
 
     assert_eq!(text("gate"), ["Gateway guide"], "a word prefix in the title");
     assert_eq!(
-        text("REQUESTS routing"),
+        text("ROUTING of Requ"),
         ["Gateway guide"],
-        "all words, any case, in the text"
+        "the words in order, any case, the last as a prefix"
+    );
+    assert_eq!(
+        text("requests routing"),
+        Vec::<String>::new(),
+        "the same words in another order are no phrase"
     );
     assert_eq!(text("invoice"), ["Handbook"], "a prefix of a word in the text");
     assert_eq!(text("ateway"), ["Gateway guide"], "a substring of the title");

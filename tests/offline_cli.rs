@@ -242,6 +242,28 @@ fn team_the_fallback_follows_a_remote_that_stops_pauses_and_returns() {
 
     // The remote returns: a check that reaches it clears the cooldown for everyone.
     docker("start", &container);
+
+    // A change does not wait for the cooldown to end: it tries the remote, and goes through as soon as
+    // the server accepts connections again, whatever the file says.
+    assert!(computer.cooldown_file().is_file(), "the cooldown still runs");
+    let renamed = (0..60)
+        .find_map(|_| {
+            let ran = computer.run(
+                &["docs", "rename", "--json", &remote_id, "--title", "Shared gateway"],
+                "",
+            );
+
+            if ran.code == Some(0) {
+                return Some(ran);
+            }
+
+            assert_eq!(ran.json()["error"], json!("unreachable"), "{}", ran.stdout);
+            std::thread::sleep(Duration::from_secs(1));
+            None
+        })
+        .expect("the change went through once the remote was back");
+    assert_eq!(renamed.json()["title"], "Shared gateway");
+
     computer.wait_until_reachable();
     assert!(!computer.cooldown_file().exists());
 

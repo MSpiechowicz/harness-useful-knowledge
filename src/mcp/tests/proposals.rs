@@ -354,3 +354,54 @@ fn the_clients_name_is_one_visible_line() {
 
     assert_eq!(held_item(&world)["client"], "code x");
 }
+
+#[test]
+fn replaces_is_a_document_id_as_the_tools_show_it_and_is_kept_with_its_place() {
+    let mut world = World::new();
+    let project = project_arg(&world);
+    let local_seven = crate::store::routed::ids::tag(crate::config::Place::Local, 7);
+
+    for (index, (given, kept)) in [(json!(7), 7), (json!("7"), 7), (json!("local:7"), local_seven)]
+        .into_iter()
+        .enumerate()
+    {
+        world.ok(
+            "knowledge_add",
+            json!({
+                "title": format!("Replacement {index}"),
+                "content": format!("Text number {index}."),
+                "replaces": given,
+                "project_path": project,
+            }),
+        );
+
+        let item: Value = world
+            .held_files()
+            .iter()
+            .map(|path| serde_json::from_slice::<Value>(&std::fs::read(path).expect("read")).expect("JSON"))
+            .find(|item| item["title"] == format!("Replacement {index}"))
+            .expect("the proposal is held");
+
+        assert_eq!(item["replaces"], json!(kept), "{given}");
+    }
+
+    for bad in [
+        json!("local:"),
+        json!("x"),
+        json!(0),
+        json!(-3),
+        json!(true),
+        json!("local:0"),
+    ] {
+        let refused = world.err(
+            "knowledge_add",
+            json!({ "title": "x", "content": "a", "replaces": bad, "project_path": project }),
+        );
+        assert!(
+            refused.contains("replaces") || refused.contains("invalid arguments"),
+            "{bad}: {refused}"
+        );
+    }
+
+    assert_eq!(world.held_files().len(), 3);
+}

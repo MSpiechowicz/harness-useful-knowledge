@@ -267,14 +267,80 @@ pub(super) fn connect_error(error: &Error, url: &str) -> StoreError {
 /// is a plain word), never server text or the URL. A server without `mongot` is named as such.
 ///
 /// A server that cannot be reached (no usable server in time, a network error, a host that does
-/// not resolve) is [`StoreError::Unreachable`].
+/// not resolve) is [`StoreError::Unreachable`]. A server that was reached but whose TLS the
+/// client refuses (a certificate it does not trust, a server that does not speak TLS) is a setting
+/// to fix, a [`StoreError::Backend`] (see [`tls_failure`]).
 pub(super) fn backend(error: &Error) -> StoreError {
+    if tls_failure(error) {
+        return StoreError::Backend(message(error));
+    }
+
     match error.kind.as_ref() {
         ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
             StoreError::Unreachable(message(error))
         }
         _ => StoreError::Backend(message(error)),
     }
+}
+
+/// What the text of a TLS failure of a server says about it, as the driver and rustls word it.
+const TLS_MARKERS: [&str; 8] = [
+    "peer certificate",
+    "invalid certificate",
+    "fatal alert",
+    "peer is incompatible",
+    "peer misbehaved",
+    "corrupt message",
+    "tls",
+    "handshake",
+];
+
+/// Whether `error` says the TLS with a server failed: the certificate was refused, or the server did
+/// not speak TLS. The driver reports a refused certificate as an I/O error that wraps rustls', and
+/// server selection (which is where a connect that never gets through ends) only as text that
+/// names each server's last error, so those errors are read for what rustls says (the server's
+/// address in that text is not).
+pub(super) fn tls_failure(error: &Error) -> bool {
+    match error.kind.as_ref() {
+        ErrorKind::Io(io) => io_refused_by_tls(io),
+        ErrorKind::ServerSelection { message, .. } => selection_is_tls(message),
+        _ => false,
+    }
+}
+
+/// Whether an I/O error is, or is caused by, a rustls error.
+fn io_refused_by_tls(io: &std::io::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = io.get_ref().map(|inner| inner as _);
+
+    while let Some(inner) = cause {
+        if inner.is::<rustls::Error>() {
+            return true;
+        }
+
+        cause = inner.source();
+    }
+
+    false
+}
+
+/// Whether the text of a server selection error names a TLS failure of a server.
+fn selection_is_tls(message: &str) -> bool {
+    server_errors(message).any(is_tls_text)
+}
+
+/// The last error of each server in the text of a server selection error: what follows each
+/// `Error: ` up to the labels of that error.
+fn server_errors(message: &str) -> impl Iterator<Item = &str> {
+    message
+        .split("Error: ")
+        .skip(1)
+        .map(|rest| rest.split(", labels:").next().unwrap_or(rest))
+}
+
+fn is_tls_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+
+    TLS_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 /// The server error code of `error`, if any.
@@ -297,6 +363,10 @@ pub(super) fn missing(error: &Error) -> Option<(&'static str, String)> {
 pub(super) const NO_MONGOT: &str = "this MongoDB server has no search engine (mongot), use MongoDB Atlas or \
                                     MongoDB 8.2 or newer with mongot";
 
+/// The text shown when TLS with the server failed.
+pub(super) const TLS_FAILED: &str =
+    "TLS with the MongoDB server failed (the certificate was refused or the server does not speak TLS)";
+
 /// The message of [`backend`].
 pub(super) fn message(error: &Error) -> String {
     if error_code(error) == Some(SEARCH_NOT_ENABLED) {
@@ -307,6 +377,7 @@ pub(super) fn message(error: &Error) -> String {
         ErrorKind::Authentication { .. } => {
             "authentication failed (check the user, the password and authSource)".to_owned()
         }
+        _ if tls_failure(error) => TLS_FAILED.to_owned(),
         ErrorKind::ServerSelection { .. } => "cannot reach a usable MongoDB server (timed out)".to_owned(),
         ErrorKind::Io(io) => format!("network error ({:?})", io.kind()),
         ErrorKind::DnsResolve { .. } => "cannot resolve the MongoDB host".to_owned(),

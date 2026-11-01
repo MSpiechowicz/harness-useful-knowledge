@@ -57,10 +57,12 @@ pub(super) fn fetch(
     Ok(DocumentPage { items, total })
 }
 
-/// The order of two rows of the list.
+/// The order of two rows of the list. A title is compared the way every store sorts it: with ASCII
+/// letters folded to lower case and the rest by bytes, so the merged pages are the pages of each
+/// place's own order, also for titles that are not ASCII.
 pub(super) fn compare(a: &DocumentRow, b: &DocumentRow, sort: Sort, descending: bool) -> Ordering {
     let by_key = match sort {
-        Sort::Title => a.doc.title.to_lowercase().cmp(&b.doc.title.to_lowercase()),
+        Sort::Title => a.doc.title.to_ascii_lowercase().cmp(&b.doc.title.to_ascii_lowercase()),
         Sort::Updated => a.doc.updated_at.cmp(&b.doc.updated_at),
         Sort::Size => a.doc.bytes.cmp(&b.doc.bytes),
         Sort::Format => a.doc.format.cmp(&b.doc.format),

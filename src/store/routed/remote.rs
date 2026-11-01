@@ -7,12 +7,30 @@
 //! routed store answers from this computer, and the remote is not tried again until the cooldown
 //! of the reach (which every process shares) has ended. The next call after that opens it again,
 //! and a success clears the cooldown for everyone.
+//!
+//! A read opens the remote with a short probe ([`Patience::Probe`]) and honours the cooldown. A write
+//! has nothing to fall back on, so it always tries, cooldown or not, with the driver's own timeout
+//! ([`Patience::Full`], see [`Remote::settle_for_write`]): a person is not refused for a minute after
+//! the remote came back, nor because it connects slowly. A probe that merely ran out of time is
+//! recorded as such (see [`Reach::failed_in`]) and so never turns away a reader that waits longer.
+
+use std::time::{Duration, Instant};
 
 use crate::backend::OpenError;
+use crate::config::Secrets;
 use crate::store::{KnowledgeStore, Reach, StoreError};
 
+/// How long an attempt to open the remote database may wait for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Patience {
+    /// The short probe of a read, which this computer can answer instead.
+    Probe,
+    /// The driver's own timeout, for a write that nothing else can answer.
+    Full,
+}
+
 /// What it takes to open the remote database.
-type Opener = Box<dyn FnMut() -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> + Send>;
+type Opener = Box<dyn FnMut(Patience) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> + Send>;
 
 /// How the remote is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +49,10 @@ enum State {
 struct Link {
     open: Opener,
     reach: Reach,
+    /// How long a [`Patience::Probe`] waits.
+    probe: Duration,
+    /// What the messages of a lost connection are scrubbed of before the reach keeps them.
+    secrets: Secrets,
 }
 
 /// The remote store of a routed one, if there is one.
@@ -53,10 +75,14 @@ impl Remote {
         }
     }
 
-    /// A remote that `open` opens when first needed, recording its failures in `reach`.
+    /// A remote that `open` opens when first needed, recording its failures in `reach`. A probe
+    /// waits `probe` for it. The reason a connection was lost later is scrubbed of `secrets` first
+    /// (the opener's own errors already are).
     pub fn lazy(
-        open: impl FnMut() -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> + Send + 'static,
+        open: impl FnMut(Patience) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> + Send + 'static,
         reach: Reach,
+        probe: Duration,
+        secrets: Secrets,
     ) -> Self {
         Self {
             store: None,
@@ -64,6 +90,8 @@ impl Remote {
             link: Some(Link {
                 open: Box::new(open),
                 reach,
+                probe,
+                secrets,
             }),
         }
     }
@@ -83,7 +111,7 @@ impl Remote {
         self.state == State::Absent
     }
 
-    /// Decides before a call whether the remote is there: opens it the first time, and again once
+    /// Decides before a read whether the remote is there: opens it the first time, and again once
     /// the cooldown of an unreachable one has ended. Only a failure that is not about reaching the
     /// remote (a database without pgvector, say) is an error.
     pub fn settle(&mut self) -> Result<(), OpenError> {
@@ -91,16 +119,39 @@ impl Remote {
             return Ok(());
         }
 
-        let Some(link) = self.link.as_mut() else {
+        let Some(link) = self.link.as_ref() else {
             return Ok(());
         };
 
-        if link.reach.cooling().is_some() {
+        if link.reach.cooling_for(link.probe).is_some() {
             self.state = State::Down;
             return Ok(());
         }
 
-        match (link.open)() {
+        self.open(Patience::Probe)
+    }
+
+    /// Decides before a write whether the remote is there. The cooldown is not honoured and the
+    /// driver's full timeout applies: a write that would be refused because of an earlier failure
+    /// (or a probe that was too short) is tried against the remote instead, and the remote that
+    /// answers is used from then on.
+    pub fn settle_for_write(&mut self) -> Result<(), OpenError> {
+        if matches!(self.state, State::Open | State::Absent) || self.link.is_none() {
+            return Ok(());
+        }
+
+        self.open(Patience::Full)
+    }
+
+    /// Tries to open the remote, and notes the outcome in the reach.
+    fn open(&mut self, patience: Patience) -> Result<(), OpenError> {
+        let Some(link) = self.link.as_mut() else {
+            return Ok(());
+        };
+
+        let started = Instant::now();
+
+        match (link.open)(patience) {
             Ok(store) => {
                 link.reach.reached();
                 self.state = if store.is_some() { State::Open } else { State::Absent };
@@ -109,7 +160,7 @@ impl Remote {
                 Ok(())
             }
             Err(OpenError::Unreachable(message)) => {
-                link.reach.failed(&message);
+                link.reach.failed_in(&message, started.elapsed(), link.probe);
                 self.state = State::Down;
 
                 Ok(())
@@ -125,7 +176,7 @@ impl Remote {
             return false;
         };
 
-        link.reach.failed(message);
+        link.reach.failed(&link.secrets.scrub(message));
         self.store = None;
         self.state = State::Down;
 

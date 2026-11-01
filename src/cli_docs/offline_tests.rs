@@ -125,6 +125,17 @@ fn repos_and_stats_report_this_computer_and_the_remote_as_offline() {
     assert_eq!(stats.json["documents"], 1, "the counts at the top are this computer's");
     assert_eq!(stats.json["places"]["remote"], json!({ "offline": true }));
     assert_eq!(stats.json["places"]["local"]["documents"], 1);
+
+    // The generation of the place that is counted, and none for the one that is not.
+    assert_eq!(
+        stats.json["generations"],
+        json!({ "local": stats.json["places"]["local"]["generation"] })
+    );
+    assert!(
+        stats.json["generations"]["local"]
+            .as_i64()
+            .is_some_and(|generation| generation > 0)
+    );
 }
 
 #[test]
@@ -138,7 +149,9 @@ fn a_document_of_the_remote_is_refused_with_exit_1_and_one_of_this_computer_is_r
         let refused = computer.run(BOTH, args);
         assert_eq!(
             refused,
-            Err(Failure::Failed("remote knowledge is unreachable right now".to_owned())),
+            Err(Failure::Unreachable(
+                "remote knowledge is unreachable right now".to_owned()
+            )),
             "{args:?}"
         );
     }
@@ -154,7 +167,9 @@ fn a_document_of_the_remote_is_refused_with_exit_1_and_one_of_this_computer_is_r
 fn a_change_meant_for_the_remote_is_refused_and_a_change_to_this_computer_goes_on() {
     let computer = Computer::new();
     let down = |reply: Reply| match reply {
-        Err(Failure::Failed(message)) => assert!(message.starts_with("remote knowledge is unreachable"), "{message}"),
+        Err(Failure::Unreachable(message)) => {
+            assert!(message.starts_with("remote knowledge is unreachable"), "{message}")
+        }
         other => panic!("not refused: {other:?}"),
     };
 
@@ -177,7 +192,7 @@ fn a_change_meant_for_the_remote_is_refused_and_a_change_to_this_computer_goes_o
 
     assert_eq!(
         result.err(),
-        Some(Failure::Failed(crate::store::routed::REMOTE_DOWN_WRITE.to_owned()))
+        Some(Failure::Unreachable(crate::store::routed::REMOTE_DOWN_WRITE.to_owned()))
     );
     assert!(out.is_empty(), "no event: nothing was imported");
 
@@ -227,7 +242,7 @@ fn with_the_remote_alone_an_unreachable_database_fails_as_before_and_leaves_no_c
     let remote = Routing::new(Where::Remote, Where::Remote);
 
     match computer.run(remote, &["list", "--json"]) {
-        Err(Failure::Failed(message)) => {
+        Err(Failure::Unreachable(message)) => {
             assert!(message.contains("cannot reach the PostgreSQL database"), "{message}");
             assert!(!message.contains("remote knowledge is unreachable"), "{message}");
         }
@@ -239,7 +254,7 @@ fn with_the_remote_alone_an_unreachable_database_fails_as_before_and_leaves_no_c
         computer
             .run(remote, &["get", "--json", "3"])
             .err()
-            .map(|failure| matches!(failure, Failure::Failed(_))),
+            .map(|failure| matches!(failure, Failure::Unreachable(_))),
         Some(true)
     );
 }
@@ -275,7 +290,9 @@ fn a_list_narrowed_to_a_place_answers_for_that_place_and_a_bad_place_is_a_usage_
 
     assert_eq!(
         computer.run(BOTH, &["list", "--json", "--place", "remote"]),
-        Err(Failure::Failed("remote knowledge is unreachable right now".to_owned()))
+        Err(Failure::Unreachable(
+            "remote knowledge is unreachable right now".to_owned()
+        ))
     );
     assert_eq!(
         computer.run(BOTH, &["list", "--json", "--place", "elsewhere"]),
@@ -292,4 +309,34 @@ fn a_list_narrowed_to_a_place_answers_for_that_place_and_a_bad_place_is_a_usage_
     let remote_alone = Routing::new(Where::Remote, Where::Remote);
     let none = computer.json(remote_alone, &["list", "--json", "--place", "local"]);
     assert_eq!(none["total"], 0);
+}
+
+#[test]
+fn a_remote_whose_tls_is_refused_is_reported_but_starts_no_cooldown() {
+    // A server that answers the TLS request of the client with "no TLS here".
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut request = [0_u8; 8];
+            let _read = std::io::Read::read(&mut stream, &mut request);
+            let _answered = std::io::Write::write_all(&mut stream, b"N");
+        }
+    });
+
+    let computer = Computer::at(&format!("postgres://nobody@127.0.0.1:{port}/none?sslmode=require"));
+    let done = check::check(&computer.context(BOTH), &[Some("--json")]).expect("check answers");
+
+    assert_eq!(done.json["places"]["remote"]["problem"], "unreachable");
+    assert!(
+        done.json["places"]["remote"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("TLS")),
+        "{}",
+        done.json
+    );
+    assert!(computer.reach().cooling().is_none(), "no cooldown for a refused TLS");
+    assert!(!computer.cooldown_file().exists());
 }

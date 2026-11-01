@@ -31,7 +31,7 @@ pub struct Manifest {
 }
 
 /// A document id written as a number or as text (`"12"`, `"local:12"`).
-fn document_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+pub(crate) fn document_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Written {

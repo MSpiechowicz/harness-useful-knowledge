@@ -31,7 +31,7 @@ mod rows;
 use std::collections::HashMap;
 
 pub use kinds::{Kinds, Part, fuse_places, merge_found};
-pub use remote::Remote;
+pub use remote::{Patience, Remote};
 
 use crate::backend::OpenError;
 use crate::config::{Kind, Place, Routing};
@@ -138,11 +138,7 @@ impl KnowledgeStore for RoutedStore {
     }
 
     fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
-        self.ready()?;
-
-        if self.remote.is_down() {
-            return Err(StoreError::Unreachable(REMOTE_DOWN_WRITE.to_owned()));
-        }
+        self.writable(Place::Remote)?;
 
         match self.primary()? {
             Some(store) => store.set_meta(key, value),

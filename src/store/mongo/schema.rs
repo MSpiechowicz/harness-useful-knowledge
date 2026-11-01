@@ -2,8 +2,9 @@
 //!
 //! Version 1 is a set of idempotent steps, so servers that start together need no lock: a
 //! collection or index that exists is left as it is, and the schema document is written last
-//! (`$max`), which is what [`version`] reads. Later versions only add collections, indexes and
-//! fields, never rewrite documents.
+//! (`$max`), which is what [`version`] reads. Later versions add collections, indexes and fields,
+//! and fill the ones they add from what is stored (see [`super::migrate`]), never rewriting a field
+//! that holds what the person wrote.
 //!
 //! - `knowledge_meta`: `schema` (`version`, `dims`), `generation` (`value`, the write counter),
 //!   the id counters `counter:documents` and `counter:chunks` (`value`), and the meta keys the
@@ -16,6 +17,8 @@
 //!   `title`, `repo_keys`, `global` and `updated_at` (so a search filters and answers from one
 //!   collection), the folded words of its text (`terms`) and of the title (`title_terms`) for the
 //!   list filter, and the `embedding` (an array of doubles) with its `model_id` once embedded.
+//!   `phrase_text` is the folded words of the heading path and of the text (a newline between them)
+//!   that a multi-word list filter matches with a regular expression, on the server (version 2).
 //!   Indexes: unique `(doc_id, ordinal)`, `(chunk_sha, model_id)`, `terms`, `title_terms`.
 //! - Search indexes on the chunks, built by `mongot` ([`KEYWORD_INDEX`] and [`VECTOR_INDEX`]).
 
@@ -31,7 +34,7 @@ use super::connection::{INDEX_EXISTS, NAMESPACE_EXISTS, NAMESPACE_NOT_FOUND, err
 use crate::store::DIMS;
 
 /// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub(super) const META: &str = "knowledge_meta";
 pub(super) const DOCUMENTS: &str = "knowledge_documents";
@@ -87,6 +90,11 @@ pub(super) fn migrate(db: &Database) -> mongodb::error::Result<bool> {
         // A server without `mongot` fails here, before anything is created.
         search_states(db)?;
         create_v1(db)?;
+    }
+
+    // Version 2 derives two fields from stored ones: only a database that has documents needs it.
+    if current == 1 {
+        super::migrate::upgrade_v2(db)?;
     }
 
     ensure_search_indexes(db)?;

@@ -4,7 +4,7 @@
 //! The text is the agent's `content`, or the text of a file named by `path`, which must be inside
 //! the project, a regular file reached without a symbolic link and not hidden (no dot in the name of
 //! the file or of a folder on the way), at most [`CONTENT_MAX`] bytes of UTF-8. A text that holds a
-//! credential is refused.
+//! credential is refused. `replaces` is a document id as the tools show it (`12` or `local:12`).
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +15,7 @@ use super::scope::repository;
 use super::{CONTENT_MAX, Server};
 use crate::extract::{self, Format};
 use crate::held::{HeldItem, HoldError, Proposal, Source};
+use crate::import::manifest::document_id;
 use crate::project::ProjectKey;
 use crate::store::{Link, clean};
 use crate::support::redact::has_credentials;
@@ -28,6 +29,9 @@ pub(super) struct AddArgs {
     format: Option<String>,
     project_path: Option<String>,
     links: Option<Vec<LinkArg>>,
+    /// The document it replaces: `12`, or `"local:12"` for one on this computer (see [`crate::store::routed::ids`]), kept
+    /// with its place so an approval replaces that document and no other.
+    #[serde(default, deserialize_with = "document_id")]
     replaces: Option<i64>,
 }
 
@@ -53,10 +57,6 @@ const FORMATS: [(&str, &str); 6] = [
 
 pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> {
     let title = clean::title(&args.title).map_err(|error| error.to_string())?;
-
-    if args.replaces.is_some_and(|id| id < 1) {
-        return Err("replaces must be the id of a document".to_owned());
-    }
 
     let repo = repository(server, args.project_path.as_deref())?;
     let links = links(args.links, repo.as_ref())?;

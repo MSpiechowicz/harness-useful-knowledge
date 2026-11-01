@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::backend::OpenError;
+use crate::config::Secrets;
 use crate::store::testing::{Seed, insert, store};
 use crate::store::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
@@ -17,11 +18,16 @@ use crate::store::{
 /// How long a failed attempt is not repeated in these tests.
 pub(super) const COOLDOWN: Duration = Duration::from_millis(250);
 
+/// How long a probe of the remote waits in these tests.
+pub(super) const PROBE: Duration = Duration::from_secs(3);
+
 /// The network between this computer and the remote: up or down, and how often it was dialled.
 #[derive(Clone)]
 pub(super) struct Net {
     up: Arc<AtomicBool>,
     dials: Arc<AtomicUsize>,
+    /// Milliseconds a dial takes before it fails (a network that drops the packets).
+    lag: Arc<AtomicUsize>,
 }
 
 impl Net {
@@ -29,7 +35,14 @@ impl Net {
         Self {
             up: Arc::new(AtomicBool::new(up)),
             dials: Arc::new(AtomicUsize::new(0)),
+            lag: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Makes every failing dial take `lag` before it gives up.
+    pub(super) fn set_lag(&self, lag: Duration) {
+        self.lag
+            .store(usize::try_from(lag.as_millis()).unwrap_or(usize::MAX), Ordering::SeqCst);
     }
 
     pub(super) fn set(&self, up: bool) {
@@ -192,15 +205,23 @@ impl Machine {
 
     /// One process: its own routed store (and so its own connection) over the shared remote.
     pub(super) fn process(&self) -> RoutedStore {
+        self.process_probing(PROBE)
+    }
+
+    /// One process that waits `probe` for the remote before it answers from this computer.
+    pub(super) fn process_probing(&self, probe: Duration) -> RoutedStore {
         let net = self.net.clone();
         let file = self.folder.path().join("remote.sqlite3");
         let reach = Reach::beside_with(&self.database(), "remote:test", COOLDOWN);
 
         let remote = Remote::lazy(
-            move || {
+            move |_patience| {
                 net.dials.fetch_add(1, Ordering::SeqCst);
 
                 if !net.up.load(Ordering::SeqCst) {
+                    let lag = net.lag.load(Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(u64::try_from(lag).unwrap_or(0)));
+
                     return Err(OpenError::Unreachable("cannot connect".to_owned()));
                 }
 
@@ -212,6 +233,8 @@ impl Machine {
                 }) as Box<dyn KnowledgeStore>))
             },
             reach,
+            probe,
+            Secrets::default(),
         );
 
         let mut local = store();

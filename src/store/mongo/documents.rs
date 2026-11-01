@@ -13,11 +13,17 @@ use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
 use crate::store::{Chunk, DIMS, Document, Link, Origin, PendingChunk, StoreError};
 
+/// What a list sorted by title compares: the title with ASCII letters folded to lower case, like
+/// every other store does (see [`crate::store::routed`]'s merge). Compared bytewise.
+pub(super) fn title_key(title: &str) -> String {
+    title.to_ascii_lowercase()
+}
+
 /// The fields of a document that change with an import or a rename (everything but `created_at`).
 fn fields(doc: &Document, title: &str, chunks: usize, links: &[Link]) -> Row {
     let mut fields = doc! {
         "title": title,
-        "title_key": title.to_lowercase(),
+        "title_key": title_key(title),
         "source_name": &doc.source_name,
         "source_key": &doc.source_key,
         "format": &doc.format,
@@ -109,6 +115,7 @@ fn chunk_row(id: i64, doc_id: i64, (title, updated_at): (&str, i64), chunk: &Chu
         "heading_path": &chunk.heading_path,
         "text": &chunk.text,
         "terms": terms::of_text(&format!("{} {}", chunk.heading_path, chunk.text)),
+        "phrase_text": terms::phrase_text(&chunk.heading_path, &chunk.text),
         "chunk_sha": &chunk.chunk_sha,
         "tokens": long(chunk.tokens),
         "char_start": long(chunk.char_start),
@@ -201,7 +208,7 @@ pub(super) fn set_links(ctx: &mut Ctx<'_>, id: i64, links: &[Link]) -> Result<bo
 
 /// Retitles document `id` (to the cleaned `title`) and its chunks; false when there is none.
 pub(super) fn rename(ctx: &mut Ctx<'_>, id: i64, title: &str) -> Result<bool, Fail> {
-    let update = doc! { "$set": { "title": title, "title_key": title.to_lowercase() } };
+    let update = doc! { "$set": { "title": title, "title_key": title_key(title) } };
 
     if ctx.update_one(DOCUMENTS, doc! { "_id": id }, update, false)? == 0 {
         return Ok(false);

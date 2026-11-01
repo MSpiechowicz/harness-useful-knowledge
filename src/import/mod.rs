@@ -1,6 +1,7 @@
 //! Imports files into the knowledge: the manifest, the walk, one document at a time.
 //!
 //! - [`manifest`]: what `docs import --ndjson` reads from stdin.
+//! - [`place`]: where a document is saved.
 //! - [`walk`]: the files of the manifest's paths and folders, with the folder walk's rules.
 //! - [`document`]: one file, from bytes to a stored document ([`Importer`]).
 //! - [`embed`]: the [`Embedder`] trait and the reuse of vectors an import does not recompute.
@@ -15,6 +16,7 @@ pub mod document;
 pub mod embed;
 pub mod events;
 pub mod manifest;
+pub mod place;
 pub mod reindex;
 pub mod walk;
 

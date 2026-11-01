@@ -111,3 +111,48 @@ fn a_page_deeper_than_a_store_answers_at_once_is_still_right() {
     assert_eq!(page.items[0].doc.title, "doc 200 local");
     assert_eq!(page.items[49].doc.title, "doc 224 remote");
 }
+
+#[test]
+fn the_merged_titles_of_two_places_sort_the_way_each_store_sorts_them_for_polish_titles() {
+    use crate::store::testing::{TITLES, title_order};
+
+    let mut remote = store();
+    let mut local = store();
+    let mut expected: Vec<(i64, String)> = Vec::new();
+
+    for (n, title) in TITLES.iter().enumerate() {
+        let seed = Seed::new(title).chunk("a", "text");
+
+        if n % 2 == 0 {
+            expected.push((ids::tag(Place::Remote, insert(&mut remote, &seed)), (*title).to_owned()));
+        } else {
+            expected.push((ids::tag(Place::Local, insert(&mut local, &seed)), (*title).to_owned()));
+        }
+    }
+
+    let mut routed = routed_over(local, remote, Routing::new(Where::RemoteLocal, Where::RemoteLocal));
+    let order = title_order(expected);
+
+    assert_eq!(
+        titles(&routed.list(&query(Sort::Title, false, 0, 50)).expect("list")),
+        order
+    );
+
+    // The same in pages, which is where an order that differs from a store's shows.
+    let mut paged = Vec::new();
+
+    for page in 0..4 {
+        paged.extend(titles(
+            &routed.list(&query(Sort::Title, false, page * 3, 3)).expect("page"),
+        ));
+    }
+
+    assert_eq!(paged, order);
+
+    let mut reversed = order;
+    reversed.reverse();
+    assert_eq!(
+        titles(&routed.list(&query(Sort::Title, true, 0, 50)).expect("list")),
+        reversed
+    );
+}

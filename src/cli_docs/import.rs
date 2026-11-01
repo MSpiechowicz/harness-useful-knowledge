@@ -24,6 +24,7 @@ use crate::config::{Kind, Layout, Place};
 use crate::extract::pdf::{PdfPages, WorkerProcess};
 use crate::import::embed::{self, Embedder};
 use crate::import::events::Events;
+use crate::import::place::write_place;
 use crate::import::reindex::{self, Which};
 use crate::import::{self, Importer, manifest};
 use crate::limits::{DELETE_IDS_MAX, MANIFEST_MAX};
@@ -87,17 +88,10 @@ pub(super) fn import_with(
 
 /// Where an import saves: the manifest's `place`, else the place of the document it replaces, else
 /// the routing's default for documents of `kind` (the manifest's links decide it). A place the
-/// routing does not keep that kind in is refused.
+/// routing does not keep that kind in is refused, and so is a replacement that names a document
+/// of another place or by a place that is not in use (see [`write_place`]).
 fn import_place(context: &Context, manifest: &import::Manifest, kind: Kind) -> Result<Place, Failure> {
-    let replaced = manifest.replaces.map(ids::place_of);
-    let place = manifest
-        .place
-        .or(replaced.filter(|_| context.routing.layout() == Layout::Both))
-        .unwrap_or_else(|| context.routing.default_place(kind));
-
-    context.routing.check_write(kind, place).map_err(Failure::Failed)?;
-
-    Ok(place)
+    write_place(context.routing, manifest.place, manifest.replaces, kind).map_err(Failure::Failed)
 }
 
 fn read_manifest(input: &mut dyn Read) -> Result<import::Manifest, Failure> {

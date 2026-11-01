@@ -59,6 +59,16 @@ impl Client {
 
     /// [`Client::new`] giving up on a connection after `connect_timeout`.
     pub(super) fn within(base: String, token: Option<&str>, connect_timeout: Duration) -> Result<Self, StoreError> {
+        Self::with_timeouts(base, token, connect_timeout, REQUEST_TIMEOUT)
+    }
+
+    /// [`Client::within`] with `request_timeout` as the most a whole request may take.
+    pub(super) fn with_timeouts(
+        base: String,
+        token: Option<&str>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let authorization = match token.map(str::trim).filter(|token| !token.is_empty()) {
             Some(token) if token.bytes().all(|byte| byte.is_ascii_graphic()) => Some(format!("Bearer {token}")),
             Some(_) => {
@@ -77,7 +87,7 @@ impl Client {
 
         let agent = Agent::config_builder()
             .tls_config(tls)
-            .timeout_global(Some(REQUEST_TIMEOUT))
+            .timeout_global(Some(request_timeout))
             .timeout_connect(Some(connect_timeout))
             .http_status_as_error(false)
             .max_redirects(0)
@@ -420,11 +430,16 @@ fn platform_roots() -> RootCerts {
 }
 
 /// A transport failure, described without the URL: [`StoreError::Unreachable`] when the server
-/// could not be reached (a timeout, a host that does not resolve, a refused or lost connection),
-/// [`StoreError::Backend`] for anything the TLS check refused or the reply broke.
+/// could not be reached (a connection that took too long, a host that does not resolve, a refused or
+/// lost connection), [`StoreError::Backend`] for anything the TLS check refused or the reply broke.
+/// A request that the server took too long to answer is a failure of that request, not an
+/// unreachable server: a slow statement must not send the routed store to this computer.
 fn transport(error: ureq::Error) -> StoreError {
     let (reason, reachable) = match error {
-        ureq::Error::Timeout(_) => ("the libSQL server did not answer in time".to_owned(), false),
+        ureq::Error::Timeout(Timeout::Resolve | Timeout::Connect) => {
+            ("the libSQL server did not answer in time".to_owned(), false)
+        }
+        ureq::Error::Timeout(_) => ("the libSQL server took too long to answer a request".to_owned(), true),
         ureq::Error::HostNotFound => ("the libSQL host was not found".to_owned(), false),
         ureq::Error::ConnectionFailed => ("cannot connect to the libSQL server".to_owned(), false),
         ureq::Error::Io(error) => match error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {

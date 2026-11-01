@@ -355,6 +355,7 @@ fn bad_arguments_are_usage_errors() {
 }
 
 mod keys;
+mod replaces;
 
 /// A team database that is never reached: an approval into this computer's file does not open it.
 fn unreachable_remote() -> Backend {

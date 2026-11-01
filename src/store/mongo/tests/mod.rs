@@ -20,7 +20,9 @@ mod documents;
 mod embeddings;
 mod listing;
 mod ordered;
+mod phrase;
 mod search;
+mod titles;
 mod url;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -83,6 +83,34 @@ pub(super) fn phrase_words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The folded words of `text`, repeats kept and none cut, joined by single spaces.
+fn folded_words(text: &str) -> String {
+    let words: Vec<String> = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(folded)
+        .collect();
+
+    words.join(" ")
+}
+
+/// What a chunk stores in `phrase_text` for the phrase filter to match on the server: the folded
+/// words of its heading path, a newline, then the folded words of its text, each joined by single
+/// spaces. A phrase is words joined by single spaces too, so it cannot span the newline: a phrase
+/// is in the heading or in the text, as [`has_phrase`] reads them.
+pub(super) fn phrase_text(heading_path: &str, text: &str) -> String {
+    format!("{}\n{}", folded_words(heading_path), folded_words(text))
+}
+
+/// The regular expression that finds `phrase` in a [`phrase_text`]: its words next to each other,
+/// the first starting a word and the last a prefix of one. The words are folded letters and digits,
+/// so nothing in them is regex syntax (they are escaped anyway).
+pub(super) fn phrase_regex(phrase: &[String]) -> String {
+    let words: Vec<String> = phrase.iter().map(|word| regex::escape(word)).collect();
+
+    format!("(^|[ \n]){}", words.join(" "))
+}
+
 /// True when `text` holds the `phrase` words next to each other in that order, the last as a
 /// prefix of a word (the check of the phrase filter, with the folding of the `terms` index).
 pub(super) fn has_phrase(text: &str, phrase: &[String]) -> bool {

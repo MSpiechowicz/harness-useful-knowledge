@@ -11,6 +11,13 @@
 //! process: without the file each of them would wait out the timeout itself. The file names the
 //! remote database it is about and the (already scrubbed) reason, it is private to the owner, and
 //! one that cannot be read or does not match counts as no failure.
+//!
+//! A failure that is only a wait that ran out (the remote did not answer within a probe the caller
+//! chose, see [`Reach::failed_in`]) carries how long it waited, and is honoured by a reader only when
+//! that reader would not wait longer ([`Reach::cooling_for`]). So the 1 s a hook gives the remote
+//! never makes a 3 s read, or a write that waits as long as its driver does, skip a remote that
+//! merely connects slowly. A refused connection, a host that does not resolve and the like are
+//! facts for every reader.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,6 +40,8 @@ pub const COOLDOWN: Duration = Duration::from_secs(60);
 struct Failure {
     at: Instant,
     message: String,
+    /// How long the attempt waited for an answer, for a failure that is a wait that ran out.
+    waited: Option<Duration>,
 }
 
 /// The failure as other processes see it.
@@ -42,6 +51,9 @@ struct Recorded {
     /// Milliseconds since the Unix epoch.
     at: u64,
     message: String,
+    /// Milliseconds the attempt waited for an answer, absent for a failure that is not a wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waited: Option<u64>,
 }
 
 /// Where the cooldown is shared between processes, for the remote database `remote`.
@@ -105,11 +117,34 @@ impl Reach {
         }
     }
 
-    /// Records an unreachable remote (`message` must be safe to show).
+    /// Records an unreachable remote that told so itself (`message` must be safe to show): a refused
+    /// connection, a host that does not resolve, a lost connection. Every reader honours it.
     pub fn failed(&self, message: &str) {
+        self.record(message, None);
+    }
+
+    /// Records a remote that did not answer within `waited`, a wait the caller chose: only a reader
+    /// that waits no longer than that honours it ([`Reach::cooling_for`]).
+    pub fn failed_after(&self, message: &str, waited: Duration) {
+        self.record(message, Some(waited));
+    }
+
+    /// Records a failed attempt that took `elapsed` when the caller was willing to wait `probe`: a
+    /// failure that came quicker was the remote's own answer, one that used up the probe was only
+    /// the wait running out.
+    pub fn failed_in(&self, message: &str, elapsed: Duration, probe: Duration) {
+        if elapsed >= probe {
+            self.failed_after(message, elapsed);
+        } else {
+            self.failed(message);
+        }
+    }
+
+    fn record(&self, message: &str, waited: Option<Duration>) {
         let failure = Failure {
             at: Instant::now(),
             message: message.to_owned(),
+            waited,
         };
 
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(failure);
@@ -119,6 +154,7 @@ impl Reach {
             remote: shared.remote.clone(),
             at: now(),
             message: message.to_owned(),
+            waited: waited.map(millis),
         };
 
         // A file that cannot be written only costs the other processes their own wait.
@@ -135,40 +171,77 @@ impl Reach {
         }
     }
 
-    /// Records that the remote answered.
+    /// Records that the remote answered. Only the record about this remote database is removed: the
+    /// file may hold another one's failure, which this answer says nothing about.
     pub fn reached(&self) {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
 
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = &self.shared
+            && self.recorded_of(shared).is_some()
+        {
             let _removed = std::fs::remove_file(&shared.path);
         }
     }
 
-    /// The message of the last failed attempt while its cooldown runs, `None` once it has ended
-    /// (the next call tries the remote) or when the last attempt worked.
+    /// The message of the last failed attempt while its cooldown runs, whoever's wait it was, `None`
+    /// once it has ended or when the last attempt worked.
     pub fn cooling(&self) -> Option<String> {
+        self.cooling_with(None)
+    }
+
+    /// As [`Reach::cooling`], for a reader that waits `budget` for the remote: a failure that was
+    /// only a shorter wait does not count (this reader may well get its answer).
+    pub fn cooling_for(&self, budget: Duration) -> Option<String> {
+        self.cooling_with(Some(budget))
+    }
+
+    fn cooling_with(&self, budget: Option<Duration>) -> Option<String> {
         let last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
 
         if let Some(failure) = last.as_ref() {
-            return (failure.at.elapsed() < self.cooldown).then(|| failure.message.clone());
+            let honoured = failure.at.elapsed() < self.cooldown && honours(failure.waited, budget);
+
+            return honoured.then(|| failure.message.clone());
         }
 
         drop(last);
 
-        self.recorded()
+        self.recorded(budget)
     }
 
     /// The failure another process recorded for this remote database, while its cooldown runs.
-    fn recorded(&self) -> Option<String> {
+    fn recorded(&self, budget: Option<Duration>) -> Option<String> {
         let shared = self.shared.as_ref()?;
-        let bytes = read_private(&shared.path, MAX_BYTES).ok().flatten()?;
-        let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+        let recorded = self.recorded_of(shared)?;
 
         // A time in the future (a clock set back) is not trusted: the next call tries the remote.
         let age = now().checked_sub(recorded.at)?;
+        let waited = recorded.waited.map(Duration::from_millis);
 
-        (recorded.remote == shared.remote && u128::from(age) < self.cooldown.as_millis()).then_some(recorded.message)
+        (u128::from(age) < self.cooldown.as_millis() && honours(waited, budget)).then_some(recorded.message)
     }
+
+    /// The record in the file when it is about this remote database.
+    fn recorded_of(&self, shared: &Shared) -> Option<Recorded> {
+        let bytes = read_private(&shared.path, MAX_BYTES).ok().flatten()?;
+        let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+
+        (recorded.remote == shared.remote).then_some(recorded)
+    }
+}
+
+/// Whether a failure that waited `waited` counts for a reader that waits `budget`: one that was not
+/// a wait counts for everybody, a wait counts for a reader that would not wait longer, and every
+/// failure counts when the reader has no budget (it is only asking).
+fn honours(waited: Option<Duration>, budget: Option<Duration>) -> bool {
+    match (waited, budget) {
+        (Some(waited), Some(budget)) => waited >= budget,
+        _ => true,
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Milliseconds since the Unix epoch.
@@ -229,5 +302,55 @@ mod tests {
         let future = format!(r#"{{"remote":"remote:a","at":{},"message":"down"}}"#, now() + 3_600_000);
         std::fs::write(&file, future).expect("write");
         assert_eq!(Reach::beside(&database, "remote:a").cooling(), None);
+    }
+
+    #[test]
+    fn a_wait_that_ran_out_counts_only_for_a_reader_that_waits_no_longer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let database = dir.path().join("knowledge.sqlite3");
+        let hook = Duration::from_secs(1);
+        let read = Duration::from_secs(3);
+
+        // The hook gave up after its second: that says nothing about a reader that waits three.
+        Reach::beside(&database, "remote:a").failed_in("slow", hook, hook);
+
+        let cooling = |budget: Duration| Reach::beside(&database, "remote:a").cooling_for(budget);
+        assert_eq!(cooling(hook).as_deref(), Some("slow"));
+        assert_eq!(cooling(read), None);
+
+        // A read that waited its three seconds is a reason for the hook as well.
+        Reach::beside(&database, "remote:a").failed_in("slower", read, read);
+        assert_eq!(cooling(hook).as_deref(), Some("slower"));
+        assert_eq!(cooling(read).as_deref(), Some("slower"));
+
+        // An answer that came at once (refused) is a fact for every reader.
+        Reach::beside(&database, "remote:a").failed_in("refused", Duration::from_millis(5), read);
+        assert_eq!(cooling(read).as_deref(), Some("refused"));
+        assert_eq!(cooling(Duration::from_secs(60)).as_deref(), Some("refused"));
+
+        // The same process sees it the same way.
+        let process = Reach::with_cooldown(Duration::from_secs(60));
+        process.failed_in("slow", hook, hook);
+        assert_eq!(process.cooling_for(read), None);
+        assert_eq!(process.cooling_for(hook).as_deref(), Some("slow"));
+    }
+
+    #[test]
+    fn an_answer_clears_the_failure_of_its_own_remote_and_leaves_another_ones() {
+        let dir = tempfile::tempdir().expect("dir");
+        let database = dir.path().join("knowledge.sqlite3");
+
+        Reach::beside(&database, "remote:a").failed("down");
+
+        Reach::beside(&database, "remote:b").reached();
+        assert_eq!(
+            Reach::beside(&database, "remote:a").cooling().as_deref(),
+            Some("down"),
+            "remote b answering says nothing about remote a"
+        );
+
+        Reach::beside(&database, "remote:a").reached();
+        assert_eq!(Reach::beside(&database, "remote:a").cooling(), None);
+        assert!(!dir.path().join(FILE).exists());
     }
 }

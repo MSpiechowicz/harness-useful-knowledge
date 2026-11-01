@@ -316,3 +316,76 @@ pub fn pending_chunks_contract(store: &mut dyn KnowledgeStore) {
     assert_eq!(for_model, [alpha, delta]);
     assert_eq!(for_other, [beta, gamma, delta]);
 }
+
+/// The titles [`title_order_contract`] sorts: Polish ones, upper and lower case, among ASCII ones.
+pub const TITLES: [&str; 12] = [
+    "Zebra",
+    "alfa",
+    "Łódź",
+    "łabędź",
+    "Żaba",
+    "żółw",
+    "Ąbc",
+    "ąbc",
+    "Bravo",
+    "źdźbło",
+    "Zażółć",
+    "bravo",
+];
+
+/// The order the list sorted by title has in every place: case-insensitive for ASCII letters only
+/// (the one fold every database can do the same way), then by bytes, ties by id. A title that
+/// starts with a Polish capital sorts before its lower case letter, and both after every ASCII one.
+pub fn title_order(mut titles: Vec<(i64, String)>) -> Vec<String> {
+    titles.sort_by(|(a_id, a), (b_id, b)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()).then(a_id.cmp(b_id)));
+
+    titles.into_iter().map(|(_, title)| title).collect()
+}
+
+/// A list sorted by title, in either direction and in pages, follows [`title_order`] for
+/// [`TITLES`], the way the merge of two places does (`store` is empty).
+pub fn title_order_contract(store: &mut dyn KnowledgeStore) {
+    use super::{ListQuery, RepoFilter, Sort};
+
+    let mut inserted: Vec<(i64, String)> = Vec::new();
+
+    for title in TITLES {
+        let (doc, chunks, links) = Seed::new(title).chunk("Intro", "text").parts();
+        let id = store.put_document(&doc, &chunks, &links).expect("put document");
+
+        inserted.push((id, title.to_owned()));
+    }
+
+    let expected = title_order(inserted);
+    let ask = |store: &mut dyn KnowledgeStore, descending: bool, offset: usize, limit: usize| -> Vec<String> {
+        store
+            .list(&ListQuery {
+                filter: RepoFilter::All,
+                format: None,
+                text: String::new(),
+                sort: Sort::Title,
+                descending,
+                offset,
+                limit,
+            })
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|row| row.doc.title)
+            .collect()
+    };
+
+    assert_eq!(ask(store, false, 0, 50), expected, "ascending");
+
+    let mut reversed = expected.clone();
+    reversed.reverse();
+    assert_eq!(ask(store, true, 0, 50), reversed, "descending");
+
+    let mut paged = Vec::new();
+
+    for page in 0..4 {
+        paged.extend(ask(store, false, page * 3, 3));
+    }
+
+    assert_eq!(paged, expected, "in pages of three");
+}

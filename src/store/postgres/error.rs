@@ -29,13 +29,11 @@ pub(super) fn backend(error: postgres::Error) -> StoreError {
 
 /// Whether `error` says the server could not be reached: a connection that was refused, timed out,
 /// could not be resolved or was lost (an I/O error, or a closed connection), or a server that
-/// says it is shutting down or the connection failed (SQLSTATE class 08, 57P01 to 57P03). A
-/// certificate the TLS check refuses is a setting to fix, not an unreachable server.
+/// says it is shutting down or the connection failed (see [`unreachable_code`]). A certificate the
+/// TLS check refuses is a setting to fix, not an unreachable server.
 pub(super) fn unreachable(error: &postgres::Error) -> bool {
     if let Some(db) = error.as_db_error() {
-        let code = db.code().code();
-
-        return code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03");
+        return unreachable_code(db.code().code());
     }
 
     if error.is_closed() {
@@ -59,6 +57,14 @@ pub(super) fn unreachable(error: &postgres::Error) -> bool {
     }
 
     false
+}
+
+/// Whether the SQLSTATE `code` says the server could not be reached: the connection exceptions of
+/// class 08 and a server that is shutting down or starting up (57P01 to 57P03). 08P01 is a protocol
+/// violation, a client or server that speaks wrongly, which another attempt does not mend: it is a
+/// failure, not an unreachable server.
+fn unreachable_code(code: &str) -> bool {
+    (code.starts_with("08") && code != "08P01") || matches!(code, "57P01" | "57P02" | "57P03")
 }
 
 /// Whether `error` says the server ended this session (an administrator or a restart terminated
@@ -166,6 +172,17 @@ mod tests {
         );
         assert_eq!(described("28P01"), "the database refused the login (SQLSTATE 28P01)");
         assert_eq!(described("XX000"), "database error XX000");
+    }
+
+    #[test]
+    fn a_lost_or_refused_connection_is_unreachable_and_a_protocol_violation_is_not() {
+        for code in ["08000", "08001", "08003", "08004", "08006", "57P01", "57P02", "57P03"] {
+            assert!(unreachable_code(code), "{code}");
+        }
+
+        for code in ["08P01", "28P01", "42P01", "57014", "53300", "XX000"] {
+            assert!(!unreachable_code(code), "{code}");
+        }
     }
 
     #[test]

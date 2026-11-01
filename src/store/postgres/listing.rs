@@ -31,9 +31,11 @@ pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result
         )
         .map_err(backend)?;
 
-    // The `C` collation keeps the order the same on every server, whatever its locale.
+    // The `C` collation keeps the order the same on every server, whatever its locale. A title folds
+    // ASCII letters only (`lower` would also fold the letters of the server's locale), the one fold
+    // every store does alike, so merged pages of two places are the pages of each one's own order.
     let order = match query.sort {
-        Sort::Title => "lower(d.title) COLLATE \"C\"",
+        Sort::Title => "translate(d.title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE \"C\"",
         Sort::Updated => "d.updated_at",
         Sort::Size => "d.bytes",
         Sort::Format => "d.format",
@@ -107,12 +109,20 @@ fn conditions(query: &ListQuery) -> (String, Vec<Param>) {
         params.push(Box::new(format!("%{}%", escape_like(text))));
         let mut matching = format!("d.title ILIKE ${} ESCAPE '\\'", params.len());
 
-        if let Some(tsquery) = prefix_query(text) {
-            params.push(Box::new(tsquery));
-            matching.push_str(&format!(
-                " OR EXISTS (SELECT 1 FROM knowledge_chunks c WHERE c.doc_id = d.id
-                             AND c.tsv @@ to_tsquery('simple'::regconfig, {}))",
+        if let Some(tsquery) = phrase_query(text) {
+            params.push(Box::new(tsquery.text));
+            let wanted = format!(
+                "to_tsquery('simple'::regconfig, {})",
                 schema::fold(&format!("${}", params.len()))
+            );
+            let found = if tsquery.phrase {
+                phrase_in_a_field(&wanted)
+            } else {
+                format!("c.tsv @@ {wanted}")
+            };
+
+            matching.push_str(&format!(
+                " OR EXISTS (SELECT 1 FROM knowledge_chunks c WHERE c.doc_id = d.id AND {found})"
             ));
         }
 
@@ -127,16 +137,17 @@ fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
-/// The words of `text` as a `tsquery` for a phrase: the words next to each other in that order,
-/// the last as a prefix, `'api' <-> 'gat':*`. The words are lowercase letters and digits, so
-/// nothing in it is `tsquery` syntax. `None` when there is no word.
-fn prefix_query(text: &str) -> Option<String> {
-    phrase_query(text, "")
+/// A `tsquery` for the words of a text.
+struct PhraseQuery {
+    /// The words next to each other in that order, the last as a prefix, `'api' <-> 'gat':*`. The
+    /// words are lowercase letters and digits, so nothing in it is `tsquery` syntax.
+    text: String,
+    /// There is more than one word, so the order and the adjacency matter.
+    phrase: bool,
 }
 
-/// [`prefix_query`] with every word restricted to the weights `weights` (`BD`: the heading path
-/// and the text, not the title).
-fn phrase_query(text: &str, weights: &str) -> Option<String> {
+/// The `tsquery` of the words of `text`. `None` when there is no word.
+fn phrase_query(text: &str) -> Option<PhraseQuery> {
     let words: Vec<String> = text
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -148,18 +159,19 @@ fn phrase_query(text: &str, weights: &str) -> Option<String> {
     let terms: Vec<String> = words
         .iter()
         .enumerate()
-        .map(|(index, word)| {
-            let suffix = format!("{}{weights}", if index == last { "*" } else { "" });
-
-            if suffix.is_empty() {
-                format!("'{word}'")
-            } else {
-                format!("'{word}':{suffix}")
-            }
-        })
+        .map(|(index, word)| format!("'{word}'{}", if index == last { ":*" } else { "" }))
         .collect();
 
-    Some(terms.join(" <-> "))
+    Some(PhraseQuery {
+        text: terms.join(" <-> "),
+        phrase: words.len() > 1,
+    })
+}
+
+/// The condition that a chunk `c` has the `tsquery` as a phrase in its heading path or in its text,
+/// never across the two (each has a `tsvector` of its own).
+fn phrase_in_a_field(tsquery: &str) -> String {
+    format!("(c.tsv_heading @@ {tsquery} OR c.tsv_text @@ {tsquery})")
 }
 
 /// The chunks of document `id` that match `text` in their heading path or text, at most `limit`.
@@ -169,13 +181,14 @@ pub(super) fn matching_chunks(
     text: &str,
     limit: usize,
 ) -> Result<ChunkMatches, StoreError> {
-    let Some(tsquery) = phrase_query(text, "BD") else {
+    let Some(phrase) = phrase_query(text) else {
         return Ok(ChunkMatches::default());
     };
+    let tsquery = phrase.text;
 
     let condition = format!(
-        "c.doc_id = $1 AND c.tsv @@ to_tsquery('simple'::regconfig, {})",
-        schema::fold("$2")
+        "c.doc_id = $1 AND {}",
+        phrase_in_a_field(&format!("to_tsquery('simple'::regconfig, {})", schema::fold("$2")))
     );
     let total = client
         .query_one(
@@ -371,18 +384,25 @@ mod tests {
 
     #[test]
     fn the_words_of_a_text_become_a_quoted_phrase_whose_last_word_is_a_prefix() {
-        assert_eq!(prefix_query("API gat").as_deref(), Some("'api' <-> 'gat':*"));
         assert_eq!(
-            prefix_query("one two three").as_deref(),
+            phrase_query("API gat").map(|query| query.text).as_deref(),
+            Some("'api' <-> 'gat':*")
+        );
+        assert_eq!(
+            phrase_query("one two three").map(|query| query.text).as_deref(),
             Some("'one' <-> 'two' <-> 'three':*")
         );
-        assert_eq!(prefix_query("\"( OR *").as_deref(), Some("'or':*"));
-        assert_eq!(prefix_query("'; DROP").as_deref(), Some("'drop':*"));
-        assert_eq!(prefix_query(" ?! "), None);
         assert_eq!(
-            phrase_query("Version 1", "BD").as_deref(),
-            Some("'version':BD <-> '1':*BD")
+            phrase_query("\"( OR *").map(|query| query.text).as_deref(),
+            Some("'or':*")
         );
+        assert_eq!(
+            phrase_query("'; DROP").map(|query| query.text).as_deref(),
+            Some("'drop':*")
+        );
+        assert!(phrase_query(" ?! ").is_none());
+        assert!(phrase_query("Version 1").is_some_and(|query| query.phrase));
+        assert!(phrase_query("Version").is_some_and(|query| !query.phrase));
     }
 
     #[test]

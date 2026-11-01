@@ -166,3 +166,64 @@ fn server_code_names_are_shown_only_when_they_are_plain_words() {
         assert_eq!(coded("write failed", Some(name), 2), "write failed (2)", "{name}");
     }
 }
+
+/// How the driver words the server selection that ended with `last_error` for a server called `host`.
+fn timed_out(host: &str, last_error: &str) -> String {
+    format!(
+        "Server selection timeout: No available servers. Topology: {{ Type: Single, Servers: [ {{ Address: {host}:27017, \
+         Type: Unknown, Error: Kind: {last_error}, labels: {{\"RetryableError\"}}, source: None, server response: None }} ] }}"
+    )
+}
+
+#[test]
+fn a_server_whose_tls_is_refused_is_told_from_one_that_cannot_be_reached() {
+    let refused = [
+        "I/O error: invalid peer certificate: UnknownIssuer",
+        "I/O error: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))",
+        "I/O error: invalid peer certificate: NotValidForName",
+        "I/O error: received fatal alert: HandshakeFailure",
+        "I/O error: received corrupt message of type InvalidContentType",
+        "I/O error: peer is incompatible: NoCipherSuitesInCommon",
+    ];
+
+    for last_error in refused {
+        assert!(
+            selection_is_tls(&timed_out("db.example.com", last_error)),
+            "{last_error}"
+        );
+    }
+
+    // Nothing but the reason counts: a server called like a TLS error is only unreachable.
+    let unreached = [
+        ("db.example.com", "I/O error: Connection refused (os error 111)"),
+        (
+            "tls-certificate-handshake.example.com",
+            "I/O error: Connection refused (os error 111)",
+        ),
+        ("db.example.com", "I/O error: Connection reset by peer (os error 104)"),
+        ("db.example.com", "DNS resolution error: no record found"),
+    ];
+
+    for (host, last_error) in unreached {
+        assert!(!selection_is_tls(&timed_out(host, last_error)), "{host}: {last_error}");
+    }
+
+    let nobody = "Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [] }";
+    assert!(!selection_is_tls(nobody));
+}
+
+#[test]
+fn an_io_error_that_wraps_a_tls_error_is_a_failure_and_a_plain_one_is_not() {
+    let wrapped = std::io::Error::other(rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate));
+    let plain = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+
+    match backend(&Error::from(ErrorKind::Io(std::sync::Arc::new(wrapped)))) {
+        StoreError::Backend(message) => assert_eq!(message, TLS_FAILED),
+        other => panic!("{other:?}"),
+    }
+
+    assert!(matches!(
+        backend(&Error::from(ErrorKind::Io(std::sync::Arc::new(plain)))),
+        StoreError::Unreachable(_)
+    ));
+}

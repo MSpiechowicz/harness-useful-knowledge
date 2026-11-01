@@ -84,15 +84,14 @@ fn conditions(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<Row, Fail> {
     })
 }
 
-/// The most chunks a phrase filter checks the text of: the chunks that have every word.
-const PHRASE_CANDIDATES_MAX: i64 = 5000;
-
 /// Keeps the documents whose title contains `wanted` (any case), or that have a chunk whose
 /// heading or text has its words next to each other in that order, the last as a prefix.
 ///
 /// One word is a prefix of a word of a chunk's text or title (the `terms` arrays decide). Several
-/// words cannot be asked of the arrays, so the chunks that have every word are the candidates
-/// (at most [`PHRASE_CANDIDATES_MAX`]) and their heading and text are checked for the phrase.
+/// words are matched by the server against the chunk's `phrase_text` (see [`terms::phrase_text`]),
+/// so every chunk is looked at and nothing is cut: the total and the pages are exact. The `terms`
+/// index narrows the chunks first by the words of two letters or more (a one-letter prefix matches
+/// nearly every chunk and narrows nothing, a phrase of one-letter words alone scans the chunks).
 fn text_condition(ctx: &mut Ctx<'_>, wanted: &str) -> Result<Row, Fail> {
     let in_title = doc! { "title": { "$regex": regex::escape(wanted), "$options": "i" } };
 
@@ -103,38 +102,27 @@ fn text_condition(ctx: &mut Ctx<'_>, wanted: &str) -> Result<Row, Fail> {
         return Ok(in_title);
     }
 
-    let ids: Vec<i64> = if phrase.len() == 1 {
+    let chunk_filter = if phrase.len() == 1 {
         // The word is a prefix of a word of the chunk's text or of its title.
         let prefix = doc! { "$regex": format!("^{}", regex::escape(&words[0])) };
-        let either = doc! { "$or": [{ "terms": prefix.clone() }, { "title_terms": prefix }] };
-        let found = ctx.aggregate(
-            CHUNKS,
-            vec![doc! { "$match": either }, doc! { "$group": { "_id": "$doc_id" } }],
-        )?;
 
-        found.iter().map(|group| int(group, "_id")).collect()
+        doc! { "$or": [{ "terms": prefix.clone() }, { "title_terms": prefix }] }
     } else {
-        let each: Vec<Row> = words
+        let mut each: Vec<Row> = phrase
             .iter()
+            .filter(|word| word.chars().count() >= 2)
             .map(|word| doc! { "terms": { "$regex": format!("^{}", regex::escape(word)) } })
             .collect();
-        let projection = doc! { "doc_id": 1, "heading_path": 1, "text": 1 };
-        let candidates = ctx.find(
-            CHUNKS,
-            doc! { "$and": each },
-            (doc! { "_id": 1 }, 0, PHRASE_CANDIDATES_MAX),
-            projection,
-        )?;
+        each.push(doc! { "phrase_text": { "$regex": terms::phrase_regex(&phrase) } });
 
-        let mut ids: Vec<i64> = candidates
-            .iter()
-            .filter(|chunk| has_phrase_in(chunk, &phrase))
-            .map(|chunk| int(chunk, "doc_id"))
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        doc! { "$and": each }
     };
+
+    let found = ctx.aggregate(
+        CHUNKS,
+        vec![doc! { "$match": chunk_filter }, doc! { "$group": { "_id": "$doc_id" } }],
+    )?;
+    let ids: Vec<i64> = found.iter().map(|group| int(group, "_id")).collect();
 
     Ok(doc! { "$or": [in_title, { "_id": { "$in": ids } }] })
 }

@@ -14,4 +14,5 @@ mod embeddings;
 mod listing;
 mod search;
 mod support;
+mod titles;
 mod transport;

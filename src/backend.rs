@@ -7,13 +7,16 @@
 //!
 //! With both places in use ([`Layout::Both`]) this computer stands in for a remote database that
 //! cannot be reached (see [`open`]): it is tried with a short connect timeout, and a failure starts
-//! the cooldown of a [`Reach`] shared by every process, during which it is not tried again.
+//! the cooldown of a [`Reach`] shared by every process, during which it is not tried again. A probe
+//! that merely ran out of time is recorded with how long it waited, so the 1 s of a hook never
+//! makes a longer reader (or a write, which always tries with the driver's own timeout) skip a remote
+//! that connects slowly.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{Backend, Layout, Place, Routing};
 use crate::location::{DIR_VAR, database_path, override_is_relative};
-use crate::store::routed::Remote;
+use crate::store::routed::{Patience, Remote};
 use crate::store::{KnowledgeStore, Reach, RoutedStore, SqliteStore, StoreError};
 use crate::support::{Env, deadline};
 
@@ -23,6 +26,12 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The same for `recall --hook`, which has to finish within [`crate::recall::DEADLINE`].
 pub const HOOK_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many attempts to open the remote database may still be running after their deadline: a
+/// server that takes the connection and never speaks leaves its thread blocked until the server or
+/// the network ends it (the drivers' timeouts do not cover that), and a long-lived process must not
+/// leave one more behind for every attempt. With all of them in use the remote counts as unreachable.
+static SILENT_OPENS: deadline::Slots = deadline::Slots::new(4);
 
 /// What a command needs from the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +102,17 @@ pub fn open_within(
         Layout::Both => {
             let local = open_place(env, backend, Place::Local, access)?;
             let reach = reach_of(env, backend);
+            let secrets = backend.secrets();
             let (env, backend) = (env.clone(), backend.clone());
-            let remote = Remote::lazy(move || open_remote_within(&env, &backend, access, probe), reach);
+            let opener = move |patience| {
+                let connect = match patience {
+                    Patience::Probe => probe,
+                    Patience::Full => default_timeout(&backend),
+                };
+
+                open_remote_within(&env, &backend, access, connect)
+            };
+            let remote = Remote::lazy(opener, reach, probe, secrets);
             let mut routed = RoutedStore::new(local, None, routing).with_remote(remote);
 
             routed.settle()?;
@@ -149,7 +167,7 @@ fn open_remote_within(
     let (env, backend) = (env.clone(), backend.clone());
     let silent = || OpenError::Unreachable("the remote database did not answer in time".to_owned());
 
-    deadline::within("remote-open", connect * 2, move || {
+    deadline::within_slots(&SILENT_OPENS, "remote-open", connect * 2, move || {
         open_place_within(&env, &backend, Place::Remote, access, connect)
     })
     .unwrap_or_else(|| Err(silent()))
@@ -192,7 +210,7 @@ pub enum Attempt {
 pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bool) -> Result<Attempt, OpenError> {
     let reach = reach_of(env, backend);
 
-    if let Some(message) = cooldown.then(|| reach.cooling()).flatten() {
+    if let Some(message) = cooldown.then(|| reach.cooling_for(PROBE_TIMEOUT)).flatten() {
         return Ok(Attempt::Offline(message));
     }
 
@@ -201,6 +219,7 @@ pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bo
     } else {
         default_timeout(backend)
     };
+    let started = Instant::now();
 
     match open_remote_within(env, backend, access, connect) {
         Ok(store) => {
@@ -208,7 +227,7 @@ pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bo
             Ok(Attempt::Opened(store))
         }
         Err(OpenError::Unreachable(message)) => {
-            reach.failed(&message);
+            reach.failed_in(&message, started.elapsed(), PROBE_TIMEOUT);
             Ok(Attempt::Offline(message))
         }
         Err(other) => Err(other),

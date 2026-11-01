@@ -46,6 +46,38 @@ fn client(url: &str) -> Client {
     Client::new(endpoint::parse(url).expect("url"), Some("secret-token")).expect("client")
 }
 
+/// A server that accepts every connection and never answers.
+fn silent_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
+
+    thread::spawn(move || {
+        let mut held = Vec::new();
+
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+
+    url
+}
+
+#[test]
+fn a_request_the_server_takes_too_long_to_answer_is_not_an_unreachable_server() {
+    let url = silent_server();
+    let client = Client::with_timeouts(
+        endpoint::parse(&url).expect("url"),
+        None,
+        CONNECT_TIMEOUT,
+        std::time::Duration::from_millis(300),
+    )
+    .expect("client");
+
+    let error = client.single().query("SELECT 7", args![]).expect_err("no answer");
+
+    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+}
+
 #[test]
 fn a_read_is_repeated_once_when_the_connection_broke_before_any_reply() {
     let url = flaky_server(1, ONE_ROW);

@@ -58,18 +58,28 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
 
 /// Records what the check found out about reaching the remote database, which every other command
 /// goes by while this computer stands in for it (see [`crate::store::Reach`]): an `unreachable`
-/// problem starts the cooldown, any other answer ends it. The check itself is never skipped.
+/// problem starts the cooldown, any other answer ends it. The check itself is never skipped. A server
+/// whose TLS is refused answered (it is a setting to fix, see [`crate::store::StoreError::Unreachable`]),
+/// so it starts no cooldown, though the check reports it as `unreachable` like any connection that
+/// did not work.
 fn note_reach(context: &Context, done: &Done) {
     let reach = backend::reach_of(context.env, context.backend);
 
+    let message = done.json["message"]
+        .as_str()
+        .unwrap_or("the remote database is unreachable");
+
     match done.json["problem"].as_str() {
-        Some("unreachable") => reach.failed(
-            done.json["message"]
-                .as_str()
-                .unwrap_or("the remote database is unreachable"),
-        ),
+        Some("unreachable") if !refused_by_tls(message) => reach.failed(message),
         _ => reach.reached(),
     }
+}
+
+/// Whether a reason says TLS with the server failed (the messages of the drivers all name it).
+fn refused_by_tls(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+
+    lower.contains("tls") || lower.contains("certificate")
 }
 
 /// The check of one place.

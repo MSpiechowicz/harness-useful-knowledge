@@ -122,6 +122,21 @@ fn team_remote_and_local_documents_are_listed_searched_and_changed_together() {
     assert_eq!(stats["places"]["local"]["documents"], 1);
     assert_eq!(stats["places"]["local"]["chunks"], 3);
 
+    // Each place has its own generation, so a change in either shows.
+    let generation = |stats: &Value, place: &str| stats["generations"][place].as_i64().expect("a generation");
+    for place in ["remote", "local"] {
+        assert_eq!(
+            generation(&stats, place),
+            stats["places"][place]["generation"].as_i64().expect("own")
+        );
+    }
+    docs(&context, &["rename", "--json", "local:1", "--title", "Mine"]);
+    let changed = crate::cli_docs::stats_reply(&context, &[Some("--json")])
+        .expect("stats")
+        .json;
+    assert!(generation(&changed, "local") > generation(&stats, "local"));
+    assert_eq!(generation(&changed, "remote"), generation(&stats, "remote"));
+
     let check = crate::cli_docs::check_reply(&context, &[Some("--json")]).expect("check");
     assert_eq!(check.code, 0);
     assert_eq!(check.json["backend"], "postgres");

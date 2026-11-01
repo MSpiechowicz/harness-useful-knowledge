@@ -11,6 +11,10 @@ use crate::store::{DocumentRow, KnowledgeStore, ListQuery, RepoFilter, Sort, Sto
 /// Documents per page.
 const PAGE: usize = 20;
 
+/// The last page that can be asked for: a page number an agent makes up (it can be any integer)
+/// must not overflow the offset.
+const PAGE_MAX: usize = 1_000_000;
+
 /// Most characters of a list query.
 const QUERY_CHARS_MAX: usize = 200;
 
@@ -29,7 +33,7 @@ pub(super) fn list(server: &mut Server, args: ListArgs) -> Result<String, String
         return Err(format!("query must be at most {QUERY_CHARS_MAX} characters"));
     }
 
-    let page = usize::try_from(args.page.unwrap_or(1).max(1)).unwrap_or(1);
+    let page = usize::try_from(args.page.unwrap_or(1).max(1)).map_or(PAGE_MAX, |page| page.min(PAGE_MAX));
     let repo = repository(server, args.project_path.as_deref())?;
     let key = repo
         .as_ref()
@@ -41,7 +45,7 @@ pub(super) fn list(server: &mut Server, args: ListArgs) -> Result<String, String
             return Ok("no documents yet".to_owned());
         };
 
-        collect(store, key.as_deref(), &text, (page - 1) * PAGE)
+        collect(store, key.as_deref(), &text, (page - 1).saturating_mul(PAGE))
     };
 
     let (rows, total) = listed.map_err(|error| server.failed(&error))?;
@@ -63,7 +67,7 @@ pub(super) fn list(server: &mut Server, args: ListArgs) -> Result<String, String
         reply.push_str(NO_PROJECT);
     }
 
-    if page * PAGE < total {
+    if page.saturating_mul(PAGE) < total {
         reply.push_str(&format!("\nNext page: {}", page + 1));
     }
 
