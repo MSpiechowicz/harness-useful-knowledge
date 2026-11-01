@@ -13,8 +13,9 @@ use crate::store::libsql::wire::execute;
 use crate::store::libsql::{CONNECT_TIMEOUT, LibsqlStore, endpoint, open_boxed};
 
 /// A server that hangs up on the first `hangups` connections without a word, then answers every
-/// request with `body`.
-fn flaky_server(hangups: usize, body: &'static str) -> String {
+/// request with `body`. `abrupt` drops the socket unread (a reset), else it closes it cleanly
+/// after reading the request (what a server ending an idle connection does).
+fn flaky_server(hangups: usize, body: &'static str, abrupt: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
 
@@ -22,18 +23,25 @@ fn flaky_server(hangups: usize, body: &'static str) -> String {
         for (index, stream) in listener.incoming().enumerate() {
             let Ok(mut stream) = stream else { continue };
 
-            if index < hangups {
+            if index < hangups && abrupt {
                 drop(stream);
                 continue;
             }
 
-            // The whole request first: answering a client still writing it fails on macOS.
+            // The whole request first: closing or answering a socket with unread bytes resets it.
             let _request = read_body(&mut stream);
+
+            if index < hangups {
+                close_cleanly(stream);
+                continue;
+            }
+
             let reply = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(reply.as_bytes()).ok();
+            close_cleanly(stream);
         }
     });
 
@@ -80,18 +88,21 @@ fn a_request_the_server_takes_too_long_to_answer_is_not_an_unreachable_server() 
 
 #[test]
 fn a_read_is_repeated_once_when_the_connection_broke_before_any_reply() {
-    let url = flaky_server(1, ONE_ROW);
-    let rows = client(&url)
-        .single()
-        .query("SELECT 7", args![])
-        .expect("the second try answers");
+    // a reset on Linux, and on macOS either a reset or a clean close, so both are asked for
+    for abrupt in [true, false] {
+        let url = flaky_server(1, ONE_ROW, abrupt);
+        let rows = client(&url)
+            .single()
+            .query("SELECT 7", args![])
+            .unwrap_or_else(|error| panic!("the second try answers (abrupt {abrupt}): {error:?}"));
 
-    assert_eq!(rows[0].get::<i64>(0).expect("a number"), 7);
+        assert_eq!(rows[0].get::<i64>(0).expect("a number"), 7);
+    }
 }
 
 #[test]
 fn a_read_is_not_repeated_forever() {
-    let url = flaky_server(2, ONE_ROW);
+    let url = flaky_server(2, ONE_ROW, false);
     let error = client(&url)
         .single()
         .query("SELECT 7", args![])
@@ -106,7 +117,7 @@ fn a_read_is_not_repeated_forever() {
 
 #[test]
 fn a_transaction_is_never_repeated_when_the_connection_broke() {
-    let url = flaky_server(1, ONE_ROW);
+    let url = flaky_server(1, ONE_ROW, false);
     let client = client(&url);
     let error = client
         .stream()
@@ -120,7 +131,7 @@ fn a_transaction_is_never_repeated_when_the_connection_broke() {
 #[test]
 fn a_blob_in_a_reply_is_decoded() {
     const BLOB: &str = r#"{"baton":null,"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[[{"type":"blob","base64":"AACAPw"}]],"affected_row_count":0,"last_insert_rowid":null}}},{"type":"ok","response":{"type":"close"}}]}"#;
-    let url = flaky_server(0, BLOB);
+    let url = flaky_server(0, BLOB, false);
     let rows = client(&url).single().query("SELECT e", args![]).expect("rows");
 
     let bytes: Vec<u8> = rows[0].get(0).expect("a blob");
@@ -234,6 +245,17 @@ fn refusing_server(refuse: &'static str, message: &'static str) -> String {
     });
 
     url
+}
+
+/// Ends the conversation with a FIN, never a reset: no more writes, then whatever the client still
+/// sends is read until it closes its side (bounded, so a client that keeps the socket open cannot
+/// hold the fake server).
+fn close_cleanly(mut stream: std::net::TcpStream) {
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+
+    let mut buffer = [0; 1024];
+    while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {}
 }
 
 /// The body of the HTTP request on `stream`.

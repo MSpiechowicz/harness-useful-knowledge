@@ -231,8 +231,10 @@ impl Failed {
                 | ureq::Error::ConnectionFailed
                 | ureq::Error::Timeout(Timeout::Resolve | Timeout::Connect)
         );
+        // A reset gives a bare io error. A clean close before the reply (a server that ended an idle
+        // kept connection, or restarted) gives ureq's UnexpectedEof "Peer disconnected".
         let stale = matches!(&error, ureq::Error::ConnectionFailed)
-            || matches!(&error, ureq::Error::Io(io) if io.get_ref().is_none());
+            || matches!(&error, ureq::Error::Io(io) if io.get_ref().is_none() || io.kind() == std::io::ErrorKind::UnexpectedEof);
         let kind = if refused_by_tls(&error) {
             Kind::Refused
         } else {
