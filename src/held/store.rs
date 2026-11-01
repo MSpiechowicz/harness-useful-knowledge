@@ -1,7 +1,7 @@
 //! The proposal files on disk: `held/<heldId>.json` next to the database (see [`crate::held`]).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     HELD_FILE_MAX, HELD_FOLDER, HELD_MAX_ITEMS, HELD_TOTAL_BYTES, HeldItem, VERSION, is_held_id, now, random_id,
@@ -109,15 +109,12 @@ impl HeldStore {
         }
 
         let id = random_id();
-        let aside = self.folder.join(format!("{TEMP_PREFIX}{id}.tmp"));
+        // The claim's start is in its name: a rename keeps the file's time, and stamping the file
+        // before the move would collide with another claim's rename on Windows.
+        let aside = self
+            .folder
+            .join(format!("{TEMP_PREFIX}{CLAIM_MARK}{}-{id}.tmp", now_millis()));
         let home = item_path(&self.folder, held_id);
-
-        // A rename keeps the file's time, so the claim's start is stamped before the move: a
-        // `restore_stranded` running between the two never sees a fresh claim as an old one.
-        let _ = std::fs::File::options()
-            .write(true)
-            .open(&home)
-            .and_then(|file| file.set_modified(SystemTime::now()));
 
         match std::fs::rename(&home, &aside) {
             Ok(()) => {}
@@ -191,7 +188,9 @@ impl HeldStore {
             let name = entry.file_name();
             let name = name.to_string_lossy();
 
-            if !(name.starts_with(TEMP_PREFIX) && name.ends_with(".tmp")) || !older_than(&entry, CLAIM_TIMEOUT) {
+            if !(name.starts_with(TEMP_PREFIX) && name.ends_with(".tmp"))
+                || !claim_older_than(&name, &entry, CLAIM_TIMEOUT)
+            {
                 continue;
             }
 
@@ -305,6 +304,30 @@ fn put_back(aside: &Path, home: &Path) -> Result<(), String> {
 }
 
 /// True when the file of `entry` was last written more than `age` ago.
+/// The marker of a claimed proposal's name, followed by the claim's start in milliseconds.
+const CLAIM_MARK: &str = "c";
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
+}
+
+/// Whether the claim a temporary file stands for began more than `age` ago: by the time in its
+/// name, or by the file's own time for a name without one (a half-written proposal).
+fn claim_older_than(name: &str, entry: &std::fs::DirEntry, age: Duration) -> bool {
+    let started = name
+        .strip_prefix(TEMP_PREFIX)
+        .and_then(|rest| rest.strip_prefix(CLAIM_MARK))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|millis| millis.parse::<u64>().ok());
+
+    match started {
+        Some(millis) => now_millis().saturating_sub(u128::from(millis)) > age.as_millis(),
+        None => older_than(entry, age),
+    }
+}
+
 fn older_than(entry: &std::fs::DirEntry, age: Duration) -> bool {
     entry
         .metadata()

@@ -115,7 +115,8 @@ fn tools_list_is_the_four_knowledge_tools_as_snapshotted() {
         std::fs::write(&path, &snapshot).expect("write the snapshot");
     }
 
-    assert_eq!(snapshot, include_str!("../tools_list.snap.json"));
+    // A Windows checkout may hold the snapshot with CRLF line endings.
+    assert_eq!(snapshot, include_str!("../tools_list.snap.json").replace("\r\n", "\n"));
 
     let names: Vec<&str> = listed["tools"]
         .as_array()

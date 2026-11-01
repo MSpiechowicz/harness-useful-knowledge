@@ -316,11 +316,14 @@ fn only_a_project_folder_is_read_from_never_the_home_folder_or_a_folder_without_
     std::fs::write(keys.join("id_rsa"), "not a credential, just text").expect("write");
     std::fs::write(world.home().join("diary.txt"), "private words").expect("write");
 
-    for (folder, path) in [
-        (world.home(), "diary.txt"),
-        (keys.clone(), "id_rsa"),
-        (std::path::PathBuf::from("/etc"), "hostname"),
-    ] {
+    let mut refused_folders = vec![(world.home(), "diary.txt"), (keys.clone(), "id_rsa")];
+
+    // A system folder, where the platform has a well-known one.
+    if cfg!(unix) {
+        refused_folders.push((std::path::PathBuf::from("/etc"), "hostname"));
+    }
+
+    for (folder, path) in refused_folders {
         let refused = world.err(
             "knowledge_add",
             json!({ "title": "x", "path": path, "project_path": folder.to_string_lossy() }),

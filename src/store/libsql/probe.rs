@@ -138,6 +138,39 @@ mod tests {
         }
     }
 
+    /// Reads one HTTP request to its end (headers and a `content-length` body), so the answer
+    /// never reaches a client still writing it (macOS then fails the write).
+    fn read_request(stream: &mut std::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut buffer = [0; 4096];
+
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => seen.extend_from_slice(&buffer[..read]),
+            }
+        }
+
+        let head_end = seen
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(0, |at| at + 4);
+        let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = seen.len() - head_end;
+
+        while body < length {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => body += read,
+            }
+        }
+    }
+
     /// A server that answers every request with `status` and nothing else.
     fn server_answering(status: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
@@ -145,8 +178,7 @@ mod tests {
 
         thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
-                let mut buffer = [0; 4096];
-                let _read = stream.read(&mut buffer);
+                read_request(&mut stream);
                 let reply = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
                 stream.write_all(reply.as_bytes()).ok();
             }

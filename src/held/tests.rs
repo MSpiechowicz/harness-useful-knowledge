@@ -222,13 +222,14 @@ fn a_claim_left_behind_by_a_dead_process_is_put_back_after_ten_minutes() {
         .collect();
     assert_eq!(aside.len(), 1);
 
+    // Three hours later: the claim's start is in its name.
     let old = std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60);
-    std::fs::File::options()
-        .write(true)
-        .open(aside[0].path())
-        .expect("open")
-        .set_modified(old)
-        .expect("mtime");
+    let millis = old.duration_since(std::time::UNIX_EPOCH).expect("epoch").as_millis();
+    std::fs::rename(
+        aside[0].path(),
+        store.folder().join(format!(".held-c{millis}-dead.tmp")),
+    )
+    .expect("age the claim");
 
     let items = store.list().expect("list");
 
