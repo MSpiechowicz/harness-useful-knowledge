@@ -218,7 +218,7 @@ fn a_claim_left_behind_by_a_dead_process_is_put_back_after_ten_minutes() {
     let aside: Vec<_> = std::fs::read_dir(store.folder())
         .expect("folder")
         .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".held-"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".held-c"))
         .collect();
     assert_eq!(aside.len(), 1);
 

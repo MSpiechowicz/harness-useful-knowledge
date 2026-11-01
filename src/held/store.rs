@@ -108,6 +108,23 @@ impl HeldStore {
             return Ok(None);
         }
 
+        // One claim at a time: the marker is created exclusively, which every platform does
+        // atomically (a rename alone is not: on Windows two renames of one file can both succeed).
+        let Some(lock) = take_lock(&self.folder, held_id)? else {
+            return Ok(None);
+        };
+
+        let claimed = self.claim_locked(held_id);
+
+        if !matches!(claimed, Ok(Some(_))) {
+            let _ = std::fs::remove_file(&lock);
+        }
+
+        claimed.map(|claim| claim.map(|claim| Claim { lock, ..claim }))
+    }
+
+    /// [`Self::claim`] once its marker is taken.
+    fn claim_locked(&self, held_id: &str) -> Result<Option<Claim>, String> {
         let id = random_id();
         // The claim's start is in its name: a rename keeps the file's time, and stamping the file
         // before the move would collide with another claim's rename on Windows.
@@ -135,6 +152,7 @@ impl HeldStore {
                 item,
                 path: aside,
                 home,
+                lock: PathBuf::new(),
             })),
             None => {
                 put_back(&aside, &home)?;
@@ -207,7 +225,10 @@ impl HeldStore {
                 continue;
             };
 
-            let _ = put_back(&path, &item_path(&self.folder, &item.held_id));
+            // The dead claim's marker goes with it, so the proposal can be decided again.
+            if put_back(&path, &item_path(&self.folder, &item.held_id)).is_ok() {
+                let _ = std::fs::remove_file(self.folder.join(format!("{LOCK_PREFIX}{}", item.held_id)));
+            }
         }
     }
 
@@ -288,18 +309,58 @@ pub struct Claim {
     path: PathBuf,
     /// Where the file was waiting.
     home: PathBuf,
+    /// The marker that keeps every other claim of this proposal out until this one ends.
+    lock: PathBuf,
 }
 
 impl Claim {
     /// Removes the claimed proposal: it was approved or rejected.
     pub fn finish(self) -> Result<(), String> {
-        std::fs::remove_file(&self.path).map_err(|error| format!("removing the held proposal failed: {error}"))
+        let removed =
+            std::fs::remove_file(&self.path).map_err(|error| format!("removing the held proposal failed: {error}"));
+        let _ = std::fs::remove_file(&self.lock);
+
+        removed
     }
 
     /// Puts the proposal back where it waited: it was not approved.
     pub fn restore(self) -> Result<(), String> {
-        put_back(&self.path, &self.home)
+        let restored = put_back(&self.path, &self.home);
+        let _ = std::fs::remove_file(&self.lock);
+
+        restored
     }
+}
+
+/// The prefix of a claim marker, followed by the proposal's id.
+const LOCK_PREFIX: &str = ".held-lock-";
+
+/// Creates the claim marker of `held_id`; `None` when another claim holds it. A marker older than
+/// [`CLAIM_TIMEOUT`] was left by a process that died, so it is taken over.
+fn take_lock(folder: &Path, held_id: &str) -> Result<Option<PathBuf>, String> {
+    let path = folder.join(format!("{LOCK_PREFIX}{held_id}"));
+
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|elapsed| elapsed > CLAIM_TIMEOUT);
+
+                if !stale {
+                    return Ok(None);
+                }
+
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(error) => return Err(format!("claiming the held proposal failed: {error}")),
+        }
+    }
+
+    Ok(None)
 }
 
 /// Moves the file at `aside` back to `home`, unless another file took that name meanwhile.
