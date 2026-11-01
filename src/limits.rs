@@ -35,3 +35,24 @@ pub const CANDIDATES_MAX: usize = 200;
 
 /// Most bytes of the JSON a command reads from stdin (`docs links set`).
 pub const STDIN_MAX: u64 = 256 * 1024;
+
+/// Most bytes of a file an import reads (a PDF may be [`PDF_BYTES_MAX`]).
+pub const FILE_BYTES_MAX: u64 = 32 * 1024 * 1024;
+
+/// Most bytes of a PDF an import reads.
+pub const PDF_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// Most bytes of the text extracted from one document.
+pub const TEXT_BYTES_MAX: usize = 8 * 1024 * 1024;
+
+/// Most files one import takes (the files of its folders count).
+pub const FILES_PER_IMPORT_MAX: usize = 5000;
+
+/// How deep an import walks into a folder (the folder itself is depth 0).
+pub const WALK_DEPTH_MAX: usize = 16;
+
+/// Most bytes of the manifest `docs import --ndjson` reads from stdin.
+pub const MANIFEST_MAX: u64 = 4 * 1024 * 1024;
+
+/// Most seconds the PDF worker may take for one file before it is killed.
+pub const PDF_TIMEOUT_SECS: u64 = 60;

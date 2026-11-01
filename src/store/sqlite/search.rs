@@ -15,53 +15,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::documents::decode;
 use super::meta;
-use crate::limits::{CANDIDATES_MAX, QUERY_TOKENS_MAX};
+use super::sql_shared::{fts_query, keyword_sql, linked_globs, visible};
+use crate::limits::CANDIDATES_MAX;
 use crate::store::{ChunkHit, DIMS, Scope, StoreError};
-
-/// True for the documents of the scope: parameter `?{all}` is 1 for every document, else the
-/// global documents (no link) and the ones linked to the repository in `?{repo}` (NULL for none).
-pub(super) fn visible(all: usize, repo: usize) -> String {
-    format!(
-        "(?{all} = 1
-          OR NOT EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id)
-          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ?{repo}))"
-    )
-}
-
-/// The globs of the document's link to the repository in `?{repo}`: NULL when it is not linked.
-fn linked_globs(repo: usize) -> String {
-    format!("(SELECT g.globs FROM knowledge_doc_links g WHERE g.doc_id = d.id AND g.repo_key = ?{repo})")
-}
 
 /// The scope as its two statement parameters: whether every document is visible, and the
 /// repository whose links are read.
 fn bindings(scope: &Scope) -> (i64, Option<&str>) {
     (i64::from(scope.sees_everything()), scope.repo_key())
-}
-
-/// The words of `text` as an FTS5 query: `"a" OR "b"`. `None` when there is no word. The words
-/// are lowercase letters and digits, so nothing in the query is FTS5 syntax.
-fn fts_query(text: &str) -> Option<String> {
-    let mut words: Vec<String> = Vec::new();
-
-    for word in text.split(|character: char| !character.is_alphanumeric()) {
-        if word.is_empty() || words.len() >= QUERY_TOKENS_MAX {
-            continue;
-        }
-
-        let word = word.to_lowercase();
-
-        if !words.contains(&word) {
-            words.push(word);
-        }
-    }
-
-    if words.is_empty() {
-        return None;
-    }
-
-    let quoted: Vec<String> = words.iter().map(|word| format!("\"{word}\"")).collect();
-    Some(quoted.join(" OR "))
 }
 
 pub(super) fn keyword_top_k(
@@ -75,18 +36,7 @@ pub(super) fn keyword_top_k(
     };
 
     let (all, repo) = bindings(scope);
-    let sql = format!(
-        "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
-                -bm25(knowledge_chunks_fts, 4, 2, 1) AS relevance, d.updated_at, {globs}
-         FROM knowledge_chunks_fts
-         JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
-         JOIN knowledge_documents d ON d.id = c.doc_id
-         WHERE knowledge_chunks_fts MATCH ?1 AND {visible}
-         ORDER BY relevance DESC, c.id
-         LIMIT ?4",
-        globs = linked_globs(3),
-        visible = visible(2, 3),
-    );
+    let sql = keyword_sql();
 
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(params![fts, all, repo, limit(k)], hit)?;
@@ -173,35 +123,4 @@ fn dot(a: &[f32], b: &[f32]) -> f64 {
 /// `k` capped at [`CANDIDATES_MAX`], as the SQL parameter.
 fn limit(k: usize) -> i64 {
     i64::try_from(k.min(CANDIDATES_MAX)).unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn query_words_are_quoted_and_or_ed() {
-        assert_eq!(fts_query("Git CLI").as_deref(), Some("\"git\" OR \"cli\""));
-        assert_eq!(fts_query("git git").as_deref(), Some("\"git\""));
-        assert_eq!(fts_query("  ?! "), None);
-        assert_eq!(fts_query(""), None);
-    }
-
-    #[test]
-    fn query_syntax_is_dropped_into_plain_words() {
-        let query = fts_query("title:\"x\" NEAR(a b) OR NOT * -secret ^start");
-
-        assert_eq!(
-            query.as_deref(),
-            Some("\"title\" OR \"x\" OR \"near\" OR \"a\" OR \"b\" OR \"or\" OR \"not\" OR \"secret\" OR \"start\"")
-        );
-    }
-
-    #[test]
-    fn a_long_query_keeps_its_first_words() {
-        let text: Vec<String> = (0..100).map(|n| format!("w{n}")).collect();
-        let query = fts_query(&text.join(" ")).expect("query");
-
-        assert_eq!(query.matches(" OR ").count(), QUERY_TOKENS_MAX - 1);
-    }
 }

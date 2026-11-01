@@ -5,9 +5,6 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::store::StoreError;
 
-/// The keys the store keeps itself.
-const RESERVED: [&str; 3] = ["generation", "schema_version", "dims"];
-
 pub(super) fn get(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
     Ok(conn
         .query_row("SELECT value FROM knowledge_meta WHERE key = ?1", [key], |row| {
@@ -16,18 +13,7 @@ pub(super) fn get(conn: &Connection, key: &str) -> Result<Option<String>, StoreE
         .optional()?)
 }
 
-/// Fails for a key the store keeps itself.
-pub(super) fn check_settable(key: &str) -> Result<(), StoreError> {
-    if RESERVED.contains(&key) {
-        return Err(StoreError::Invalid(format!("the meta key {key} belongs to the store")));
-    }
-
-    if key.is_empty() || key.len() > 64 {
-        return Err(StoreError::Invalid("a meta key is 1-64 characters".to_owned()));
-    }
-
-    Ok(())
-}
+pub(super) use super::sql_shared::check_settable;
 
 pub(super) fn set(tx: &Transaction, key: &str, value: &str) -> Result<(), StoreError> {
     tx.execute(

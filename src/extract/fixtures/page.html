@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gateway guide &amp; limits</title>
+<style>body { color: red } h1::before { content: "<h2>x</h2>" }</style></head>
+<body>
+<nav><a href="/">Home</a> <a href="/docs">Docs</a></nav>
+<h1>Gateway guide</h1>
+<p>The gateway routes   requests
+to services.</p>
+<h2>Limits</h2>
+<p>Each key may send 100 requests per minute.</p>
+<ol><li>First <b>step</b></li><li>Second step<ul><li>nested</li></ul></li></ol>
+<pre>curl -H "X-Key: abc" https://gw/api
+curl https://gw/health</pre>
+<table><tr><th>Plan</th><th>Rate</th></tr><tr><td>free</td><td>10</td></tr></table>
+<footer>Copyright nobody</footer>
+<script>document.write("<h2>injected</h2>")</script>
+</body></html>

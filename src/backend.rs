@@ -38,10 +38,11 @@ pub enum OpenError {
 pub fn open(env: &Env, backend: &Backend, access: Access) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
     match backend {
         Backend::Sqlite => open_local(env, access),
-        other => Err(OpenError::NotBuilt(format!(
-            "{} is not supported by this build yet, use the local database",
-            other.describe()
-        ))),
+        Backend::Postgres { url } => crate::store::postgres::open_boxed(url, access, &backend.secrets()),
+        Backend::Libsql { url, token } => {
+            crate::store::libsql::open_boxed(url, token.as_deref(), access, &backend.secrets())
+        }
+        Backend::Mongodb { url } => crate::store::mongo::open_boxed(url, access, &backend.secrets()),
     }
 }
 
@@ -104,23 +105,6 @@ mod tests {
         assert!(folder.join(FILE_NAME).is_file());
 
         assert!(open(&env, &Backend::Sqlite, Access::Read).expect("read").is_some());
-    }
-
-    #[test]
-    fn a_team_database_is_not_built_yet() {
-        let env = Env::for_tests("/home/u");
-
-        for url in [
-            "postgres://u:secret@db/k",
-            "mongodb://u:secret@db/k",
-            "libsql://db.example.com",
-        ] {
-            let backend = crate::config::backend_for(Some(url.to_owned()), None).expect("backend");
-            let error = open(&env, &backend, Access::Read).err().expect("not built");
-
-            assert!(matches!(&error, OpenError::NotBuilt(message) if message.contains("not supported")));
-            assert!(!error.to_string().contains("secret"), "{error}");
-        }
     }
 
     #[test]

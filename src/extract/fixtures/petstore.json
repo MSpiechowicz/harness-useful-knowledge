@@ -1,0 +1,49 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Petstore", "version": "1.2.0", "description": "Manage pets in the store."},
+  "servers": [{"url": "https://pets.example.com/v1"}],
+  "tags": [{"name": "pets", "description": "Everything about pets"}],
+  "paths": {
+    "/pets": {
+      "get": {
+        "summary": "List pets",
+        "description": "Returns every pet, newest first.",
+        "operationId": "listPets",
+        "tags": ["pets"],
+        "parameters": [
+          {"name": "limit", "in": "query", "required": false, "description": "How many pets to return", "schema": {"type": "integer", "format": "int32"}},
+          {"$ref": "#/components/parameters/Cursor"}
+        ],
+        "responses": {
+          "200": {"description": "A page of pets", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Pet"}}}}},
+          "default": {"description": "Unexpected error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+        }
+      },
+      "post": {
+        "summary": "Create a pet",
+        "requestBody": {"required": true, "description": "The pet to add", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}},
+        "responses": {"201": {"description": "Created"}}
+      }
+    },
+    "/pets/{petId}": {
+      "parameters": [{"name": "petId", "in": "path", "required": true, "description": "The pet id", "schema": {"type": "string"}}],
+      "delete": {"summary": "Delete a pet", "deprecated": true, "responses": {"204": {"description": "Deleted"}}}
+    }
+  },
+  "components": {
+    "parameters": {"Cursor": {"name": "cursor", "in": "query", "description": "Opaque paging cursor", "schema": {"type": "string"}}},
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "description": "A pet in the store.",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer", "format": "int64", "description": "Unique id"},
+          "name": {"type": "string", "description": "The pet's name"},
+          "status": {"type": "string", "enum": ["available", "sold"]}
+        }
+      },
+      "Error": {"type": "object", "properties": {"message": {"type": "string"}}}
+    }
+  }
+}

@@ -1,0 +1,278 @@
+//! The SQL text the local SQLite file and the libSQL server share. libSQL is SQLite, so both
+//! stores keep the same tables, the same FTS5 keyword index (with its triggers) and run the same
+//! keyword, list and scope statements. They differ in the vectors only: a `BLOB` searched by brute
+//! force here, an `F32_BLOB(384)` with an ANN index there.
+//!
+//! The DDL is a macro so each store can `concat!` it into its migration (a `const`). The
+//! statements number their parameters (`?1`), so both runners bind them the same way.
+
+use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
+use crate::store::{ListQuery, RepoFilter, Sort, StoreError};
+
+/// The meta keys the store keeps itself.
+const RESERVED_META: [&str; 3] = ["generation", "schema_version", "dims"];
+
+/// Fails for a meta key a caller may not set: one the store keeps itself, or an unreasonable one.
+pub(crate) fn check_settable(key: &str) -> Result<(), StoreError> {
+    if RESERVED_META.contains(&key) {
+        return Err(StoreError::Invalid(format!("the meta key {key} belongs to the store")));
+    }
+
+    if key.is_empty() || key.len() > 64 {
+        return Err(StoreError::Invalid("a meta key is 1-64 characters".to_owned()));
+    }
+
+    Ok(())
+}
+
+/// The meta, documents and links tables of version 1 (see [`super::schema`] for what they hold).
+macro_rules! tables {
+    () => {
+        "
+CREATE TABLE knowledge_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE knowledge_documents (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    format TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    file_sha256 TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('user', 'agentApproved')),
+    warnings TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX knowledge_documents_source ON knowledge_documents (source_key);
+CREATE INDEX knowledge_documents_content ON knowledge_documents (content_sha256);
+
+CREATE TABLE knowledge_doc_links (
+    doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    repo_key TEXT NOT NULL,
+    globs TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (doc_id, repo_key)
+) WITHOUT ROWID;
+CREATE INDEX knowledge_doc_links_repo ON knowledge_doc_links (repo_key, doc_id);
+"
+    };
+}
+
+/// The FTS5 index of title, heading path and text over `knowledge_chunks` (external content), the
+/// triggers that keep it current, and the trigger that copies a retitle to the chunks.
+macro_rules! keyword_index {
+    () => {
+        "
+CREATE VIRTUAL TABLE knowledge_chunks_fts USING fts5(
+    title, heading_path, text,
+    content = 'knowledge_chunks', content_rowid = 'id',
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER knowledge_chunks_fts_insert AFTER INSERT ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_chunks_fts (rowid, title, heading_path, text)
+        VALUES (new.id, new.title, new.heading_path, new.text);
+END;
+CREATE TRIGGER knowledge_chunks_fts_delete AFTER DELETE ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_chunks_fts (knowledge_chunks_fts, rowid, title, heading_path, text)
+        VALUES ('delete', old.id, old.title, old.heading_path, old.text);
+END;
+CREATE TRIGGER knowledge_chunks_fts_update AFTER UPDATE OF title, heading_path, text ON knowledge_chunks BEGIN
+    INSERT INTO knowledge_chunks_fts (knowledge_chunks_fts, rowid, title, heading_path, text)
+        VALUES ('delete', old.id, old.title, old.heading_path, old.text);
+    INSERT INTO knowledge_chunks_fts (rowid, title, heading_path, text)
+        VALUES (new.id, new.title, new.heading_path, new.text);
+END;
+CREATE TRIGGER knowledge_documents_retitle AFTER UPDATE OF title ON knowledge_documents BEGIN
+    UPDATE knowledge_chunks SET title = new.title WHERE doc_id = new.id;
+END;
+"
+    };
+}
+
+pub(crate) use {keyword_index, tables};
+
+/// The columns of a document aliased `d`, in the order of `Document`'s fields.
+pub(crate) const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
+     d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
+
+/// A document of no repository (aliased `d`).
+pub(crate) const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
+
+/// True for the documents of the scope: parameter `?{all}` is 1 for every document, else the
+/// global documents (no link) and the ones linked to the repository in `?{repo}` (NULL for none).
+pub(crate) fn visible(all: usize, repo: usize) -> String {
+    format!(
+        "(?{all} = 1
+          OR NOT EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id)
+          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ?{repo}))"
+    )
+}
+
+/// The globs of the document's link to the repository in `?{repo}`: NULL when it is not linked.
+pub(crate) fn linked_globs(repo: usize) -> String {
+    format!("(SELECT g.globs FROM knowledge_doc_links g WHERE g.doc_id = d.id AND g.repo_key = ?{repo})")
+}
+
+/// The words of `text` as an FTS5 query: `"a" OR "b"`. `None` when there is no word. The words
+/// are lowercase letters and digits, so nothing in the query is FTS5 syntax.
+pub(crate) fn fts_query(text: &str) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+
+    for word in text.split(|character: char| !character.is_alphanumeric()) {
+        if word.is_empty() || words.len() >= QUERY_TOKENS_MAX {
+            continue;
+        }
+
+        let word = word.to_lowercase();
+
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+
+    if words.is_empty() {
+        return None;
+    }
+
+    let quoted: Vec<String> = words.iter().map(|word| format!("\"{word}\"")).collect();
+    Some(quoted.join(" OR "))
+}
+
+/// The keyword candidates of the FTS5 query `?1` for the scope `?2` (all) and `?3` (repository),
+/// at most `?4`: a word in the title counts four times, in the heading path twice, in the text once.
+/// Columns: the shared hit columns (see `ChunkHit`), the score being the negated BM25.
+pub(crate) fn keyword_sql() -> String {
+    format!(
+        "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
+                -bm25(knowledge_chunks_fts, 4, 2, 1) AS relevance, d.updated_at, {globs}
+         FROM knowledge_chunks_fts
+         JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
+         JOIN knowledge_documents d ON d.id = c.doc_id
+         WHERE knowledge_chunks_fts MATCH ?1 AND {visible}
+         ORDER BY relevance DESC, c.id
+         LIMIT ?4",
+        globs = linked_globs(3),
+        visible = visible(2, 3),
+    )
+}
+
+/// The `WHERE` clause of `query`'s filters and its numbered parameters.
+pub(crate) fn list_conditions<V: From<String>>(query: &ListQuery) -> (String, Vec<V>) {
+    let mut clauses: Vec<String> = vec!["1 = 1".to_owned()];
+    let mut params: Vec<V> = Vec::new();
+
+    match &query.filter {
+        RepoFilter::All => {}
+        RepoFilter::Global => clauses.push(GLOBAL.to_owned()),
+        RepoFilter::Repo(key) => {
+            params.push(key.clone().into());
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = ?{})",
+                params.len()
+            ));
+        }
+    }
+
+    if let Some(format) = &query.format {
+        params.push(format.clone().into());
+        clauses.push(format!("d.format = ?{}", params.len()));
+    }
+
+    let text = query.text.trim();
+
+    if !text.is_empty() {
+        params.push(format!("%{}%", escape_like(text)).into());
+        let mut matching = format!("d.title LIKE ?{} ESCAPE '\\'", params.len());
+
+        if let Some(fts) = prefix_query(text) {
+            params.push(fts.into());
+            matching.push_str(&format!(
+                " OR d.id IN (SELECT c.doc_id FROM knowledge_chunks_fts
+                              JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
+                              WHERE knowledge_chunks_fts MATCH ?{})",
+                params.len()
+            ));
+        }
+
+        clauses.push(format!("({matching})"));
+    }
+
+    (clauses.join(" AND "), params)
+}
+
+/// The page of the documents `filter` keeps, in `query`'s order. The limit and the offset are the
+/// last two of the `params` numbered parameters.
+pub(crate) fn page_sql(filter: &str, query: &ListQuery, params: usize) -> String {
+    let order = match query.sort {
+        Sort::Title => "d.title COLLATE NOCASE",
+        Sort::Updated => "d.updated_at",
+        Sort::Size => "d.bytes",
+    };
+    let direction = if query.descending { "DESC" } else { "ASC" };
+
+    format!(
+        "SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE {filter}
+         ORDER BY {order} {direction}, d.id {direction} LIMIT ?{} OFFSET ?{}",
+        params - 1,
+        params
+    )
+}
+
+/// The rows of a page the store may return: `limit` capped at [`LIST_PAGE_MAX`].
+pub(crate) fn page_limit(query: &ListQuery) -> i64 {
+    i64::try_from(query.limit.min(LIST_PAGE_MAX)).unwrap_or(0)
+}
+
+/// `text` with the `LIKE` wildcards written out, for `ESCAPE '\'`.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// The words of `text` as an FTS5 query that wants all of them, each as a prefix:
+/// `"api"* "gat"*`. `None` when there is no word.
+fn prefix_query(text: &str) -> Option<String> {
+    let words: Vec<String> = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(QUERY_TOKENS_MAX)
+        .map(|word| format!("\"{}\"*", word.to_lowercase()))
+        .collect();
+
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_words_are_quoted_and_or_ed() {
+        assert_eq!(fts_query("Git CLI").as_deref(), Some("\"git\" OR \"cli\""));
+        assert_eq!(fts_query("git git").as_deref(), Some("\"git\""));
+        assert_eq!(fts_query("  ?! "), None);
+        assert_eq!(fts_query(""), None);
+    }
+
+    #[test]
+    fn query_syntax_is_dropped_into_plain_words() {
+        let query = fts_query("title:\"x\" NEAR(a b) OR NOT * -secret ^start");
+
+        assert_eq!(
+            query.as_deref(),
+            Some("\"title\" OR \"x\" OR \"near\" OR \"a\" OR \"b\" OR \"or\" OR \"not\" OR \"secret\" OR \"start\"")
+        );
+    }
+
+    #[test]
+    fn a_long_query_keeps_its_first_words() {
+        let text: Vec<String> = (0..100).map(|n| format!("w{n}")).collect();
+        let query = fts_query(&text.join(" ")).expect("query");
+
+        assert_eq!(query.matches(" OR ").count(), QUERY_TOKENS_MAX - 1);
+    }
+}

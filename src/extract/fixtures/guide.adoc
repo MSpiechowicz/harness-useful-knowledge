@@ -1,0 +1,32 @@
+= Gateway Guide
+Jane Doe <jane@example.com>
+:toc:
+:icons: font
+
+A short intro to the gateway.
+
+== Install
+
+Install with the package manager.
+
+[source,bash]
+----
+apt install gateway
+
+gateway --version
+----
+
+// a comment that is dropped
+include::shared.adoc[]
+
+=== Linux
+
+* Debian
+* Ubuntu
+
+== Reference
+
+|===
+|Flag |Meaning
+|-v |verbose
+|===

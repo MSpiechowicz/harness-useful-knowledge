@@ -45,10 +45,35 @@ rustls-native-certs = "0.8.5"
 mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver", "sync"] }
 # The libSQL team backend (sqld, Turso): a blocking HTTP client for the Hrana pipeline API.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
+# The ingestion: token counts with the e5 tokenizer (no Oniguruma C library), the content and chunk hashes.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+sha2 = "0.11.1"
+# The extractors: Markdown, HTML (the tokenizer only, no DOM), YAML for OpenAPI, PDF in a worker process
+# and the NFKC normalisation of the PDF text.
+pulldown-cmark = { version = "0.13.6", default-features = false }
+html5ever = "0.39.0"
+saphyr = { version = "0.3.3", default-features = false }
+pdf-extract = "0.12.1"
+unicode-normalization = "0.1.25"
+# SIGTERM, SIGHUP and Ctrl-C cancel an import between two documents.
+ctrlc = { version = "3.5.2", features = ["termination"] }
+# The embedder (`harness-knowledge embedder`): the multilingual e5 model runs on tract (pure Rust, no
+# native runtime to download) with the tokenizer above, and every `harness-knowledge mcp` asks it
+# over a local socket.
+tract-onnx = "0.23.9"
+interprocess = "2.4.6"
+# Returns the freed model memory to the operating system (glibc keeps it), so the embedder's idle
+# unload gives it back.
+mimalloc = "0.1"
 
 # Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
+
+# The security descriptor string and the secret name of the embedder's named pipe (see `src/embed/pipe.rs`).
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
+getrandom = "0.4.3"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

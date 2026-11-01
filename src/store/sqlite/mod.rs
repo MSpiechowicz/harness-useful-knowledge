@@ -16,6 +16,7 @@ mod listing;
 mod meta;
 pub mod schema;
 mod search;
+pub(crate) mod sql_shared;
 #[cfg(test)]
 mod tests;
 

@@ -4,43 +4,25 @@
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use super::documents::{COLUMNS, document, links_of, links_of_many};
+use super::documents::{document, links_of, links_of_many};
+use super::sql_shared::{DOCUMENT_COLUMNS, GLOBAL, list_conditions, page_limit, page_sql};
 use super::{meta, schema};
-use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
-use crate::store::{Chunk, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts, RepoFilter};
-use crate::store::{Section, Sort, Stats, StoreError};
-
-/// A document of no repository (aliased `d`).
-const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
+use crate::store::{Chunk, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts};
+use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(conn: &Connection, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = conditions(query);
+    let (filter, mut params) = list_conditions::<Value>(query);
     let total: i64 = conn.query_row(
         &format!("SELECT count(*) FROM knowledge_documents d WHERE {filter}"),
         params_from_iter(params.iter()),
         |row| row.get(0),
     )?;
 
-    let order = match query.sort {
-        Sort::Title => "d.title COLLATE NOCASE",
-        Sort::Updated => "d.updated_at",
-        Sort::Size => "d.bytes",
-    };
-    let direction = if query.descending { "DESC" } else { "ASC" };
-
-    params.push(Value::Integer(
-        i64::try_from(query.limit.min(LIST_PAGE_MAX)).unwrap_or(0),
-    ));
+    params.push(Value::Integer(page_limit(query)));
     params.push(Value::Integer(i64::try_from(query.offset).unwrap_or(i64::MAX)));
 
-    let sql = format!(
-        "SELECT {COLUMNS} FROM knowledge_documents d WHERE {filter}
-         ORDER BY {order} {direction}, d.id {direction} LIMIT ?{} OFFSET ?{}",
-        params.len() - 1,
-        params.len()
-    );
-
+    let sql = page_sql(&filter, query, params.len());
     let mut statement = conn.prepare(&sql)?;
     let docs: Vec<_> = statement
         .query_map(params_from_iter(params.iter()), document)?
@@ -63,71 +45,9 @@ pub(super) fn list(conn: &Connection, query: &ListQuery) -> Result<DocumentPage,
     })
 }
 
-/// The `WHERE` clause of `query`'s filters and its numbered parameters.
-fn conditions(query: &ListQuery) -> (String, Vec<Value>) {
-    let mut clauses: Vec<String> = vec!["1 = 1".to_owned()];
-    let mut params: Vec<Value> = Vec::new();
-
-    match &query.filter {
-        RepoFilter::All => {}
-        RepoFilter::Global => clauses.push(GLOBAL.to_owned()),
-        RepoFilter::Repo(key) => {
-            params.push(Value::Text(key.clone()));
-            clauses.push(format!(
-                "EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = ?{})",
-                params.len()
-            ));
-        }
-    }
-
-    if let Some(format) = &query.format {
-        params.push(Value::Text(format.clone()));
-        clauses.push(format!("d.format = ?{}", params.len()));
-    }
-
-    let text = query.text.trim();
-
-    if !text.is_empty() {
-        params.push(Value::Text(format!("%{}%", escape_like(text))));
-        let mut matching = format!("d.title LIKE ?{} ESCAPE '\\'", params.len());
-
-        if let Some(fts) = prefix_query(text) {
-            params.push(Value::Text(fts));
-            matching.push_str(&format!(
-                " OR d.id IN (SELECT c.doc_id FROM knowledge_chunks_fts
-                              JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
-                              WHERE knowledge_chunks_fts MATCH ?{})",
-                params.len()
-            ));
-        }
-
-        clauses.push(format!("({matching})"));
-    }
-
-    (clauses.join(" AND "), params)
-}
-
-/// `text` with the `LIKE` wildcards written out, for `ESCAPE '\'`.
-fn escape_like(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-}
-
-/// The words of `text` as an FTS5 query that wants all of them, each as a prefix:
-/// `"api"* "gat"*`. `None` when there is no word.
-fn prefix_query(text: &str) -> Option<String> {
-    let words: Vec<String> = text
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .take(QUERY_TOKENS_MAX)
-        .map(|word| format!("\"{}\"*", word.to_lowercase()))
-        .collect();
-
-    (!words.is_empty()).then(|| words.join(" "))
-}
-
 /// Document `id` with its links, and what `detail` asks for.
 pub(super) fn get(conn: &Connection, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM knowledge_documents d WHERE d.id = ?1");
+    let sql = format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.id = ?1");
     let Some(doc) = conn.query_row(&sql, [id], document).optional()? else {
         return Ok(None);
     };

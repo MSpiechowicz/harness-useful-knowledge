@@ -1,0 +1,355 @@
+//! [`KnowledgeStore`] on a libSQL server (`sqld` self-hosted, or Turso), so a whole team shares one
+//! database.
+//!
+//! libSQL is SQLite, so this backend keeps the tables, the FTS5 keyword index and the keyword and
+//! list statements of [`crate::store::sqlite`] (shared through `sql_shared`), and differs in the
+//! vectors only: an `F32_BLOB(384)` column with a cosine ANN index, searched by `vector_top_k`
+//! (see [`search`]). Requests go over the server's HTTP pipeline API ([`hrana`]): a write holds
+//! one server connection from `BEGIN IMMEDIATE` to `COMMIT`, so two clients writing or migrating
+//! at once queue, and each write re-reads the schema version under that lock, so a client
+//! connected before a newer server migrated stops writing ([`StoreError::NewerSchema`]).
+//!
+//! The connection is opened lazily and kept: the HTTP agent reuses its sockets and opens a new
+//! one when a kept one broke, a read is repeated once on such a break, and every write starts on
+//! a fresh stream. A write whose `COMMIT` got no answer may have been applied: it fails saying so
+//! and is never sent again.
+//!
+//! Opening never writes unless asked: [`LibsqlStore::open_read_only`] answers `None` for a
+//! database with no knowledge tables, [`LibsqlStore::open_existing`] migrates only one that has
+//! them, and [`LibsqlStore::connect`] creates them.
+//!
+//! Inserting a vector updates the ANN graph, which dominates a write: a document of 4000 embedded
+//! chunks takes about two minutes in its one transaction on a laptop-class server (the transport
+//! is a few seconds of it), and another writer waits for the lock meanwhile.
+//!
+//! TLS is required except for a server on the same machine ([`endpoint`]); the token is sent as
+//! `Authorization: Bearer` and appears in no message, like the URL. Proxy variables are ignored
+//! ([`hrana`]). [`probe`] reports what the server can do, for `check`.
+
+mod documents;
+mod endpoint;
+mod hrana;
+mod listing;
+mod meta;
+mod probe;
+mod schema;
+mod search;
+mod sql;
+#[cfg(test)]
+mod tests;
+mod wire;
+
+use std::collections::HashMap;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use hrana::{Client, Stream};
+use sql::Sql;
+use wire::{Outcome, execute};
+
+pub use probe::{Capabilities, Trouble, probe};
+pub use schema::SCHEMA_VERSION;
+
+use crate::backend::{Access, OpenError};
+use crate::config::Secrets;
+
+use super::{ChunkHit, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
+use super::{RepoCounts, Scope, Stats, StoreError, clean};
+
+/// How long a write keeps asking for a lock the server reports busy.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause between those attempts.
+const BUSY_RETRY: Duration = Duration::from_millis(50);
+
+/// What opening may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Nothing: a database without tables is `None`, an old one an error.
+    Read,
+    /// Migrates a database that has tables, `None` for one that has none.
+    Existing,
+    /// Creates the tables and migrates.
+    Create,
+}
+
+/// The team backend on a libSQL server. See the module docs.
+pub struct LibsqlStore {
+    client: Client,
+    newer: bool,
+    /// False for a store opened with [`LibsqlStore::open_read_only`]: its writes are refused.
+    writable: bool,
+}
+
+impl std::fmt::Debug for LibsqlStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibsqlStore")
+            .field("newer", &self.newer)
+            .field("writable", &self.writable)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LibsqlStore {
+    /// Connects to the server at `url` (`libsql://`, `https://`, or `http://` for localhost only)
+    /// with an optional access token, creating the tables when the database has none and
+    /// migrating it. A database written by a newer server connects, but every operation then
+    /// fails with [`StoreError::NewerSchema`].
+    pub fn connect(url: &str, token: Option<&str>) -> Result<Self, StoreError> {
+        Self::open(url, token, Mode::Create)?
+            .ok_or_else(|| StoreError::Backend("the database was not opened".to_owned()))
+    }
+
+    /// Like [`Self::connect`] when the database has its tables, `None` when it has none yet.
+    pub fn open_existing(url: &str, token: Option<&str>) -> Result<Option<Self>, StoreError> {
+        Self::open(url, token, Mode::Existing)
+    }
+
+    /// Connects without creating or migrating anything: `None` when the database has no tables
+    /// yet, an error when it is from an older server that has not upgraded it.
+    pub fn open_read_only(url: &str, token: Option<&str>) -> Result<Option<Self>, StoreError> {
+        Self::open(url, token, Mode::Read)
+    }
+
+    /// True when the database was written by a newer server.
+    pub fn is_newer(&self) -> bool {
+        self.newer
+    }
+
+    fn open(url: &str, token: Option<&str>, mode: Mode) -> Result<Option<Self>, StoreError> {
+        let client = Client::new(endpoint::parse(url)?, token)?;
+        let found = schema::version(&mut client.single())?;
+        let mut store = Self {
+            client,
+            newer: false,
+            writable: mode != Mode::Read,
+        };
+
+        match (found, mode) {
+            (None, Mode::Read | Mode::Existing) => return Ok(None),
+            (Some(version), Mode::Read) if version < SCHEMA_VERSION => {
+                return Err(StoreError::Backend(
+                    "the database is from an older server and has not been upgraded yet".to_owned(),
+                ));
+            }
+            (Some(SCHEMA_VERSION), _) => {}
+            (Some(version), _) if version > SCHEMA_VERSION => store.newer = true,
+            _ => store.newer = store.migrate()?,
+        }
+
+        Ok(Some(store))
+    }
+
+    /// Brings the database to [`SCHEMA_VERSION`] under the write lock (another client may have
+    /// migrated meanwhile). True when it turned out to be from a newer server.
+    fn migrate(&mut self) -> Result<bool, StoreError> {
+        self.transact(|db| match schema::version(db)? {
+            Some(version) if version > SCHEMA_VERSION => Ok(true),
+            Some(SCHEMA_VERSION) => Ok(false),
+            found => {
+                schema::upgrade(db, found.unwrap_or(0))?;
+                Ok(false)
+            }
+        })
+    }
+
+    fn check_version(&self) -> Result<(), StoreError> {
+        if self.newer {
+            return Err(StoreError::NewerSchema);
+        }
+
+        Ok(())
+    }
+
+    /// Runs `op` on a one-shot stream: every statement is its own request.
+    fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.check_version()?;
+        op(&mut self.client.single())
+    }
+
+    /// Runs `op` in a write transaction that takes the write lock first, committed when `op`
+    /// succeeds and rolled back when it fails. The server's schema version is re-read under the
+    /// lock, and the generation grows with every committed write.
+    fn write<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.check_version()?;
+
+        if !self.writable {
+            return Err(StoreError::Backend("the database was opened read-only".to_owned()));
+        }
+
+        let written = self.transact(|db| {
+            let version: Option<i64> = meta::get(db, "schema_version")?.and_then(|text| text.parse().ok());
+
+            if version.is_some_and(|version| version > SCHEMA_VERSION) {
+                return Err(StoreError::NewerSchema);
+            }
+
+            let done = op(db)?;
+            meta::bump(db)?;
+
+            Ok(done)
+        });
+
+        if matches!(written, Err(StoreError::NewerSchema)) {
+            self.newer = true;
+        }
+
+        written
+    }
+
+    /// Runs `op` between `BEGIN IMMEDIATE` and `COMMIT` on one server connection, rolling back
+    /// when it fails. The commit is sent once; see [`hrana::Stream::commit`].
+    fn transact<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let mut stream = begin(&self.client)?;
+
+        match op(&mut stream) {
+            Ok(done) => {
+                stream.commit()?;
+                Ok(done)
+            }
+            Err(error) => {
+                // The error that ended the transaction is the one to report.
+                stream.rollback().ok();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl KnowledgeStore for LibsqlStore {
+    fn meta(&mut self, key: &str) -> Result<Option<String>, StoreError> {
+        self.read(|db| meta::get(db, key))
+    }
+
+    fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        super::sqlite::sql_shared::check_settable(key)?;
+        self.write(|db| meta::set(db, key, value))
+    }
+
+    fn generation(&mut self) -> Result<i64, StoreError> {
+        self.read(meta::generation)
+    }
+
+    fn put_document(&mut self, doc: &Document, chunks: &[super::Chunk], links: &[Link]) -> Result<i64, StoreError> {
+        let title = clean::title(&doc.title)?;
+        let links = clean::links(links)?;
+        clean::chunks(chunks)?;
+
+        self.write(|db| documents::put(db, doc, &title, chunks, &links))
+    }
+
+    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
+        self.read(|db| documents::find(db, "content_sha256", sha))
+    }
+
+    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
+        self.read(|db| documents::find(db, "source_key", key))
+    }
+
+    fn reusable_embeddings(
+        &mut self,
+        model_id: &str,
+        chunk_shas: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, StoreError> {
+        self.read(|db| documents::reusable_embeddings(db, model_id, chunk_shas))
+    }
+
+    fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
+        let links = clean::links(links)?;
+
+        self.write(|db| documents::set_links(db, id, &links))
+    }
+
+    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+        let title = clean::title(title)?;
+
+        self.write(|db| documents::rename(db, id, &title))
+    }
+
+    fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
+        self.write(|db| documents::delete(db, ids))
+    }
+
+    fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+        self.read(|db| listing::list(db, query))
+    }
+
+    fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
+        self.read(|db| listing::get(db, id, detail))
+    }
+
+    fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        self.read(|db| search::keyword_top_k(db, query, scope, k))
+    }
+
+    fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        self.read(|db| search::vector_top_k(db, vector, scope, k))
+    }
+
+    fn repos(&mut self) -> Result<RepoCounts, StoreError> {
+        self.read(listing::repos)
+    }
+
+    fn stats(&mut self) -> Result<Stats, StoreError> {
+        self.read(listing::stats)
+    }
+}
+
+/// A stream inside `BEGIN IMMEDIATE`, with foreign keys enforced (deleting a document relies on
+/// them to remove its chunks and links; the pragma is a no-op inside a transaction, so it goes
+/// first). A server that rejects the pragma gets no write. The server queues a writer while
+/// another holds the lock; a busy answer is retried until [`BUSY_TIMEOUT`].
+fn begin(client: &Client) -> Result<Stream<'_>, StoreError> {
+    let mut stream = client.stream();
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+
+    let mut outcomes = stream.send(vec![execute("PRAGMA foreign_keys = ON"), execute("BEGIN IMMEDIATE")])?;
+    let mut started = outcomes.remove(1);
+
+    if let Outcome::Error { error } = outcomes.remove(0) {
+        stream.close();
+        return Err(StoreError::Backend(format!(
+            "the libSQL server rejected PRAGMA foreign_keys = ON ({}), which deleting a document needs to remove \
+             its chunks, so nothing was written",
+            error.code().unwrap_or("no error code")
+        )));
+    }
+
+    loop {
+        match started {
+            Outcome::Ok { .. } => return Ok(stream),
+            Outcome::Error { error } if error.is_busy() && Instant::now() < deadline => {
+                thread::sleep(BUSY_RETRY);
+                started = stream.send(vec![execute("BEGIN IMMEDIATE")])?.remove(0);
+            }
+            Outcome::Error { error } => {
+                stream.close();
+                return Err(error.into_store_error());
+            }
+        }
+    }
+}
+
+/// The store `backend::open` hands out for a libSQL URL: `None` when `access` does not create the
+/// tables and the database has none. A failure is one readable line without the URL or the token
+/// (every secret of them is scrubbed from it).
+pub fn open_boxed(
+    url: &str,
+    token: Option<&str>,
+    access: Access,
+    secrets: &Secrets,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    let opened = match access {
+        Access::Read => LibsqlStore::open_read_only(url, token),
+        Access::Existing => LibsqlStore::open_existing(url, token),
+        Access::Create => LibsqlStore::connect(url, token).map(Some),
+    };
+
+    match opened {
+        Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
+        Err(StoreError::NoFts5) => Err(OpenError::NoFts5),
+        Err(error) => Err(OpenError::Failed(
+            secrets.scrub(&format!("cannot open the libSQL database: {error}")),
+        )),
+    }
+}

@@ -6,6 +6,7 @@
 
 use rusqlite::{Connection, TransactionBehavior};
 
+use super::sql_shared::{keyword_index, tables};
 use crate::store::DIMS;
 
 /// The schema version this server writes: how many entries [`MIGRATIONS`] has.
@@ -37,38 +38,9 @@ pub const EMBEDDING_BYTES: usize = DIMS * 4;
 ///   model.
 /// - `knowledge_chunks_fts`: the FTS5 index of title, heading path and text, kept current by
 ///   triggers.
-const V1: &str = "
-CREATE TABLE knowledge_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-) WITHOUT ROWID;
-
-CREATE TABLE knowledge_documents (
-    id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    source_name TEXT NOT NULL,
-    source_key TEXT NOT NULL,
-    format TEXT NOT NULL,
-    content_sha256 TEXT NOT NULL,
-    file_sha256 TEXT NOT NULL,
-    bytes INTEGER NOT NULL,
-    chunk_count INTEGER NOT NULL,
-    origin TEXT NOT NULL CHECK (origin IN ('user', 'agentApproved')),
-    warnings TEXT NOT NULL DEFAULT '[]',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-CREATE INDEX knowledge_documents_source ON knowledge_documents (source_key);
-CREATE INDEX knowledge_documents_content ON knowledge_documents (content_sha256);
-
-CREATE TABLE knowledge_doc_links (
-    doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
-    repo_key TEXT NOT NULL,
-    globs TEXT NOT NULL DEFAULT '[]',
-    PRIMARY KEY (doc_id, repo_key)
-) WITHOUT ROWID;
-CREATE INDEX knowledge_doc_links_repo ON knowledge_doc_links (repo_key, doc_id);
-
+const V1: &str = concat!(
+    tables!(),
+    "
 CREATE TABLE knowledge_chunks (
     id INTEGER PRIMARY KEY,
     doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
@@ -87,32 +59,12 @@ CREATE TABLE knowledge_chunks (
     CHECK (embedding IS NULL OR length(embedding) = 1536)
 );
 CREATE INDEX knowledge_chunks_sha ON knowledge_chunks (chunk_sha, model_id);
-
-CREATE VIRTUAL TABLE knowledge_chunks_fts USING fts5(
-    title, heading_path, text,
-    content = 'knowledge_chunks', content_rowid = 'id',
-    tokenize = 'unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER knowledge_chunks_fts_insert AFTER INSERT ON knowledge_chunks BEGIN
-    INSERT INTO knowledge_chunks_fts (rowid, title, heading_path, text)
-        VALUES (new.id, new.title, new.heading_path, new.text);
-END;
-CREATE TRIGGER knowledge_chunks_fts_delete AFTER DELETE ON knowledge_chunks BEGIN
-    INSERT INTO knowledge_chunks_fts (knowledge_chunks_fts, rowid, title, heading_path, text)
-        VALUES ('delete', old.id, old.title, old.heading_path, old.text);
-END;
-CREATE TRIGGER knowledge_chunks_fts_update AFTER UPDATE OF title, heading_path, text ON knowledge_chunks BEGIN
-    INSERT INTO knowledge_chunks_fts (knowledge_chunks_fts, rowid, title, heading_path, text)
-        VALUES ('delete', old.id, old.title, old.heading_path, old.text);
-    INSERT INTO knowledge_chunks_fts (rowid, title, heading_path, text)
-        VALUES (new.id, new.title, new.heading_path, new.text);
-END;
-CREATE TRIGGER knowledge_documents_retitle AFTER UPDATE OF title ON knowledge_documents BEGIN
-    UPDATE knowledge_chunks SET title = new.title WHERE doc_id = new.id;
-END;
-
+",
+    keyword_index!(),
+    "
 INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1'), ('dims', '384'), ('generation', '0');
-";
+"
+);
 
 /// The migrations in order: entry `n` takes a database from version `n` to `n + 1`.
 const MIGRATIONS: [&str; 1] = [V1];

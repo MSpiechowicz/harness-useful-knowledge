@@ -1,0 +1,46 @@
+swagger: "2.0"
+info:
+  title: Legacy shop
+  version: "1.0"
+host: shop.example.com
+basePath: /api
+schemes: [https]
+paths:
+  /orders:
+    get:
+      summary: List orders
+      parameters:
+        - name: status
+          in: query
+          type: string
+          description: Filter by status
+      responses:
+        200:
+          description: The orders
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Order"
+    post:
+      summary: Place an order
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/Order"
+      responses:
+        201:
+          description: Placed
+definitions:
+  Order:
+    type: object
+    description: An order.
+    required: [id]
+    properties:
+      id:
+        type: integer
+        description: The order id
+      total:
+        type: number
+        format: float

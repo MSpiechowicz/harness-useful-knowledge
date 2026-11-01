@@ -16,6 +16,9 @@
 pub mod clean;
 pub mod fuse;
 pub mod glob;
+pub mod libsql;
+pub mod mongo;
+pub mod postgres;
 pub mod rank;
 pub mod sqlite;
 #[cfg(test)]

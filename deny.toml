@@ -8,6 +8,9 @@ ignore = [
   # paste is unmaintained (archived), but it is only a proc macro that tokenizers 0.23 uses at
   # build time (the embedder's tokenizer). No safe upgrade exists.
   "RUSTSEC-2024-0436",
+  # ttf-parser is unmaintained, but it only reads the fonts embedded in a PDF (pdf-extract via lopdf),
+  # and that runs in the isolated extract-worker process. No safe upgrade exists.
+  "RUSTSEC-2026-0192",
 ]
 
 [licenses]

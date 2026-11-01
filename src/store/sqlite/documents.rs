@@ -7,14 +7,11 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::schema::EMBEDDING_BYTES;
+use super::sql_shared::DOCUMENT_COLUMNS;
 use crate::limits::DELETE_IDS_MAX;
 use crate::store::{Chunk, Document, Link, Origin, StoreError};
 
-/// The columns [`document`] reads, of a document aliased `d`.
-pub(super) const COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
-     d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
-
-/// A [`Document`] from a row of [`COLUMNS`].
+/// A [`Document`] from a row of [`DOCUMENT_COLUMNS`].
 pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
     let origin: String = row.get(11)?;
     let warnings: String = row.get(12)?;
@@ -188,7 +185,8 @@ pub(super) fn delete(tx: &Transaction, ids: &[i64]) -> Result<usize, StoreError>
 
 /// The oldest document whose `column` (`content_sha256` or `source_key`) is `value`.
 pub(super) fn find(conn: &Connection, column: &str, value: &str) -> Result<Option<Document>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1");
+    let sql =
+        format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1");
 
     Ok(conn.query_row(&sql, [value], document).optional()?)
 }

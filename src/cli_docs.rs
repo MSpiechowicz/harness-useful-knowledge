@@ -19,6 +19,9 @@
 //! - `docs rename --json ID --title TITLE` (1 to 300 characters) prints `{"id", "title"}`.
 //! - `docs delete --json ID...` deletes the documents, their chunks and index entries, and prints
 //!   `{"deleted": N}` (ids that do not exist count nothing).
+//! - `docs import --ndjson` reads a manifest from stdin and prints one JSON event per line while it
+//!   imports, `docs reindex --json (ID... | --all)` embeds the chunks that have no vector (see
+//!   [`import`]).
 //! - `repos --json` prints `{"global": N, "repos": [{"key", "docs"}]}`, `stats --json` the counts
 //!   of [`overview::stats`], `project-key --json --path PATH` the repository key of a folder, and
 //!   `check --json` what the database can do (see [`check`]).
@@ -28,6 +31,7 @@
 //! line. Other exit codes and errors as in [`crate::cli`].
 
 mod check;
+mod import;
 mod json;
 mod overview;
 
@@ -47,7 +51,8 @@ use crate::support::Env;
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
                          [--sort title|updated|size] [--desc] [--page N] [--per-page N] | docs get --json ID \
                          [--sections] [--chunk CID] | docs links set --json ID < links.json | docs rename --json ID \
-                         --title TITLE | docs delete --json ID... | repos --json | stats --json | project-key --json \
+                         --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
+                         --json (ID... | --all) | repos --json | stats --json | project-key --json \
                          --path PATH | check --json";
 
 /// Where a command runs: the environment and the database it reads.
@@ -160,7 +165,11 @@ fn run(args: &[Option<&str>], command: Command) -> ExitCode {
 fn finish(reply: Reply) -> ExitCode {
     match reply {
         Ok(done) => {
-            println!("{}", done.json);
+            // A command that printed its own output (the import's events) has no object to print.
+            if !done.json.is_null() {
+                println!("{}", done.json);
+            }
+
             ExitCode::from(done.code)
         }
         Err(Failure::Usage) => cli::usage(USAGE),
@@ -178,6 +187,8 @@ pub fn docs_reply(context: &Context, args: &[Option<&str>], input: &mut dyn Read
         [Some("links"), Some("set"), rest @ ..] => links_set(context, rest, input),
         [Some("rename"), rest @ ..] => rename(context, rest),
         [Some("delete"), rest @ ..] => delete(context, rest),
+        [Some("import"), rest @ ..] => import::import(context, rest, input),
+        [Some("reindex"), rest @ ..] => import::reindex(context, rest),
         _ => Err(Failure::Usage),
     }
 }

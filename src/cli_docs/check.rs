@@ -17,6 +17,8 @@ use crate::backend::{self, Access};
 use crate::cli::Args;
 use crate::config::Backend;
 use crate::store::DIMS;
+use crate::store::libsql::{self, Trouble};
+use crate::store::postgres::{self, Fault, Problem};
 use crate::store::sqlite::{fts5_available, schema::SCHEMA_VERSION};
 
 pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
@@ -28,10 +30,9 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
 
     match context.backend {
         Backend::Sqlite => local(context),
-        other => Err(Failure::Unsupported(format!(
-            "{} is not supported by this build yet, use the local database",
-            other.describe()
-        ))),
+        Backend::Postgres { url } => postgres_check(context, url),
+        Backend::Libsql { url, token } => libsql_check(context, url, token.as_deref()),
+        Backend::Mongodb { url } => mongodb_check(context, url),
     }
 }
 
@@ -82,4 +83,268 @@ fn local(context: &Context) -> Reply {
 
 fn capabilities(keyword: bool) -> Value {
     json!({ "keyword": keyword, "vector": true, "vectorIndex": "ready" })
+}
+
+/// `check` of a PostgreSQL team database (see [`postgres::probe`], which changes nothing).
+///
+/// Same JSON as the local file, with `schema` the version stored (or the one a new database gets).
+/// A problem prints `ok: false`, `problem` (`no-pgvector`, `pgvector-no-privilege`,
+/// `pgvector-too-old`, `index-building`, `unreachable` or `auth`) and a `message`, and exits 3.
+/// `capabilities` then says what is known to work: the keyword index when the server answered, the
+/// vector search only when pgvector and its index are fine, and `vectorIndex` is `building` or
+/// `missing`.
+fn postgres_check(context: &Context, url: &str) -> Reply {
+    let secrets = context.backend.secrets();
+    let name = backend::name(context.backend);
+
+    match postgres::probe(url) {
+        Ok(found) => {
+            let mut model = json!({ "dims": DIMS });
+
+            if let Some(id) = found.model_id {
+                model["id"] = Value::String(id);
+            }
+
+            Ok(Done::ok(json!({
+                "ok": true,
+                "backend": name,
+                "schema": found.schema.unwrap_or(postgres::schema::SCHEMA_VERSION),
+                "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
+                "model": model,
+            })))
+        }
+        Err(Fault::Problem(problem)) => {
+            let reached = !matches!(problem, Problem::Unreachable(_) | Problem::Auth);
+            let index = if problem == Problem::IndexBuilding {
+                "building"
+            } else {
+                "missing"
+            };
+
+            Ok(Done {
+                json: json!({
+                    "ok": false,
+                    "backend": name,
+                    "schema": postgres::schema::SCHEMA_VERSION,
+                    "capabilities": { "keyword": reached, "vector": false, "vectorIndex": index },
+                    "model": { "dims": DIMS },
+                    "problem": problem.code(),
+                    "message": secrets.scrub(&problem.message()),
+                }),
+                code: 3,
+            })
+        }
+        Err(Fault::Store(error)) => Err(Failure::Failed(secrets.scrub(&error.to_string()))),
+    }
+}
+
+/// `check` of a libSQL team database (see [`libsql::probe`], which changes nothing).
+///
+/// Same JSON as the local file, with `schema` the version stored (or the one a new database gets).
+/// A problem prints `ok: false`, `problem` (`libsql-no-vector`, `no-fts5`, `unreachable` or `auth`)
+/// and a `message`, and exits 3. `capabilities` then says what the server answered: `keyword` and
+/// `vector` as probed (both false when it could not be asked), and `vectorIndex` is `missing`
+/// when vectors do not work.
+fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
+    let secrets = context.backend.secrets();
+    let name = backend::name(context.backend);
+
+    let problem = |code: &str, message: &str, keyword: bool, vector: bool| Done {
+        json: json!({
+            "ok": false,
+            "backend": name,
+            "schema": libsql::SCHEMA_VERSION,
+            "capabilities": {
+                "keyword": keyword,
+                "vector": vector,
+                "vectorIndex": if vector { "ready" } else { "missing" },
+            },
+            "model": { "dims": DIMS },
+            "problem": code,
+            "message": secrets.scrub(message),
+        }),
+        code: 3,
+    };
+
+    let found = match libsql::probe(url, token) {
+        Ok(found) => found,
+        Err(Trouble::Auth) => {
+            let message = "the libSQL server refused the token, check the token of the database settings";
+            return Ok(problem("auth", message, false, false));
+        }
+        Err(Trouble::Unreachable(message)) => return Ok(problem("unreachable", &message, false, false)),
+        Err(Trouble::Invalid(message)) => return Err(Failure::Failed(secrets.scrub(&message))),
+    };
+
+    if !found.vector {
+        let message = "this libSQL server has no vector support (F32_BLOB, vector32, vector_top_k), use a libSQL \
+                       server build that has it";
+        return Ok(problem("libsql-no-vector", message, found.keyword, false));
+    }
+
+    if !found.keyword {
+        let message = "this libSQL server has no FTS5 full-text search, so the keyword index cannot be kept";
+        return Ok(problem("no-fts5", message, false, true));
+    }
+
+    let (schema, model_id) = match context.open(Access::Read)? {
+        Some(mut store) => {
+            let schema = store
+                .meta("schema_version")?
+                .and_then(|version| version.parse::<i64>().ok());
+            (schema.unwrap_or(libsql::SCHEMA_VERSION), store.meta("model_id")?)
+        }
+        None => (libsql::SCHEMA_VERSION, None),
+    };
+
+    let mut model = json!({ "dims": DIMS });
+
+    if let Some(id) = model_id {
+        model["id"] = Value::String(id);
+    }
+
+    Ok(Done::ok(json!({
+        "ok": true,
+        "backend": name,
+        "schema": schema,
+        "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
+        "model": model,
+    })))
+}
+
+/// `check` of a MongoDB team database (see [`crate::store::mongo::probe`], which changes nothing).
+///
+/// Same JSON as the local file, with `schema` the version stored (or the one a new database gets).
+/// A problem prints `ok: false`, `problem` (`no-mongot`, `index-building`, `unreachable` or `auth`)
+/// and a `message`, and exits 3. `capabilities` then says what is known to work: with `no-mongot`
+/// neither search, with `index-building` the keyword search when its index answers, and
+/// `vectorIndex` is `building` or `missing`. A database nobody wrote to yet is ready: its first
+/// import creates the two search indexes.
+fn mongodb_check(context: &Context, url: &str) -> Reply {
+    use crate::store::mongo::probe::probe;
+    use crate::store::mongo::schema::{IndexState, SCHEMA_VERSION as MONGO_SCHEMA};
+
+    let secrets = context.backend.secrets();
+    let name = backend::name(context.backend);
+
+    let problem = |code: &str, message: &str, keyword: bool, vector: (bool, &str)| Done {
+        json: json!({
+            "ok": false,
+            "backend": name,
+            "schema": MONGO_SCHEMA,
+            "capabilities": { "keyword": keyword, "vector": vector.0, "vectorIndex": vector.1 },
+            "model": { "dims": DIMS },
+            "problem": code,
+            "message": secrets.scrub(message),
+        }),
+        code: 3,
+    };
+
+    let found = match probe(url) {
+        Ok(found) => found,
+        Err(error) => return Ok(problem(error.code, &error.message, false, (false, "missing"))),
+    };
+
+    if let Some(error) = found.problem() {
+        let keyword = found.keyword == IndexState::Ready;
+        let vector = (false, found.vector_index());
+
+        return Ok(problem(error.code, &error.message, keyword, vector));
+    }
+
+    let mut model = json!({ "dims": DIMS });
+
+    if let Some(id) = found.model_id {
+        model["id"] = Value::String(id);
+    }
+
+    Ok(Done::ok(json!({
+        "ok": true,
+        "backend": name,
+        "schema": found.schema.unwrap_or(MONGO_SCHEMA),
+        "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
+        "model": model,
+    })))
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::support::Env;
+
+    /// A server with pgvector, and one without, for the `team_*` tests (they skip when unset).
+    const URL_VAR: &str = "HARNESS_KNOWLEDGE_TEST_POSTGRES_URL";
+    const PLAIN_URL_VAR: &str = "HARNESS_KNOWLEDGE_TEST_POSTGRES_PLAIN_URL";
+
+    fn check_url(url: &str) -> Done {
+        let env = Env::for_tests("/home/u");
+        let backend = crate::config::backend_for(Some(url.to_owned()), None).expect("backend");
+        let context = Context {
+            env: &env,
+            backend: &backend,
+        };
+
+        check(&context, &[Some("--json")]).expect("a check answers")
+    }
+
+    fn url_of(name: &str) -> Option<String> {
+        let url = std::env::var(name).ok().filter(|url| !url.trim().is_empty());
+
+        if url.is_none() {
+            eprintln!("skipped: set {name} to run the PostgreSQL check tests");
+        }
+
+        url
+    }
+
+    #[test]
+    fn an_unreachable_postgres_server_exits_3_with_its_problem_and_no_password() {
+        let done = check_url("postgres://someone:hunter2-secret@127.0.0.1:1/knowledge?sslmode=disable");
+
+        assert_eq!(done.code, 3);
+        assert_eq!(done.json["ok"], json!(false));
+        assert_eq!(done.json["backend"], json!("postgres"));
+        assert_eq!(done.json["problem"], json!("unreachable"));
+        assert_eq!(
+            done.json["capabilities"],
+            json!({ "keyword": false, "vector": false, "vectorIndex": "missing" })
+        );
+        assert!(!done.json.to_string().contains("hunter2-secret"), "{}", done.json);
+    }
+
+    #[test]
+    fn team_a_postgres_server_with_pgvector_checks_ready() {
+        let Some(url) = url_of(URL_VAR) else { return };
+        let done = check_url(&url);
+
+        assert_eq!(done.code, 0, "{}", done.json);
+        assert_eq!(done.json["ok"], json!(true));
+        assert_eq!(done.json["backend"], json!("postgres"));
+        assert_eq!(
+            done.json["capabilities"],
+            json!({ "keyword": true, "vector": true, "vectorIndex": "ready" })
+        );
+        assert_eq!(done.json["model"], json!({ "dims": 384 }));
+    }
+
+    #[test]
+    fn team_a_postgres_server_without_pgvector_exits_3_with_no_pgvector() {
+        let Some(url) = url_of(PLAIN_URL_VAR) else { return };
+        let done = check_url(&url);
+
+        assert_eq!(done.code, 3, "{}", done.json);
+        assert_eq!(done.json["ok"], json!(false));
+        assert_eq!(done.json["problem"], json!("no-pgvector"));
+        assert_eq!(
+            done.json["capabilities"],
+            json!({ "keyword": true, "vector": false, "vectorIndex": "missing" })
+        );
+        assert!(
+            done.json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("pgvector"))
+        );
+    }
 }
