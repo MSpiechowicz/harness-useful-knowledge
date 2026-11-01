@@ -16,6 +16,7 @@ use super::{CONTENT_MAX, Server};
 use crate::extract::{self, Format};
 use crate::held::{HeldItem, HoldError, Proposal, Source};
 use crate::import::manifest::document_id;
+use crate::import::place::hold_replaces;
 use crate::project::ProjectKey;
 use crate::store::{Link, clean};
 use crate::support::redact::has_credentials;
@@ -87,6 +88,10 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
         return Err("the review queue cannot be reached: the data folder is unknown".to_owned());
     };
 
+    // The routing can change before the person approves, and the same number would then name a
+    // document in the other place: the proposal keeps the place it names now.
+    let replaces = args.replaces.map(|id| hold_replaces(server.routing, id)).transpose()?;
+
     let item = HeldItem::new(
         Source {
             client: server.client.clone().unwrap_or_else(|| "unknown".to_owned()),
@@ -104,7 +109,7 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
             source_path,
             content,
             links,
-            replaces: args.replaces,
+            replaces,
         },
     );
 

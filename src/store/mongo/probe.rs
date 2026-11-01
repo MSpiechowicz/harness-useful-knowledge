@@ -23,6 +23,10 @@ const AUTHENTICATION_FAILED: i32 = 18;
 pub struct Problem {
     pub code: &'static str,
     pub message: String,
+    /// A setting to fix, not a server that is down: the TLS check refused the server, or the URL's
+    /// rules refused to connect at all. Reported as `unreachable` like a connection that did not
+    /// work, but there is no outage to wait out.
+    pub refused: bool,
 }
 
 /// A server that answered, and what it can do.
@@ -60,6 +64,7 @@ impl Probe {
         Some(Problem {
             code: "index-building",
             message: message.to_owned(),
+            refused: false,
         })
     }
 
@@ -111,6 +116,7 @@ fn refused(error: StoreError) -> Problem {
     Problem {
         code: "unreachable",
         message: error.to_string(),
+        refused: true,
     }
 }
 
@@ -133,7 +139,9 @@ fn classify(error: &Error) -> Problem {
         _ => connection::message(error),
     };
 
-    Problem { code, message }
+    let refused = code == "unreachable" && connection::tls_failure(error);
+
+    Problem { code, message, refused }
 }
 
 #[cfg(test)]

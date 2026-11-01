@@ -12,6 +12,7 @@
 //! makes a longer reader (or a write, which always tries with the driver's own timeout) skip a remote
 //! that connects slowly.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{Backend, Layout, Place, Routing};
@@ -33,6 +34,15 @@ pub const HOOK_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// leave one more behind for every attempt. With all of them in use the remote counts as unreachable.
 static SILENT_OPENS: deadline::Slots = deadline::Slots::new(4);
 
+/// How long an upgrade of the remote database may take (the whole open that runs it). An upgrade
+/// rewrites stored data, so it runs in an open of its own with this bound instead of the few
+/// seconds of an ordinary open, and a database that is still being upgraded is not unreachable.
+pub const UPGRADE_BOUND: Duration = Duration::from_secs(10 * 60);
+
+/// At most one upgrade of the remote database may still run in this process after its
+/// [`UPGRADE_BOUND`].
+static UPGRADES: deadline::Slots = deadline::Slots::new(1);
+
 /// What a command needs from the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -42,6 +52,36 @@ pub enum Access {
     Existing,
     /// Reads and writes, creating the database when it does not exist (an import).
     Create,
+}
+
+/// Whether an open that finds a database from an older version upgrades it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upgrade {
+    /// It does, in this open.
+    Run,
+    /// It does not: the open answers [`Opened::NeedsUpgrade`], and the caller upgrades the database
+    /// in an open of its own (see [`open_remote_within`]), because an upgrade of a real-sized
+    /// database takes far longer than an open is allowed to.
+    Defer,
+}
+
+/// What an open with an [`Upgrade`] ended in.
+#[derive(Debug)]
+pub enum Opened<T> {
+    /// It opened (`None`: the database has no knowledge tables and `access` does not create them).
+    Ready(Option<T>),
+    /// The database is from an older version and the open was told to [`Upgrade::Defer`].
+    NeedsUpgrade,
+}
+
+impl<T> Opened<T> {
+    /// The same with `convert` applied to the store.
+    pub fn map<U>(self, convert: impl FnOnce(T) -> U) -> Opened<U> {
+        match self {
+            Self::Ready(store) => Opened::Ready(store.map(convert)),
+            Self::NeedsUpgrade => Opened::NeedsUpgrade,
+        }
+    }
 }
 
 /// Why no store was opened. Messages carry no credentials.
@@ -59,6 +99,12 @@ pub enum OpenError {
     /// does not resolve).
     #[error("{0}")]
     Unreachable(String),
+    /// No attempt was made: too many earlier attempts to open the remote database are still
+    /// running in this process (see [`SILENT_OPENS`]). The remote counts as unreachable for this
+    /// call, but nothing was learned about it, so it is not recorded in the cooldown that other
+    /// processes share.
+    #[error("{0}")]
+    Busy(String),
 }
 
 impl OpenError {
@@ -158,19 +204,114 @@ pub fn open_place_within(
 /// Opens the remote database, which is unreachable when it has not answered within twice the
 /// `connect` timeout. The drivers' timeouts cover the connection only, so a server that accepts it
 /// and then never speaks is cut off here.
+///
+/// A database from an older version is upgraded in a second open under [`UPGRADE_BOUND`], so the
+/// few seconds of a probe never end an upgrade that a real-sized database needs minutes for (and
+/// would have ended again at every later try). See [`open_in_phases`].
 fn open_remote_within(
     env: &Env,
     backend: &Backend,
     access: Access,
     connect: Duration,
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
-    let (env, backend) = (env.clone(), backend.clone());
-    let silent = || OpenError::Unreachable("the remote database did not answer in time".to_owned());
+    open_remote_in(&SILENT_OPENS, env, backend, access, connect)
+}
 
-    deadline::within_slots(&SILENT_OPENS, "remote-open", connect * 2, move || {
-        open_place_within(&env, &backend, Place::Remote, access, connect)
+/// [`open_remote_within`] counting its silent attempts in `opens`.
+fn open_remote_in(
+    opens: &'static deadline::Slots,
+    env: &Env,
+    backend: &Backend,
+    access: Access,
+    connect: Duration,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    let (env, backend) = (env.clone(), backend.clone());
+
+    open_in_phases(opens, &UPGRADES, connect, UPGRADE_BOUND, move |upgrade| {
+        open_remote_place(&env, &backend, access, connect, upgrade)
     })
-    .unwrap_or_else(|| Err(silent()))
+}
+
+/// The type of what opens the remote database for [`open_in_phases`].
+type RemoteOpen = dyn Fn(Upgrade) -> Result<Opened<Box<dyn KnowledgeStore>>, OpenError> + Send + Sync;
+
+/// Runs `open` with [`Upgrade::Defer`] on a thread of `opens` (unreachable when it did not finish
+/// within twice `connect`), and when it says the database needs an upgrade, runs it again with
+/// [`Upgrade::Run`] on a thread of `upgrades` that may take `bound`. A database that is still being
+/// upgraded after that is a failure that says so, not an unreachable one.
+fn open_in_phases(
+    opens: &'static deadline::Slots,
+    upgrades: &'static deadline::Slots,
+    connect: Duration,
+    bound: Duration,
+    open: impl Fn(Upgrade) -> Result<Opened<Box<dyn KnowledgeStore>>, OpenError> + Send + Sync + 'static,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    let open: Arc<RemoteOpen> = Arc::new(open);
+    let first = Arc::clone(&open);
+
+    let opened = match deadline::within_slots(opens, "remote-open", connect * 2, move || first(Upgrade::Defer)) {
+        Ok(opened) => opened?,
+        Err(deadline::Missed::Late) => {
+            return Err(OpenError::Unreachable(
+                "the remote database did not answer in time".to_owned(),
+            ));
+        }
+        Err(deadline::Missed::Busy) => {
+            return Err(OpenError::Busy(
+                "earlier attempts to open the remote database are still waiting for it".to_owned(),
+            ));
+        }
+    };
+
+    match opened {
+        Opened::Ready(store) => Ok(store),
+        Opened::NeedsUpgrade => upgrade_within(upgrades, bound, open),
+    }
+}
+
+/// The second phase of [`open_in_phases`]: the open that upgrades the database.
+fn upgrade_within(
+    upgrades: &'static deadline::Slots,
+    bound: Duration,
+    open: Arc<RemoteOpen>,
+) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
+    let upgrading = deadline::within_slots(upgrades, "remote-upgrade", bound, move || open(Upgrade::Run));
+
+    match upgrading {
+        Ok(Ok(Opened::Ready(store))) => Ok(store),
+        Ok(Ok(Opened::NeedsUpgrade)) => Err(OpenError::Failed(
+            "the knowledge database could not be upgraded".to_owned(),
+        )),
+        Ok(Err(error)) => Err(error),
+        Err(deadline::Missed::Late) => Err(OpenError::Failed(format!(
+            "upgrading the knowledge database is taking longer than {} minutes, it keeps running on the \
+             server, try again later",
+            bound.as_secs().div_ceil(60)
+        ))),
+        Err(deadline::Missed::Busy) => Err(OpenError::Failed(
+            "upgrading the knowledge database is still running, try again later".to_owned(),
+        )),
+    }
+}
+
+/// The remote database as one place of the routing: `upgrade` says whether the open may upgrade a
+/// database that has data from an older version. SQLite and libSQL keep their own migrations.
+fn open_remote_place(
+    env: &Env,
+    backend: &Backend,
+    access: Access,
+    connect: Duration,
+    upgrade: Upgrade,
+) -> Result<Opened<Box<dyn KnowledgeStore>>, OpenError> {
+    match backend {
+        Backend::Postgres { url } => {
+            crate::store::postgres::open_boxed_with(url, access, connect, upgrade, &backend.secrets())
+        }
+        Backend::Mongodb { url } => {
+            crate::store::mongo::open_boxed_with(url, access, connect, upgrade, &backend.secrets())
+        }
+        _ => open_place_within(env, backend, Place::Remote, access, connect).map(Opened::Ready),
+    }
 }
 
 /// How long connecting to the remote database takes before it counts as unreachable, unless the
@@ -208,6 +349,17 @@ pub enum Attempt {
 /// always tried, with the full connect timeout of its driver, so the person is not refused for a
 /// minute after the remote came back, nor because it connects slowly.
 pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bool) -> Result<Attempt, OpenError> {
+    attempt_in(&SILENT_OPENS, env, backend, access, cooldown)
+}
+
+/// [`attempt_remote`] counting its silent attempts in `opens`.
+fn attempt_in(
+    opens: &'static deadline::Slots,
+    env: &Env,
+    backend: &Backend,
+    access: Access,
+    cooldown: bool,
+) -> Result<Attempt, OpenError> {
     let reach = reach_of(env, backend);
 
     if let Some(message) = cooldown.then(|| reach.cooling_for(PROBE_TIMEOUT)).flatten() {
@@ -221,7 +373,7 @@ pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bo
     };
     let started = Instant::now();
 
-    match open_remote_within(env, backend, access, connect) {
+    match open_remote_in(opens, env, backend, access, connect) {
         Ok(store) => {
             reach.reached();
             Ok(Attempt::Opened(store))
@@ -230,6 +382,8 @@ pub fn attempt_remote(env: &Env, backend: &Backend, access: Access, cooldown: bo
             reach.failed_in(&message, started.elapsed(), PROBE_TIMEOUT);
             Ok(Attempt::Offline(message))
         }
+        // Nothing was tried, so nothing is known about the remote: nothing is recorded.
+        Err(OpenError::Busy(message)) => Ok(Attempt::Offline(message)),
         Err(other) => Err(other),
     }
 }
@@ -267,53 +421,4 @@ fn open_local(env: &Env, access: Access) -> Result<Option<Box<dyn KnowledgeStore
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::location::FILE_NAME;
-
-    fn env_in(dir: &std::path::Path) -> Env {
-        Env::for_tests("/home/u").with_var(DIR_VAR, dir.to_string_lossy())
-    }
-
-    #[test]
-    fn reading_and_changing_never_create_the_local_database_and_creating_does() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let folder = dir.path().join("knowledge");
-        let env = env_in(&folder);
-
-        assert!(
-            open(&env, &Backend::Sqlite, Routing::local(), Access::Read)
-                .expect("read")
-                .is_none()
-        );
-        assert!(
-            open(&env, &Backend::Sqlite, Routing::local(), Access::Existing)
-                .expect("existing")
-                .is_none()
-        );
-        assert!(!folder.exists());
-
-        assert!(
-            open(&env, &Backend::Sqlite, Routing::local(), Access::Create)
-                .expect("create")
-                .is_some()
-        );
-        assert!(folder.join(FILE_NAME).is_file());
-
-        assert!(
-            open(&env, &Backend::Sqlite, Routing::local(), Access::Read)
-                .expect("read")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn a_relative_folder_override_is_refused() {
-        let env = Env::for_tests("/home/u").with_var(DIR_VAR, "relative");
-
-        assert!(matches!(
-            open(&env, &Backend::Sqlite, Routing::local(), Access::Read),
-            Err(OpenError::Failed(_))
-        ));
-    }
-}
+mod tests;

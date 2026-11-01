@@ -1,6 +1,6 @@
 //! The phrase filter of the list: matched on the server against each chunk's `phrase_text`, so no
 //! match is dropped however many chunks have the words, and a phrase never spans a heading and the
-//! text under it. And the upgrade that gives older databases the field.
+//! text under it. A new database has the field from version 1.
 
 use mongodb::bson::{Document, doc};
 
@@ -89,7 +89,7 @@ fn team_mongo_a_phrase_is_in_the_heading_or_in_the_text_and_never_across_them() 
 }
 
 #[test]
-fn team_mongo_an_older_database_gets_the_phrase_text_and_the_title_keys_when_it_is_upgraded() {
+fn team_mongo_a_new_database_has_the_phrase_text_and_the_title_keys_from_version_1() {
     let Some((db, mut store)) = store() else { return };
 
     insert(
@@ -99,30 +99,18 @@ fn team_mongo_an_older_database_gets_the_phrase_text_and_the_title_keys_when_it_
     insert(&mut store, &Seed::new("Plain").chunk("Setup", "nothing here"));
     drop(store);
 
-    // What a version 1 database looks like: no phrase text, titles lowercased with Unicode rules.
     let raw = db.raw();
-    raw.collection::<Document>(CHUNKS)
-        .update_many(doc! {}, doc! { "$unset": { "phrase_text": "" } })
-        .run()
-        .expect("unset");
-    raw.collection::<Document>(DOCUMENTS)
-        .update_one(doc! { "_id": 1_i64 }, doc! { "$set": { "title_key": "łódź guide" } })
-        .run()
-        .expect("rekey");
-    raw.collection::<Document>(META)
-        .update_one(doc! { "_id": "schema" }, doc! { "$set": { "version": 1_i64 } })
-        .run()
-        .expect("downgrade");
 
-    // A read does not upgrade, and says so.
-    let refused = MongoStore::connect_read_only(&db.url).expect_err("older");
-    assert!(refused.to_string().contains("older"), "{refused}");
-
-    let mut upgraded = MongoStore::connect_existing(&db.url)
-        .expect("connects")
-        .expect("exists");
-
-    assert_eq!(titles(&filtered(&mut upgraded, "alpha beta")), ["Łódź guide"]);
+    assert_eq!(
+        raw.collection::<Document>(META)
+            .find_one(doc! { "_id": "schema" })
+            .run()
+            .expect("find")
+            .expect("schema")
+            .get_i64("version"),
+        Ok(1)
+    );
+    assert_eq!(db.count(CHUNKS, doc! {}), 2);
     assert_eq!(db.count(CHUNKS, doc! { "phrase_text": { "$exists": false } }), 0);
 
     let key = raw
@@ -133,13 +121,12 @@ fn team_mongo_an_older_database_gets_the_phrase_text_and_the_title_keys_when_it_
         .expect("document");
     assert_eq!(
         key.get_str("title_key").expect("key"),
-        "Łódź guide".to_ascii_lowercase()
+        "Łódź guide".to_ascii_lowercase(),
+        "ASCII letters fold, the rest stays"
     );
 
-    // Upgrading again changes nothing.
-    drop(upgraded);
-    let mut again = MongoStore::connect_existing(&db.url)
-        .expect("connects")
+    let mut again = MongoStore::connect_read_only(&db.url)
+        .expect("a read of version 1 opens")
         .expect("exists");
     assert_eq!(titles(&filtered(&mut again, "alpha beta")), ["Łódź guide"]);
 }

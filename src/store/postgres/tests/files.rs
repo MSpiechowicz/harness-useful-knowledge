@@ -27,10 +27,7 @@ fn team_opening_creates_the_schema_and_reopening_keeps_the_data() {
             .title,
         "Guide"
     );
-    assert_eq!(
-        again.meta("schema_version").expect("meta").as_deref(),
-        Some(crate::store::postgres::schema::SCHEMA_VERSION.to_string().as_str())
-    );
+    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
     assert_eq!(again.generation().expect("generation"), 1);
     assert!(again.pgvector().is_some_and(|version| version.has_hnsw()));

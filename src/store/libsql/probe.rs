@@ -58,8 +58,11 @@ pub struct Capabilities {
 pub enum Trouble {
     /// HTTP 401 or 403: the token is missing or wrong.
     Auth,
-    /// No usable answer: the host, the network, TLS or a server that is not libSQL.
+    /// No usable answer: the host, the network or a server that is not libSQL.
     Unreachable(String),
+    /// The server was reached but the TLS check refused it (a certificate it does not trust, a
+    /// server that does not speak TLS): a setting to fix, not an outage.
+    Refused(String),
     /// The URL or the token cannot be used at all.
     Invalid(String),
 }
@@ -76,10 +79,8 @@ pub fn probe(url: &str, token: Option<&str>) -> Result<Capabilities, Trouble> {
 
     let outcomes = client.single().exchange(requests).map_err(|failed| match failed.kind {
         Kind::Auth => Trouble::Auth,
-        Kind::Unreachable { .. } | Kind::Other => Trouble::Unreachable(match failed.error {
-            StoreError::Backend(message) => message,
-            other => other.to_string(),
-        }),
+        Kind::Refused => Trouble::Refused(reason(failed.error)),
+        Kind::Unreachable { .. } | Kind::Other => Trouble::Unreachable(reason(failed.error)),
     })?;
 
     let mut outcomes = outcomes.into_iter();
@@ -90,6 +91,14 @@ pub fn probe(url: &str, token: Option<&str>) -> Result<Capabilities, Trouble> {
     );
 
     Ok(Capabilities { keyword, vector })
+}
+
+/// What a failed request says, without the URL.
+fn reason(error: StoreError) -> String {
+    match error {
+        StoreError::Backend(message) => message,
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ pub mod routed;
 pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod testing;
+pub(crate) mod upgrade;
 
 use std::collections::HashMap;
 

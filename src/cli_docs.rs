@@ -158,7 +158,7 @@ impl From<OpenError> for Failure {
         match error {
             OpenError::Missing { code, message } => Self::Missing { code, message },
             OpenError::Failed(message) => Self::Failed(message),
-            OpenError::Unreachable(message) => Self::Unreachable(message),
+            OpenError::Unreachable(message) | OpenError::Busy(message) => Self::Unreachable(message),
         }
     }
 }

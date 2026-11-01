@@ -195,11 +195,13 @@ impl Client {
 pub(super) enum Kind {
     /// HTTP 401 or 403: the token is wrong or missing.
     Auth,
-    /// No reply: the host, the port, the network or TLS. `stale` when a kept connection broke
+    /// No reply: the host, the port or the network. `stale` when a kept connection broke
     /// before any reply, so one more attempt may succeed.
     Unreachable {
         stale: bool,
     },
+    /// The TLS check refused the server (a certificate, a server that does not speak TLS).
+    Refused,
     Other,
 }
 
@@ -231,11 +233,16 @@ impl Failed {
         );
         let stale = matches!(&error, ureq::Error::ConnectionFailed)
             || matches!(&error, ureq::Error::Io(io) if io.get_ref().is_none());
+        let kind = if refused_by_tls(&error) {
+            Kind::Refused
+        } else {
+            Kind::Unreachable { stale }
+        };
 
         Self {
             error: transport(error),
             maybe_ran: !before_sending,
-            kind: Kind::Unreachable { stale },
+            kind,
         }
     }
 }
@@ -427,6 +434,15 @@ fn platform_roots() -> RootCerts {
         .collect();
 
     RootCerts::new_with_certs(&certs)
+}
+
+/// Whether the TLS check refused the server: rustls' error is the error or what an I/O error wraps.
+fn refused_by_tls(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Io(io) => io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()),
+        ureq::Error::Rustls(_) | ureq::Error::Tls(_) => true,
+        _ => false,
+    }
 }
 
 /// A transport failure, described without the URL: [`StoreError::Unreachable`] when the server

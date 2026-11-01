@@ -4,7 +4,7 @@ use postgres::config::SslMode;
 use postgres::{Client, NoTls};
 
 use super::connect::{self, Settings};
-use super::error::{backend, described, with_causes};
+use super::error::{backend, described, refused_by_tls, with_causes};
 use super::vector::{self, Problem};
 use crate::store::StoreError;
 
@@ -48,13 +48,14 @@ pub(super) fn open(settings: &Settings) -> Result<Client, StoreError> {
     Ok(client)
 }
 
-/// What a failed connection is called in a `check`: a refused login is [`Problem::Auth`], anything
-/// else (no route, nothing listening, a database that is not there) [`Problem::Unreachable`] with
-/// the reason, which carries no URL.
+/// What a failed connection is called in a `check`: a refused login is [`Problem::Auth`], a server
+/// whose TLS the client refuses [`Problem::Refused`], anything else (no route, nothing listening, a
+/// database that is not there) [`Problem::Unreachable`] with the reason, which carries no URL.
 pub(super) fn problem(error: &postgres::Error) -> Problem {
     match error.as_db_error() {
         Some(db) if db.code().code().starts_with("28") => Problem::Auth,
         Some(db) => Problem::Unreachable(described(db.code().code())),
+        None if refused_by_tls(error) => Problem::Refused(with_causes(error).chars().take(200).collect()),
         None => Problem::Unreachable(with_causes(error).chars().take(200).collect()),
     }
 }

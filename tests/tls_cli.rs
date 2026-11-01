@@ -139,3 +139,57 @@ fn a_mongodb_whose_certificate_is_refused_fails_with_a_tls_message_and_is_never_
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("TLS with the MongoDB server failed"), "{stderr}");
 }
+
+/// A server that agrees to TLS (`S` to the SSL request) and then talks nonsense, as a port that does
+/// not speak PostgreSQL does. The client's TLS check refuses it.
+fn nonsense_after_tls_request() -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut request = [0_u8; 8];
+            let _ = stream.read_exact(&mut request);
+            let _ = stream.write_all(b"S");
+            let _ = stream.write_all(&[0x16; 200]);
+        }
+    });
+
+    port
+}
+
+#[test]
+fn a_postgres_server_whose_tls_is_refused_is_a_setting_to_fix_and_check_starts_no_cooldown() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let port = nonsense_after_tls_request();
+    let url = format!("postgres://someone@127.0.0.1:{port}/knowledge?sslmode=require&connect_timeout=3");
+    let cooldown = root.path().join("knowledge").join("remote-unreachable.json");
+
+    let (code, stdout, stderr) = run(root.path(), &url, "remote+local", &["check", "--json"]);
+    let checked: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("{stdout} {stderr}"));
+
+    assert_eq!(code, Some(3), "{stdout} {stderr}");
+    assert_eq!(checked["places"]["remote"]["problem"], "unreachable", "{stdout}");
+    assert!(!cooldown.exists(), "a refused TLS check is not an outage: {stdout}");
+
+    let (code, stdout, stderr) = run(root.path(), &url, "remote+local", &["docs", "list", "--json"]);
+    assert_eq!(code, Some(1), "{stdout} {stderr}");
+    assert!(!stdout.contains("offline"), "{stdout}");
+    assert!(!cooldown.exists(), "{stderr}");
+
+    // A port nobody listens at is an outage, and the same check records it.
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .expect("listener")
+        .local_addr()
+        .expect("address")
+        .port();
+    let refused = format!("postgres://someone@127.0.0.1:{closed}/knowledge?sslmode=disable&connect_timeout=3");
+    let (code, stdout, _) = run(root.path(), &refused, "remote+local", &["check", "--json"]);
+
+    assert_eq!(code, Some(3), "{stdout}");
+    assert!(cooldown.exists(), "a connection that does not work is recorded");
+}

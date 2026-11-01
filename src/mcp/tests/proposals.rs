@@ -361,9 +361,14 @@ fn replaces_is_a_document_id_as_the_tools_show_it_and_is_kept_with_its_place() {
     let project = project_arg(&world);
     let local_seven = crate::store::routed::ids::tag(crate::config::Place::Local, 7);
 
-    for (index, (given, kept)) in [(json!(7), 7), (json!("7"), 7), (json!("local:7"), local_seven)]
-        .into_iter()
-        .enumerate()
+    // Only this computer is in use, so each of them names its document 7.
+    for (index, (given, kept)) in [
+        (json!(7), local_seven),
+        (json!("7"), local_seven),
+        (json!("local:7"), local_seven),
+    ]
+    .into_iter()
+    .enumerate()
     {
         world.ok(
             "knowledge_add",
@@ -404,4 +409,64 @@ fn replaces_is_a_document_id_as_the_tools_show_it_and_is_kept_with_its_place() {
     }
 
     assert_eq!(world.held_files().len(), 3);
+}
+
+#[test]
+fn a_proposal_replaces_the_document_of_the_place_it_named_when_the_routing_changes_before_it_is_approved() {
+    use crate::cli_held::{Reply, reply};
+    use crate::config::{Routing, Where};
+    use crate::location::DIR_VAR;
+
+    let mut world = World::new();
+    insert(
+        &mut world.database(),
+        &Seed::new("Mine").chunk("Intro", "gateway notes of mine"),
+    );
+
+    // Only this computer is in use: document 1 is its own.
+    let mut propose = |title: &str, text: &str| {
+        let held = world.ok(
+            "knowledge_add",
+            json!({ "title": title, "content": text, "replaces": 1, "project_path": project_arg(&world) }),
+        );
+
+        held.lines()
+            .next()
+            .and_then(|line| line.strip_prefix("held:"))
+            .expect("held:<id>")
+            .to_owned()
+    };
+    let first = propose("Gateway runbook", "# Runbook\n\nRestart it.");
+    let second = propose("Another runbook", "# Other\n\nSomething else.");
+
+    let env = Env::for_tests(world.home()).with_var(DIR_VAR, world.knowledge().to_string_lossy());
+    let remote =
+        crate::config::backend_for(Some("postgres://nobody@127.0.0.1:1/none".to_owned()), None).expect("backend");
+    let approve =
+        |held: &str, routing: Routing| reply(&env, &remote, routing, &[Some("approve"), Some("--json"), Some(held)]);
+    let title = || {
+        let mut database = world.database();
+
+        database
+            .get(1, &crate::store::Detail::default())
+            .expect("get")
+            .expect("document 1")
+            .doc
+            .title
+    };
+
+    // The remote database alone: this computer's document is not in use, so the approval is
+    // refused and nothing is touched (the remote's own document 1 included, which is never opened).
+    let Reply::Refused(_, message) = approve(&second, Routing::new(Where::Remote, Where::Remote)) else {
+        panic!("not refused");
+    };
+    assert!(message.contains("not in use"), "{message}");
+    assert_eq!(title(), "Mine");
+
+    // The remote database plus this computer: it is still this computer's document 1.
+    let Reply::Done(done) = approve(&first, Routing::new(Where::RemoteLocal, Where::RemoteLocal)) else {
+        panic!("approved");
+    };
+    assert_eq!(done["approved"]["docId"], json!("local:1"));
+    assert_eq!(title(), "Gateway runbook");
 }

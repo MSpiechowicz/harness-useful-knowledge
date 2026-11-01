@@ -35,13 +35,13 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
     let mut reports: Vec<(Place, Done)> = Vec::new();
 
     for place in context.routing.places() {
-        let done = check_place(context, place)?;
+        let checked = check_place(context, place)?;
 
         if place == Place::Remote && context.routing.layout() == Layout::Both {
-            note_reach(context, &done);
+            note_reach(context, &checked);
         }
 
-        reports.push((place, done));
+        reports.push((place, checked.done));
     }
 
     let first = reports.iter().position(|(_, done)| done.code != 0).unwrap_or(0);
@@ -56,36 +56,57 @@ pub fn check(context: &Context, args: &[Option<&str>]) -> Reply {
     Ok(shown)
 }
 
-/// Records what the check found out about reaching the remote database, which every other command
-/// goes by while this computer stands in for it (see [`crate::store::Reach`]): an `unreachable`
-/// problem starts the cooldown, any other answer ends it. The check itself is never skipped. A server
-/// whose TLS is refused answered (it is a setting to fix, see [`crate::store::StoreError::Unreachable`]),
-/// so it starts no cooldown, though the check reports it as `unreachable` like any connection that
-/// did not work.
-fn note_reach(context: &Context, done: &Done) {
-    let reach = backend::reach_of(context.env, context.backend);
+/// What a check of one place found, and whether the server could not be reached at all.
+struct Checked {
+    done: Done,
+    /// The server did not answer (no route, nothing listening, a timeout). False for one that
+    /// answered, or whose TLS the client refused (a setting to fix, nothing to wait out).
+    unreachable: bool,
+}
 
-    let message = done.json["message"]
-        .as_str()
-        .unwrap_or("the remote database is unreachable");
-
-    match done.json["problem"].as_str() {
-        Some("unreachable") if !refused_by_tls(message) => reach.failed(message),
-        _ => reach.reached(),
+impl From<Done> for Checked {
+    fn from(done: Done) -> Self {
+        Self {
+            done,
+            unreachable: false,
+        }
     }
 }
 
-/// Whether a reason says TLS with the server failed (the messages of the drivers all name it).
-fn refused_by_tls(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
+impl Checked {
+    fn unreachable(done: Done) -> Self {
+        Self {
+            done,
+            unreachable: true,
+        }
+    }
+}
 
-    lower.contains("tls") || lower.contains("certificate")
+/// Records what the check found out about reaching the remote database, which every other command
+/// goes by while this computer stands in for it (see [`crate::store::Reach`]): a server that could
+/// not be reached starts the cooldown, any other answer ends it. The check itself is never skipped.
+/// A server whose TLS is refused answered (it is a setting to fix, see
+/// [`crate::store::StoreError::Unreachable`]), so it starts no cooldown, though the check reports it
+/// as `unreachable` like any connection that did not work.
+fn note_reach(context: &Context, checked: &Checked) {
+    let reach = backend::reach_of(context.env, context.backend);
+
+    if !checked.unreachable {
+        reach.reached();
+        return;
+    }
+
+    reach.failed(
+        checked.done.json["message"]
+            .as_str()
+            .unwrap_or("the remote database is unreachable"),
+    );
 }
 
 /// The check of one place.
-fn check_place(context: &Context, place: Place) -> Reply {
+fn check_place(context: &Context, place: Place) -> Result<Checked, Failure> {
     match (place, context.backend) {
-        (Place::Local, _) => local(context),
+        (Place::Local, _) => local(context).map(Checked::from),
         (Place::Remote, Backend::Sqlite) => Err(Failure::Failed("no remote database is configured".to_owned())),
         (Place::Remote, Backend::Postgres { url }) => postgres_check(context, url),
         (Place::Remote, Backend::Libsql { url, token }) => libsql_check(context, url, token.as_deref()),
@@ -150,7 +171,7 @@ fn capabilities(keyword: bool) -> Value {
 /// `capabilities` then says what is known to work: the keyword index when the server answered, the
 /// vector search only when pgvector and its index are fine, and `vectorIndex` is `building` or
 /// `missing`.
-fn postgres_check(context: &Context, url: &str) -> Reply {
+fn postgres_check(context: &Context, url: &str) -> Result<Checked, Failure> {
     let secrets = context.backend.secrets();
     let name = backend::name(context.backend);
 
@@ -168,17 +189,19 @@ fn postgres_check(context: &Context, url: &str) -> Reply {
                 "schema": found.schema.unwrap_or(postgres::schema::SCHEMA_VERSION),
                 "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
                 "model": model,
-            })))
+            }))
+            .into())
         }
         Err(Fault::Problem(problem)) => {
-            let reached = !matches!(problem, Problem::Unreachable(_) | Problem::Auth);
+            let reached = problem.is_missing();
+            let unreachable = matches!(problem, Problem::Unreachable(_));
             let index = if problem == Problem::IndexBuilding {
                 "building"
             } else {
                 "missing"
             };
 
-            Ok(Done {
+            let done = Done {
                 json: json!({
                     "ok": false,
                     "backend": name,
@@ -189,7 +212,9 @@ fn postgres_check(context: &Context, url: &str) -> Reply {
                     "message": secrets.scrub(&problem.message()),
                 }),
                 code: 3,
-            })
+            };
+
+            Ok(Checked { done, unreachable })
         }
         Err(Fault::Store(error)) => Err(Failure::Failed(secrets.scrub(&error.to_string()))),
     }
@@ -202,7 +227,7 @@ fn postgres_check(context: &Context, url: &str) -> Reply {
 /// and a `message`, and exits 3. `capabilities` then says what the server answered: `keyword` and
 /// `vector` as probed (both false when it could not be asked), and `vectorIndex` is `missing`
 /// when vectors do not work.
-fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
+fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Result<Checked, Failure> {
     let secrets = context.backend.secrets();
     let name = backend::name(context.backend);
 
@@ -227,24 +252,22 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
         Ok(found) => found,
         Err(Trouble::Auth) => {
             let message = "the libSQL server refused the token, check the token of the database settings";
-            return Ok(problem("auth", message, false, false));
+            return Ok(problem("auth", message, false, false).into());
         }
-        Err(Trouble::Unreachable(message)) => return Ok(problem("unreachable", &message, false, false)),
+        Err(Trouble::Unreachable(message)) => {
+            return Ok(Checked::unreachable(problem("unreachable", &message, false, false)));
+        }
+        Err(Trouble::Refused(message)) => return Ok(problem("unreachable", &message, false, false).into()),
         Err(Trouble::Invalid(message)) => return Err(Failure::Failed(secrets.scrub(&message))),
     };
 
     if !found.vector {
-        return Ok(problem(
-            "libsql-no-vector",
-            libsql::NO_VECTOR_MESSAGE,
-            found.keyword,
-            false,
-        ));
+        return Ok(problem("libsql-no-vector", libsql::NO_VECTOR_MESSAGE, found.keyword, false).into());
     }
 
     if !found.keyword {
         let message = "this libSQL server has no FTS5 full-text search, so the keyword index cannot be kept";
-        return Ok(problem("no-fts5", message, false, true));
+        return Ok(problem("no-fts5", message, false, true).into());
     }
 
     let (schema, model_id) = match context.open_place(Place::Remote, Access::Read)? {
@@ -269,7 +292,8 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
         "schema": schema,
         "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
         "model": model,
-    })))
+    }))
+    .into())
 }
 
 /// `check` of a MongoDB team database (see [`crate::store::mongo::probe`], which changes nothing).
@@ -280,7 +304,7 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Reply {
 /// neither search, with `index-building` the keyword search when its index answers, and
 /// `vectorIndex` is `building` or `missing`. A database nobody wrote to yet is ready: its first
 /// import creates the two search indexes.
-fn mongodb_check(context: &Context, url: &str) -> Reply {
+fn mongodb_check(context: &Context, url: &str) -> Result<Checked, Failure> {
     use crate::store::mongo::probe::probe;
     use crate::store::mongo::schema::{IndexState, SCHEMA_VERSION as MONGO_SCHEMA};
 
@@ -302,14 +326,19 @@ fn mongodb_check(context: &Context, url: &str) -> Reply {
 
     let found = match probe(url) {
         Ok(found) => found,
-        Err(error) => return Ok(problem(error.code, &error.message, false, (false, "missing"))),
+        Err(error) => {
+            let done = problem(error.code, &error.message, false, (false, "missing"));
+            let unreachable = error.code == "unreachable" && !error.refused;
+
+            return Ok(Checked { done, unreachable });
+        }
     };
 
     if let Some(error) = found.problem() {
         let keyword = found.keyword == IndexState::Ready;
         let vector = (false, found.vector_index());
 
-        return Ok(problem(error.code, &error.message, keyword, vector));
+        return Ok(problem(error.code, &error.message, keyword, vector).into());
     }
 
     let mut model = json!({ "dims": DIMS });
@@ -324,7 +353,8 @@ fn mongodb_check(context: &Context, url: &str) -> Reply {
         "schema": found.schema.unwrap_or(MONGO_SCHEMA),
         "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
         "model": model,
-    })))
+    }))
+    .into())
 }
 
 #[cfg(test)]

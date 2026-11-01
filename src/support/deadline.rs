@@ -62,21 +62,32 @@ impl Drop for Slot {
     }
 }
 
-/// [`within`] that starts no thread (and answers `None` at once) while `slots` are all held by
-/// threads that have not ended, however long ago their deadline passed.
+/// Why [`within_slots`] gave no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missed {
+    /// All slots were held by threads that have not ended, so no thread was started: nothing is
+    /// known about the work itself.
+    Busy,
+    /// The work did not finish within the deadline.
+    Late,
+}
+
+/// [`within`] that starts no thread (and answers [`Missed::Busy`] at once) while `slots` are all
+/// held by threads that have not ended, however long ago their deadline passed.
 pub fn within_slots<T: Send + 'static>(
     slots: &'static Slots,
     name: &str,
     deadline: Duration,
     work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let slot = slots.take()?;
+) -> Result<T, Missed> {
+    let slot = slots.take().ok_or(Missed::Busy)?;
 
     within(name, deadline, move || {
         let _held = slot;
 
         work()
     })
+    .ok_or(Missed::Late)
 }
 
 #[cfg(test)]
@@ -111,13 +122,13 @@ mod tests {
                 1
             });
 
-            assert_eq!(stuck, None, "it did not finish in time");
+            assert_eq!(stuck, Err(Missed::Late), "it did not finish in time");
         }
 
         let started = std::time::Instant::now();
         assert_eq!(
             within_slots(&SLOTS, "refused", Duration::from_secs(5), || 7),
-            None,
+            Err(Missed::Busy),
             "both slots are held by threads that never ended"
         );
         assert!(started.elapsed() < Duration::from_millis(500), "no thread, no wait");
@@ -125,18 +136,18 @@ mod tests {
         drop(release);
 
         // The stuck threads end, the slots come back.
-        let mut answered = None;
+        let mut answered = Err(Missed::Busy);
 
         for _ in 0..100 {
             answered = within_slots(&SLOTS, "again", Duration::from_secs(5), || 7);
 
-            if answered.is_some() {
+            if answered.is_ok() {
                 break;
             }
 
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        assert_eq!(answered, Some(7));
+        assert_eq!(answered, Ok(7));
     }
 }

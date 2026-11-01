@@ -45,15 +45,16 @@ use postgres::{Client, Transaction};
 
 pub use connect::{CONNECT_TIMEOUT, UrlError};
 pub use probe::{Probe, probe};
-use schema::{SCHEMA_VERSION, SchemaState};
+use schema::{READABLE_FROM, SCHEMA_VERSION, SchemaState};
 use vector::Version;
 pub use vector::{Fault, Problem};
 
+use super::upgrade::{Plan, plan};
 use super::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
 };
 use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
-use crate::backend::{Access, OpenError};
+use crate::backend::{Access, OpenError, Opened, Upgrade};
 use crate::config::Secrets;
 use error::{backend, ended};
 
@@ -91,32 +92,50 @@ impl PostgresStore {
     /// [`PostgresStore::open`] giving up on a connection after `connect_timeout` unless the URL
     /// names its own `connect_timeout`.
     pub fn open_within(url: &str, access: Access, connect_timeout: Duration) -> Result<Option<Self>, Fault> {
+        match Self::open_with(url, access, connect_timeout, Upgrade::Run)? {
+            Opened::Ready(store) => Ok(store),
+            Opened::NeedsUpgrade => Err(StoreError::Backend("the database needs an upgrade".to_owned()).into()),
+        }
+    }
+
+    /// [`PostgresStore::open_within`] that, with [`Upgrade::Defer`], changes nothing of a database
+    /// that has tables from an older version and answers [`Opened::NeedsUpgrade`] instead: the
+    /// caller runs the upgrade in an open of its own (with [`Upgrade::Run`]), under a bound that
+    /// suits a migration (see [`schema`]).
+    pub fn open_with(
+        url: &str,
+        access: Access,
+        connect_timeout: Duration,
+        upgrade: Upgrade,
+    ) -> Result<Opened<Self>, Fault> {
         let settings =
             connect::parse_within(url, connect_timeout).map_err(|error| StoreError::Backend(error.to_string()))?;
         let mut client = session::open(&settings)?;
 
-        let state = match (schema::stored_version(&mut client)?, access) {
-            (None, Access::Create) => schema::migrate(&mut client)?,
-            (None, _) => return Ok(None),
-            (Some(version), _) if version > SCHEMA_VERSION => SchemaState::Newer,
-            (Some(version), Access::Read) if version < SCHEMA_VERSION => {
+        let found = schema::stored_version(&mut client)?;
+
+        let state = match plan(found, access, SCHEMA_VERSION, READABLE_FROM) {
+            Plan::Absent => return Ok(Opened::Ready(None)),
+            Plan::Current => SchemaState::Current,
+            Plan::Newer => SchemaState::Newer,
+            Plan::TooOld => {
                 return Err(StoreError::Backend(
                     "the database is from an older server and has not been upgraded yet".to_owned(),
                 )
                 .into());
             }
-            (Some(_), Access::Read) => SchemaState::Current,
-            (Some(_), _) => schema::migrate(&mut client)?,
+            Plan::Migrate { creates: false } if upgrade == Upgrade::Defer => return Ok(Opened::NeedsUpgrade),
+            Plan::Migrate { .. } => schema::migrate(&mut client)?,
         };
 
         let pgvector = vector::installed(&mut client)?;
 
-        Ok(Some(Self {
+        Ok(Opened::Ready(Some(Self {
             settings,
             client,
             newer: state == SchemaState::Newer,
             pgvector,
-        }))
+        })))
     }
 
     /// True when the database was written by a newer server.
@@ -342,16 +361,33 @@ impl KnowledgeStore for PostgresStore {
 }
 
 /// The store `backend::open` hands out for a PostgreSQL URL: `None` when `access` does not create
-/// the schema and the database has none, and connecting is given up on after `connect_timeout`. Failures are one readable line without the URL (and with
-/// every secret of it scrubbed).
+/// the schema and the database has none, and connecting is given up on after `connect_timeout`.
+/// Failures are one readable line without the URL (and with every secret of it scrubbed).
 pub fn open_boxed(
     url: &str,
     access: Access,
     connect_timeout: Duration,
     secrets: &Secrets,
 ) -> Result<Option<Box<dyn KnowledgeStore>>, OpenError> {
-    match PostgresStore::open_within(url, access, connect_timeout) {
-        Ok(store) => Ok(store.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
+    match open_boxed_with(url, access, connect_timeout, Upgrade::Run, secrets)? {
+        Opened::Ready(store) => Ok(store),
+        Opened::NeedsUpgrade => Err(OpenError::Failed(
+            "cannot open the PostgreSQL database: it needs an upgrade".to_owned(),
+        )),
+    }
+}
+
+/// [`open_boxed`] that may leave an upgrade of the database to a later open (see
+/// [`PostgresStore::open_with`]).
+pub fn open_boxed_with(
+    url: &str,
+    access: Access,
+    connect_timeout: Duration,
+    upgrade: Upgrade,
+    secrets: &Secrets,
+) -> Result<Opened<Box<dyn KnowledgeStore>>, OpenError> {
+    match PostgresStore::open_with(url, access, connect_timeout, upgrade) {
+        Ok(opened) => Ok(opened.map(|store| Box::new(store) as Box<dyn KnowledgeStore>)),
         Err(fault) => Err(open_error(fault, secrets)),
     }
 }

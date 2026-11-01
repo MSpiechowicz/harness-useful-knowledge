@@ -202,11 +202,20 @@ fn a_server_whose_tls_is_refused_is_told_from_one_that_cannot_be_reached() {
         ),
         ("db.example.com", "I/O error: Connection reset by peer (os error 104)"),
         ("db.example.com", "DNS resolution error: no record found"),
+        // The connection closed during the handshake: a limit, a shutdown, a balancer without a backend.
+        ("db.example.com", "I/O error: tls handshake eof"),
+        ("db.example.com", "I/O error: unexpected end of file during handshake"),
     ];
 
     for (host, last_error) in unreached {
         assert!(!selection_is_tls(&timed_out(host, last_error)), "{host}: {last_error}");
     }
+
+    // A server whose TLS is refused says so in rustls' words, whatever it says about the handshake.
+    assert!(selection_is_tls(&timed_out(
+        "db.example.com",
+        "I/O error: received fatal alert: HandshakeFailure"
+    )));
 
     let nobody = "Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [] }";
     assert!(!selection_is_tls(nobody));
@@ -224,6 +233,12 @@ fn an_io_error_that_wraps_a_tls_error_is_a_failure_and_a_plain_one_is_not() {
 
     assert!(matches!(
         backend(&Error::from(ErrorKind::Io(std::sync::Arc::new(plain)))),
+        StoreError::Unreachable(_)
+    ));
+
+    let closed = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof");
+    assert!(matches!(
+        backend(&Error::from(ErrorKind::Io(std::sync::Arc::new(closed)))),
         StoreError::Unreachable(_)
     ));
 }

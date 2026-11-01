@@ -74,6 +74,10 @@ pub enum Problem {
     IndexBuilding,
     /// The server did not answer (the reason, without the URL).
     Unreachable(String),
+    /// The server answered, but the TLS check refused it (a certificate, a server that does not
+    /// speak TLS): a setting to fix, reported like an unreachable server (the reason, without the
+    /// URL).
+    Refused(String),
     /// The server refused the login.
     Auth,
 }
@@ -86,7 +90,7 @@ impl Problem {
             Self::NoPrivilege => "pgvector-no-privilege",
             Self::TooOld(_) => "pgvector-too-old",
             Self::IndexBuilding => "index-building",
-            Self::Unreachable(_) => "unreachable",
+            Self::Unreachable(_) | Self::Refused(_) => "unreachable",
             Self::Auth => "auth",
         }
     }
@@ -94,7 +98,7 @@ impl Problem {
     /// True for a capability the database lacks (exit 3 of a command), false for a server that
     /// could not be reached or refused the login.
     pub fn is_missing(&self) -> bool {
-        !matches!(self, Self::Unreachable(_) | Self::Auth)
+        !matches!(self, Self::Unreachable(_) | Self::Refused(_) | Self::Auth)
     }
 
     /// What to tell the person, in a sentence or two. It never holds the URL or a password.
@@ -111,7 +115,7 @@ impl Problem {
                 format!("pgvector {version} has no HNSW index. Update the extension to version {HNSW_MIN} or newer")
             }
             Self::IndexBuilding => "the vector index is still being built, try again in a moment".to_owned(),
-            Self::Unreachable(reason) => format!("the database cannot be reached ({reason})"),
+            Self::Unreachable(reason) | Self::Refused(reason) => format!("the database cannot be reached ({reason})"),
             Self::Auth => "the database refused the login, check the user and password in the database URL".to_owned(),
         }
     }

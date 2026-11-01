@@ -13,3 +13,4 @@ mod routed;
 mod search;
 mod support;
 mod titles;
+mod upgrade;

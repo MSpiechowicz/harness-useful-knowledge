@@ -451,3 +451,69 @@ fn without_a_remote_database_only_this_computer_can_be_chosen() {
     let done = world.done(&["approve", "--json", &held, "--place", "local"]);
     assert_eq!(done["approved"]["docId"], 1, "plain ids with one place in use");
 }
+
+#[test]
+fn an_approval_to_a_remote_that_cannot_be_reached_is_refused_and_recorded_like_an_import() {
+    use crate::config::Where;
+
+    let world = World::new();
+    let remote = unreachable_remote();
+    let both = Routing::new(Where::RemoteLocal, Where::RemoteLocal);
+    let held = world.propose("Runbook", TEXT, Vec::new(), None);
+
+    let args = [Some("approve"), Some("--json"), Some(held.as_str())];
+    let Reply::Unreachable(message) = reply(&world.env, &remote, both, &args) else {
+        panic!("refused as unreachable");
+    };
+
+    assert_eq!(message, REMOTE_DOWN_WRITE);
+    assert_eq!(
+        world.held().count(),
+        1,
+        "the proposal waits, nothing is saved to this computer"
+    );
+    assert!(!world.database_exists());
+    assert!(
+        world
+            .dir
+            .path()
+            .join("knowledge")
+            .join("remote-unreachable.json")
+            .exists(),
+        "the failure goes to the cooldown that every other command shares"
+    );
+}
+
+#[test]
+fn a_proposal_shows_the_document_it_replaces_as_clients_read_ids() {
+    use crate::store::routed::ids;
+
+    let held = |replaces| {
+        HeldItem::new(
+            Source {
+                client: "tests".to_owned(),
+                session: None,
+                project_path: None,
+                repo_key: None,
+            },
+            Proposal {
+                title: "T".to_owned(),
+                format: "markdown".to_owned(),
+                name: "t.md".to_owned(),
+                source_path: None,
+                content: "text".to_owned(),
+                links: Vec::new(),
+                replaces: Some(replaces),
+            },
+        )
+    };
+
+    assert_eq!(
+        super::public(&held(ids::tag(crate::config::Place::Remote, 12)))["replaces"],
+        serde_json::json!(12)
+    );
+    assert_eq!(
+        super::public(&held(ids::tag(crate::config::Place::Local, 12)))["replaces"],
+        serde_json::json!("local:12")
+    );
+}

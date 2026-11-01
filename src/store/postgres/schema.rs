@@ -5,8 +5,25 @@
 //! `options=-csearch_path=...`. Every table, index and sequence is prefixed `knowledge_`, so the
 //! database can be shared with other tools (harness-memory keeps its own tables and locks).
 //!
-//! Migrations are additive and run in one transaction under an advisory lock, so clients starting
-//! together migrate once. A client that finds a newer version changes nothing.
+//! Migrations run in one transaction under an advisory lock, so clients starting together migrate
+//! once. A client that finds a newer version changes nothing.
+//!
+//! # Adding a version
+//!
+//! A migration on a team's database can run for minutes (a stored generated column rewrites the
+//! table, a GIN index reads every row), so the rules below keep it from failing forever:
+//!
+//! - It runs in its own open ([`super::PostgresStore::open_with`] with [`crate::backend::Upgrade::Run`]),
+//!   which [`crate::backend`] gives a long bound of its own and not the probe deadline of an
+//!   ordinary open, and the transaction lifts the session's statement and idle limits and waits
+//!   longer for locks (see [`migrate_with`]).
+//! - A change that only adds (a column, an index) leaves a read of the older database working:
+//!   queries written for the new version must still answer on the old one, or wait for the writer
+//!   to upgrade it. A change that readers of the old version cannot cope with raises
+//!   [`READABLE_FROM`] to its version, and a read of a database older than that says it has not
+//!   been upgraded yet.
+//! - Version numbers are released: a version that shipped is never edited, a change is a new
+//!   entry of [`migrations`].
 
 use postgres::{Client, GenericClient};
 
@@ -15,7 +32,15 @@ use super::vector::{self, Fault};
 use crate::store::{DIMS, StoreError};
 
 /// The schema version this server writes: how many entries [`migrations`] has.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The oldest schema version a read works with: an older database is refused to a read until a
+/// writer has upgraded it. See the module docs for when to raise it.
+pub(super) const READABLE_FROM: i64 = 1;
+
+/// How long the migration waits for a lock another session holds (the session's own limit is
+/// 10 s, which suits a read or a write but not a migration queued behind running writes).
+const MIGRATION_LOCK_TIMEOUT: &str = "5min";
 
 /// The advisory lock migrations take (database-wide, "knowledge" and 01). Writes hold it shared, so
 /// a migration waits for running writes and later writes see its version.
@@ -114,9 +139,13 @@ CREATE TABLE knowledge_meta (
 /// - `knowledge_chunks`: the unit that is searched. `title` copies the document's title (a rename
 ///   rewrites the copies), because `tsv` is generated from the row's own columns: the title weighs
 ///   A, the heading path B, the text the default D, all in the `simple` configuration (no
-///   stemming, no stop words) with accents folded (see [`fold`]). The embedding is
+///   stemming, no stop words) with accents folded (see [`fold`]). `tsv_heading` and `tsv_text` are
+///   the heading path alone and the text alone: `tsv` concatenates the three, so the positions of
+///   one field continue those of the one before it, and a phrase (`a <-> b`) would match across
+///   fields. A phrase is looked for in each of these two instead. The embedding is
 ///   [`DIMS`] floats of pgvector and always comes with its model.
-/// - `knowledge_chunks_tsv`: the GIN index of `tsv`.
+/// - `knowledge_chunks_tsv`, `knowledge_chunks_tsv_heading`, `knowledge_chunks_tsv_text`: the GIN
+///   indexes of the three.
 /// - [`HNSW_INDEX`]: the HNSW index of the embeddings by cosine distance.
 fn tables() -> String {
     format!(
@@ -165,11 +194,15 @@ CREATE TABLE knowledge_chunks (
         || setweight(to_tsvector('simple'::regconfig, {heading}), 'B')
         || to_tsvector('simple'::regconfig, {text})
     ) STORED,
+    tsv_heading TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {heading})) STORED,
+    tsv_text TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {text})) STORED,
     UNIQUE (doc_id, ordinal),
     CHECK ((embedding IS NULL) = (model_id IS NULL))
 );
 CREATE INDEX knowledge_chunks_sha ON knowledge_chunks (chunk_sha, model_id);
 CREATE INDEX knowledge_chunks_tsv ON knowledge_chunks USING GIN (tsv);
+CREATE INDEX knowledge_chunks_tsv_heading ON knowledge_chunks USING GIN (tsv_heading);
+CREATE INDEX knowledge_chunks_tsv_text ON knowledge_chunks USING GIN (tsv_text);
 CREATE INDEX {HNSW_INDEX} ON knowledge_chunks USING hnsw (embedding vector_cosine_ops);
 
 INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1'), ('dims', '{DIMS}'), ('generation', '0');
@@ -180,30 +213,9 @@ INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1'), ('dims',
     )
 }
 
-/// Version 2: a `tsvector` of the heading path alone and one of the text alone.
-///
-/// `tsv` concatenates the title, the heading path and the text, so the positions of the words of
-/// one field continue those of the one before it, and a phrase (`a <-> b`) would match the last word
-/// of the title and the first of the heading, or the last of the heading and the first of the text.
-/// A phrase is looked for in each of these two instead, so it cannot span fields. Adding a stored
-/// generated column rewrites the table, once.
-fn phrase_columns() -> String {
-    format!(
-        "
-ALTER TABLE knowledge_chunks
-    ADD COLUMN tsv_heading TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {heading})) STORED,
-    ADD COLUMN tsv_text TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple'::regconfig, {text})) STORED;
-CREATE INDEX knowledge_chunks_tsv_heading ON knowledge_chunks USING GIN (tsv_heading);
-CREATE INDEX knowledge_chunks_tsv_text ON knowledge_chunks USING GIN (tsv_text);
-",
-        heading = fold("heading_path"),
-        text = fold("text"),
-    )
-}
-
 /// The migrations in order: entry `n` takes a database from version `n` to `n + 1`.
-fn migrations() -> Vec<String> {
-    vec![format!("{META}{}", tables()), phrase_columns()]
+pub(super) fn migrations() -> Vec<String> {
+    vec![format!("{META}{}", tables())]
 }
 
 /// The version stored in the database: `None` for one that has no knowledge tables.
@@ -242,26 +254,43 @@ pub(super) fn stored_version(client: &mut impl GenericClient) -> Result<Option<i
 /// it. A newer database is left alone. Everything runs in one transaction under the migration
 /// lock, so a server that waits for it finds the work done.
 pub(super) fn migrate(client: &mut Client) -> Result<SchemaState, Fault> {
+    migrate_with(client, &migrations())
+}
+
+/// [`migrate`] with `steps` as the migrations (entry `n` takes version `n` to `n + 1`).
+///
+/// The transaction is not bound by the limits of an ordinary session, which would end a migration
+/// of a real-sized database every time it is tried: it has no statement timeout, no idle limit, and
+/// waits [`MIGRATION_LOCK_TIMEOUT`] for a lock (`SET LOCAL`, so the session's own limits are back
+/// when it ends).
+pub(super) fn migrate_with(client: &mut Client, steps: &[String]) -> Result<SchemaState, Fault> {
+    let target = i64::try_from(steps.len()).unwrap_or(i64::MAX);
+
     match stored_version(client)? {
-        Some(version) if version > SCHEMA_VERSION => return Ok(SchemaState::Newer),
-        Some(SCHEMA_VERSION) => return Ok(SchemaState::Current),
+        Some(version) if version > target => return Ok(SchemaState::Newer),
+        Some(version) if version == target => return Ok(SchemaState::Current),
         _ => {}
     }
 
     let mut tx = client.transaction().map_err(backend)?;
+    tx.batch_execute(&format!(
+        "SET LOCAL statement_timeout = 0; SET LOCAL idle_in_transaction_session_timeout = 0; \
+         SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}';"
+    ))
+    .map_err(backend)?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK])
         .map_err(backend)?;
 
     // Another server may have migrated while this one waited for the lock.
     let from = match stored_version(&mut tx)? {
-        Some(version) if version > SCHEMA_VERSION => return Ok(SchemaState::Newer),
+        Some(version) if version > target => return Ok(SchemaState::Newer),
         Some(version) => usize::try_from(version).unwrap_or(0),
         None => 0,
     };
 
     vector::ensure(&mut tx)?;
 
-    for (index, sql) in migrations().iter().enumerate().skip(from) {
+    for (index, sql) in steps.iter().enumerate().skip(from) {
         tx.batch_execute(sql).map_err(backend)?;
         tx.execute(
             "UPDATE knowledge_meta SET value = $1 WHERE key = 'schema_version'",

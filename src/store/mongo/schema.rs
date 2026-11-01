@@ -2,9 +2,26 @@
 //!
 //! Version 1 is a set of idempotent steps, so servers that start together need no lock: a
 //! collection or index that exists is left as it is, and the schema document is written last
-//! (`$max`), which is what [`version`] reads. Later versions add collections, indexes and fields,
-//! and fill the ones they add from what is stored (see [`super::migrate`]), never rewriting a field
-//! that holds what the person wrote.
+//! (`$max`), which is what [`version`] reads.
+//!
+//! # Adding a version
+//!
+//! Later versions are entries of [`UPGRADES`] (entry `n` takes version `n + 1` to `n + 2`). They
+//! add collections, indexes and fields, and fill the fields they add from what is stored, never
+//! rewriting a field that holds what the person wrote. The rules keep an upgrade of a real-sized
+//! database from failing forever:
+//!
+//! - An upgrade is idempotent, so one that stopped half way is simply run again.
+//! - It runs in its own open ([`super::MongoStore::open_checked`] with
+//!   [`crate::backend::Upgrade::Run`]), which [`crate::backend`] gives a long bound of its own and
+//!   not the probe deadline of an ordinary open.
+//! - It fills fields in pages of 500 through [`super::migrate::update_in_pages`], never one request
+//!   per document.
+//! - A change that only adds leaves a read of the older database working: queries written for the
+//!   new version must still answer on the old one, or wait for the writer to upgrade it. A change
+//!   that readers of the old version cannot cope with raises [`READABLE_FROM`] to its version, and
+//!   a read of a database older than that says it has not been upgraded yet.
+//! - Version numbers are released: a version that shipped is never edited.
 //!
 //! - `knowledge_meta`: `schema` (`version`, `dims`), `generation` (`value`, the write counter),
 //!   the id counters `counter:documents` and `counter:chunks` (`value`), and the meta keys the
@@ -18,7 +35,7 @@
 //!   collection), the folded words of its text (`terms`) and of the title (`title_terms`) for the
 //!   list filter, and the `embedding` (an array of doubles) with its `model_id` once embedded.
 //!   `phrase_text` is the folded words of the heading path and of the text (a newline between them)
-//!   that a multi-word list filter matches with a regular expression, on the server (version 2).
+//!   that a multi-word list filter matches with a regular expression, on the server.
 //!   Indexes: unique `(doc_id, ordinal)`, `(chunk_sha, model_id)`, `terms`, `title_terms`.
 //! - Search indexes on the chunks, built by `mongot` ([`KEYWORD_INDEX`] and [`VECTOR_INDEX`]).
 
@@ -33,8 +50,18 @@ use mongodb::sync::Database;
 use super::connection::{INDEX_EXISTS, NAMESPACE_EXISTS, NAMESPACE_NOT_FOUND, error_code};
 use crate::store::DIMS;
 
-/// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 2;
+/// What takes a database from one version to the next (see the module docs).
+pub(super) type Upgrade = fn(&Database) -> mongodb::error::Result<()>;
+
+/// The upgrades after version 1, in order. There are none yet.
+const UPGRADES: &[Upgrade] = &[];
+
+/// The schema version this server writes: version 1 and one for every entry of [`UPGRADES`].
+pub const SCHEMA_VERSION: i64 = 1 + UPGRADES.len() as i64;
+
+/// The oldest schema version a read works with: an older database is refused to a read until a
+/// writer has upgraded it. See the module docs for when to raise it.
+pub(super) const READABLE_FROM: i64 = 1;
 
 pub(super) const META: &str = "knowledge_meta";
 pub(super) const DOCUMENTS: &str = "knowledge_documents";
@@ -80,9 +107,15 @@ pub fn version(db: &Database) -> mongodb::error::Result<i64> {
 /// (then nothing is changed). The search indexes are created when missing whatever the version, so
 /// a dropped index comes back with the next writer.
 pub(super) fn migrate(db: &Database) -> mongodb::error::Result<bool> {
+    migrate_with(db, UPGRADES)
+}
+
+/// [`migrate`] with `upgrades` after version 1.
+pub(super) fn migrate_with(db: &Database, upgrades: &[Upgrade]) -> mongodb::error::Result<bool> {
+    let target = 1 + i64::try_from(upgrades.len()).unwrap_or(i64::MAX);
     let current = version(db)?;
 
-    if current > SCHEMA_VERSION {
+    if current > target {
         return Ok(true);
     }
 
@@ -92,32 +125,45 @@ pub(super) fn migrate(db: &Database) -> mongodb::error::Result<bool> {
         create_v1(db)?;
     }
 
-    // Version 2 derives two fields from stored ones: only a database that has documents needs it.
-    if current == 1 {
-        super::migrate::upgrade_v2(db)?;
+    // A new database has nothing to fill, so its upgrades are quick. One that has data records
+    // each version as it gets there, so a stopped upgrade resumes from the last.
+    let done = usize::try_from(current.max(1) - 1).unwrap_or(0);
+
+    for (index, upgrade) in upgrades.iter().enumerate().skip(done) {
+        upgrade(db)?;
+
+        if current >= 1 {
+            record_version(db, 2 + i64::try_from(index).unwrap_or(0))?;
+        }
     }
 
     ensure_search_indexes(db)?;
 
-    if current < SCHEMA_VERSION {
-        let meta = db.collection::<Document>(META);
+    if current < target {
+        db.collection::<Document>(META)
+            .update_one(
+                doc! { "_id": "generation" },
+                doc! { "$setOnInsert": { "value": 0_i64 } },
+            )
+            .upsert(true)
+            .run()?;
 
-        meta.update_one(
-            doc! { "_id": "generation" },
-            doc! { "$setOnInsert": { "value": 0_i64 } },
-        )
-        .upsert(true)
-        .run()?;
-
-        meta.update_one(
-            doc! { "_id": SCHEMA_ID },
-            doc! { "$max": { "version": SCHEMA_VERSION }, "$setOnInsert": { "dims": i64::try_from(DIMS).unwrap_or(0) } },
-        )
-        .upsert(true)
-        .run()?;
+        record_version(db, target)?;
     }
 
     Ok(false)
+}
+
+/// Writes `version` as the schema version, never lowering it.
+fn record_version(db: &Database, version: i64) -> mongodb::error::Result<()> {
+    db.collection::<Document>(META)
+        .update_one(
+            doc! { "_id": SCHEMA_ID },
+            doc! { "$max": { "version": version }, "$setOnInsert": { "dims": i64::try_from(DIMS).unwrap_or(0) } },
+        )
+        .upsert(true)
+        .run()
+        .map(drop)
 }
 
 /// Version 1: the collections and their regular indexes.

@@ -347,5 +347,5 @@ fn team_counts_per_repository_and_overall() {
     );
     assert_eq!((stats.global_documents, stats.repositories), (1, 2));
     assert_eq!(stats.model_id.as_deref(), Some(MODEL));
-    assert_eq!(stats.schema_version, crate::store::postgres::schema::SCHEMA_VERSION);
+    assert_eq!(stats.schema_version, 1);
 }

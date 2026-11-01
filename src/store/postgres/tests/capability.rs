@@ -58,7 +58,7 @@ fn team_a_server_with_pgvector_probes_ready_and_nothing_is_created() {
     store.set_meta("model_id", "multilingual-e5-small").expect("model");
 
     let found = probe(db.url()).expect("ready");
-    assert_eq!(found.schema, Some(crate::store::postgres::schema::SCHEMA_VERSION));
+    assert_eq!(found.schema, Some(1));
     assert_eq!(found.model_id.as_deref(), Some("multilingual-e5-small"));
 }
 

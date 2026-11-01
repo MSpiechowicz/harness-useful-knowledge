@@ -40,17 +40,47 @@ pub(super) fn unreachable(error: &postgres::Error) -> bool {
         return true;
     }
 
+    // An I/O error that does not wrap a TLS refusal is a lost or refused connection.
     let mut cause = std::error::Error::source(error);
 
     while let Some(inner) = cause {
         if let Some(io) = inner.downcast_ref::<std::io::Error>() {
-            let refused_by_tls = io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>());
-
-            return !refused_by_tls;
+            return !io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>());
         }
 
         if inner.is::<rustls::Error>() {
             return false;
+        }
+
+        cause = inner.source();
+    }
+
+    false
+}
+
+/// How the driver words an error of its TLS kind (it keeps the kind private): what a server that
+/// answers the TLS request with "no TLS here" ends in, with a cause that has no type to look for.
+const TLS_KIND: &str = "error performing TLS handshake";
+
+/// Whether `error` is the TLS check refusing the server (a certificate, an alert, a server that does
+/// not speak TLS): an error of the driver's TLS kind, or rustls' error as one of its causes, directly or
+/// inside an I/O error.
+pub(super) fn refused_by_tls(error: &postgres::Error) -> bool {
+    if error.as_db_error().is_none() && error.to_string().starts_with(TLS_KIND) {
+        return true;
+    }
+
+    let mut cause = std::error::Error::source(error);
+
+    while let Some(inner) = cause {
+        if inner.is::<rustls::Error>() {
+            return true;
+        }
+
+        if let Some(io) = inner.downcast_ref::<std::io::Error>()
+            && io.get_ref().is_some_and(|wrapped| wrapped.is::<rustls::Error>())
+        {
+            return true;
         }
 
         cause = inner.source();

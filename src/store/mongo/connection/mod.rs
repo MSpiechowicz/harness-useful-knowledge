@@ -283,16 +283,18 @@ pub(super) fn backend(error: &Error) -> StoreError {
     }
 }
 
-/// What the text of a TLS failure of a server says about it, as the driver and rustls word it.
-const TLS_MARKERS: [&str; 8] = [
+/// What rustls says when a server's TLS is refused: a certificate, an alert, a version or cipher
+/// the two do not share, a server that does not speak TLS (its first bytes are a corrupt message).
+/// Words that only mention TLS or a handshake are not here: a connection that closed during the
+/// handshake (`tls handshake eof`, from a connection limit, a shutdown or a load balancer with no
+/// backend) says nothing about the certificate, and is only unreachable.
+const TLS_MARKERS: [&str; 6] = [
     "peer certificate",
     "invalid certificate",
     "fatal alert",
     "peer is incompatible",
     "peer misbehaved",
     "corrupt message",
-    "tls",
-    "handshake",
 ];
 
 /// Whether `error` says the TLS with a server failed: the certificate was refused, or the server did

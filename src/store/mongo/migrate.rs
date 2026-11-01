@@ -1,59 +1,55 @@
-//! Upgrading a database written by an older server.
+//! What an upgrade of the MongoDB schema writes with: updates sent in pages.
 //!
-//! Version 2 adds the field the phrase filter matches on (`phrase_text` of a chunk, see
-//! [`super::terms::phrase_text`]) and re-keys the titles (`title_key` folds ASCII letters only, like
-//! every other store, see [`super::documents::title_key`]). Both are derived from fields that are
-//! already stored, and writing them again gives the same result, so a migration that stopped half
-//! way is simply run again.
+//! An upgrade that fills a field on every chunk of a real-sized database must not cost one round
+//! trip per chunk (millions of them, far past any bound an open has). [`update_in_pages`] sends
+//! them as `update` commands of [`PAGE`] updates each, which every server version runs.
 
-use mongodb::bson::{Document, doc};
+// The upgrade of the next schema version is the first caller of any of this.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use mongodb::bson::{Bson, Document, doc};
+use mongodb::error::Error;
 use mongodb::sync::Database;
 
-use super::documents::title_key;
-use super::schema::{CHUNKS, DOCUMENTS};
-use super::terms;
+/// How many updates one `update` command carries.
+pub(super) const PAGE: usize = 500;
 
-/// Version 2: the folded title key of every document and the phrase text of every chunk.
-pub(super) fn upgrade_v2(db: &Database) -> mongodb::error::Result<()> {
-    let documents = db.collection::<Document>(DOCUMENTS);
+/// Applies `updates` (each a filter and an update document, matching one document) to
+/// `collection`, [`PAGE`] to a command. A page runs unordered, so one failed update does not stop
+/// the others of its page, and the first failure is the error once the page is done.
+///
+/// A filter names `_id` and every field the new value was derived from (the title for a title key),
+/// so a row that someone changed meanwhile is left for the next run instead of getting a value
+/// derived from what it no longer holds.
+pub(super) fn update_in_pages(
+    db: &Database,
+    collection: &str,
+    updates: impl IntoIterator<Item = (Document, Document)>,
+) -> mongodb::error::Result<()> {
+    let mut page: Vec<Bson> = Vec::with_capacity(PAGE);
 
-    for row in documents
-        .find(doc! {})
-        .projection(doc! { "title": 1, "title_key": 1 })
-        .run()?
-    {
-        let row = row?;
-        let title = row.get_str("title").unwrap_or_default();
-        let key = title_key(title);
+    for (filter, update) in updates {
+        page.push(Bson::Document(doc! { "q": filter, "u": update, "multi": false }));
 
-        if row.get_str("title_key").ok() != Some(key.as_str()) {
-            documents
-                .update_one(doc! { "_id": row.get("_id") }, doc! { "$set": { "title_key": key } })
-                .run()?;
+        if page.len() == PAGE {
+            send(db, collection, std::mem::take(&mut page))?;
         }
     }
 
-    let chunks = db.collection::<Document>(CHUNKS);
-    let missing = doc! { "phrase_text": { "$exists": false } };
-
-    for row in chunks
-        .find(missing)
-        .projection(doc! { "heading_path": 1, "text": 1 })
-        .run()?
-    {
-        let row = row?;
-        let phrase = terms::phrase_text(
-            row.get_str("heading_path").unwrap_or_default(),
-            row.get_str("text").unwrap_or_default(),
-        );
-
-        chunks
-            .update_one(
-                doc! { "_id": row.get("_id") },
-                doc! { "$set": { "phrase_text": phrase } },
-            )
-            .run()?;
+    if !page.is_empty() {
+        send(db, collection, page)?;
     }
 
     Ok(())
+}
+
+fn send(db: &Database, collection: &str, updates: Vec<Bson>) -> mongodb::error::Result<()> {
+    let reply = db
+        .run_command(doc! { "update": collection, "updates": updates, "ordered": false })
+        .run()?;
+
+    match reply.get_array("writeErrors") {
+        Ok(failed) if !failed.is_empty() => Err(Error::custom("an update of the upgrade failed")),
+        _ => Ok(()),
+    }
 }

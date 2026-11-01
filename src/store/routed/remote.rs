@@ -165,6 +165,12 @@ impl Remote {
 
                 Ok(())
             }
+            // Nothing is known about the remote itself, so nothing is recorded for other processes.
+            Err(OpenError::Busy(_)) => {
+                self.state = State::Down;
+
+                Ok(())
+            }
             Err(other) => Err(other),
         }
     }
@@ -181,5 +187,30 @@ impl Remote {
         self.state = State::Down;
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_remote_that_was_not_even_tried_leaves_the_answer_to_this_computer_and_records_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let database = dir.path().join("knowledge").join("knowledge.sqlite3");
+        std::fs::create_dir_all(dir.path().join("knowledge")).expect("folder");
+
+        let reach = Reach::beside(&database, "remote:a");
+        let busy = |_: Patience| Err(OpenError::Busy("earlier attempts are still waiting".to_owned()));
+        let mut remote = Remote::lazy(busy, reach.clone(), Duration::from_secs(3), Secrets::default());
+
+        remote.settle().expect("settled");
+        assert!(remote.is_down(), "this computer answers");
+
+        remote.settle_for_write().expect("settled for a write");
+        assert!(remote.is_down());
+
+        assert_eq!(reach.cooling(), None);
+        assert!(!dir.path().join("knowledge").join("remote-unreachable.json").exists());
     }
 }

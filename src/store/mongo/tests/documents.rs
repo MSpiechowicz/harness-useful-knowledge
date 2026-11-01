@@ -432,18 +432,12 @@ fn team_mongo_the_meta_keys_the_store_owns_cannot_be_set() {
     assert_eq!(store.meta("model_id").expect("meta").as_deref(), Some(MODEL));
     assert_eq!(store.meta("missing").expect("meta"), None);
     assert_eq!(store.meta("dims").expect("meta").as_deref(), Some("384"));
-    assert_eq!(
-        store.meta("schema_version").expect("meta").as_deref(),
-        Some(crate::store::mongo::schema::SCHEMA_VERSION.to_string().as_str())
-    );
+    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("1"));
 
     // A key named like an internal document cannot reach a counter or the schema.
     store.set_meta("counter:documents", "oops").expect("a plain key");
     store.set_meta("schema", "oops").expect("a plain key");
-    assert_eq!(
-        store.meta("schema_version").expect("meta").as_deref(),
-        Some(crate::store::mongo::schema::SCHEMA_VERSION.to_string().as_str())
-    );
+    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("1"));
     let id = insert(&mut store, &Seed::new("Guide").chunk("A", "text"));
     assert!(id > 0);
 }

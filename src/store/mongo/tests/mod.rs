@@ -23,6 +23,7 @@ mod ordered;
 mod phrase;
 mod search;
 mod titles;
+mod upgrade;
 mod url;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -29,7 +29,7 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::backend::{self, Access, OpenError};
+use crate::backend::{self, Access, Attempt, OpenError};
 use crate::cli::{self, Args};
 use crate::config::{Backend, Kind, Layout, Place, Routing};
 use crate::extract::pdf::PdfPages;
@@ -39,7 +39,7 @@ use crate::import::place::write_place;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
-use crate::store::{Origin, clean};
+use crate::store::{KnowledgeStore, Origin, clean};
 use crate::support::Env;
 use crate::tokens::counter_for;
 
@@ -172,9 +172,21 @@ fn list(held: &HeldStore, args: &[Option<&str>]) -> Reply {
     }
 }
 
+/// `item` as JSON, its `replaces` written as people and clients read ids (`12` or `local:12`),
+/// never the internal tagged number, which a JSON client reading doubles would round.
+fn public(item: &HeldItem) -> Value {
+    let mut value = serde_json::to_value(item).unwrap_or(Value::Null);
+
+    if let (Value::Object(fields), Some(id)) = (&mut value, item.replaces) {
+        fields.insert("replaces".to_owned(), crate::store::routed::ids::json(id));
+    }
+
+    value
+}
+
 /// `item` without its text and with a preview of it.
 fn summary(item: &HeldItem) -> Value {
-    let mut value = serde_json::to_value(item).unwrap_or(Value::Null);
+    let mut value = public(item);
 
     if let Value::Object(fields) = &mut value {
         fields.remove("content");
@@ -197,7 +209,7 @@ fn get(held: &HeldStore, args: &[Option<&str>]) -> Reply {
     }
 
     match held.get(parsed.positional[0]) {
-        Ok(Some(item)) => Reply::Done(json!({ "held": item })),
+        Ok(Some(item)) => Reply::Done(json!({ "held": public(&item) })),
         Ok(None) => not_found(),
         Err(message) => Reply::Failed(message),
     }
@@ -249,7 +261,28 @@ fn open_failure(error: OpenError) -> Reply {
     match error {
         OpenError::Missing { code, message } => Reply::Missing { code, message },
         OpenError::Failed(message) => Reply::Failed(message),
-        OpenError::Unreachable(_) => Reply::Unreachable(REMOTE_DOWN_WRITE.to_owned()),
+        OpenError::Unreachable(_) | OpenError::Busy(_) => Reply::Unreachable(REMOTE_DOWN_WRITE.to_owned()),
+    }
+}
+
+/// The store of `place`, which an approval is about to change. With both places in use the remote
+/// database is opened like every other write to it (see `Context::open_place_to_change` of `docs`):
+/// a server that accepts the connection and never speaks is cut off, the cooldown of an earlier
+/// failure is recorded and cleared, and one that cannot be reached is refused, never replaced by this
+/// computer.
+fn open_to_change(
+    env: &Env,
+    backend: &Backend,
+    routing: Routing,
+    place: Place,
+) -> Result<Option<Box<dyn KnowledgeStore>>, Reply> {
+    if place != Place::Remote || routing.layout() != Layout::Both {
+        return backend::open_place(env, backend, place, Access::Create).map_err(open_failure);
+    }
+
+    match backend::attempt_remote(env, backend, Access::Create, false).map_err(open_failure)? {
+        Attempt::Opened(store) => Ok(store),
+        Attempt::Offline(_) => Err(Reply::Unreachable(REMOTE_DOWN_WRITE.to_owned())),
     }
 }
 
@@ -317,10 +350,10 @@ fn import(
         problem: None,
     };
 
-    let mut store = match backend::open_place(env, backend, place, Access::Create) {
+    let mut store = match open_to_change(env, backend, routing, place) {
         Ok(Some(store)) => store,
         Ok(None) => return Err(Reply::Failed("the database could not be created".to_owned())),
-        Err(error) => return Err(open_failure(error)),
+        Err(reply) => return Err(reply),
     };
 
     let counter = counter_for(env);

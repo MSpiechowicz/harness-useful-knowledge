@@ -87,19 +87,24 @@ fn a_replacement_of_a_document_on_this_computer_updates_it_there_without_being_t
 }
 
 #[test]
-fn an_id_that_names_a_place_is_refused_while_only_one_place_is_in_use() {
+fn an_id_naming_the_only_place_in_use_replaces_there_and_one_naming_the_other_place_is_refused() {
     let world = computer();
-    let held = world.propose(
-        "Replacement",
-        TEXT,
-        Vec::new(),
-        Some(crate::store::routed::ids::tag(Place::Local, 1)),
-    );
+    let local_one = crate::store::routed::ids::tag(Place::Local, 1);
 
-    let Reply::Refused(Code::Refused, message) = approve(&world, Routing::local(), &held, &[]) else {
+    let held = world.propose("Replacement", TEXT, Vec::new(), Some(local_one));
+    let Reply::Done(done) = approve(&world, Routing::local(), &held, &[]) else {
+        panic!("approved");
+    };
+    assert_eq!(done["approved"]["status"], "updated");
+    assert_eq!(mine(&world), "Replacement");
+
+    // The remote database alone: this computer's document is not a place in use any more.
+    let held = world.propose("Another", "Another zebrafish text.", Vec::new(), Some(local_one));
+    let remote_only = Routing::new(Where::Remote, Where::Remote);
+    let Reply::Refused(Code::Refused, message) = approve(&world, remote_only, &held, &[]) else {
         panic!("not refused");
     };
-
-    assert!(message.contains("both in use"), "{message}");
-    assert_eq!(mine(&world), "Mine");
+    assert!(message.contains("not in use"), "{message}");
+    assert_eq!(mine(&world), "Replacement", "this computer's document is untouched");
+    assert!(world.held().get(&held).expect("get").is_some(), "the proposal waits");
 }

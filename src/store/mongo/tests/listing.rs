@@ -372,7 +372,7 @@ fn team_mongo_counts_per_repository_and_overall() {
     );
     assert_eq!((stats.global_documents, stats.repositories), (1, 2));
     assert_eq!(stats.model_id.as_deref(), Some(crate::store::testing::MODEL));
-    assert_eq!(stats.schema_version, crate::store::mongo::schema::SCHEMA_VERSION);
+    assert_eq!(stats.schema_version, 1);
 }
 
 #[test]

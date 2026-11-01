@@ -14,7 +14,9 @@ use crate::store::StoreError;
 fn open_failure(error: OpenError) -> StoreError {
     match error {
         OpenError::Missing { code, message } => StoreError::Missing { code, message },
-        OpenError::Failed(message) | OpenError::Unreachable(message) => StoreError::Backend(message),
+        OpenError::Failed(message) | OpenError::Unreachable(message) | OpenError::Busy(message) => {
+            StoreError::Backend(message)
+        }
     }
 }
 

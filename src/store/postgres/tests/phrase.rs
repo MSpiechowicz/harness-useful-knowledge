@@ -1,6 +1,6 @@
 //! A phrase of the list filter and of the matches of a document is found in the heading path or in
-//! the text, never across the title, the heading and the text, and an older database is upgraded to
-//! tell them apart.
+//! the text, never across the title, the heading and the text. A new database has the vectors that
+//! tell them apart from version 1.
 
 use super::support::{database, insert};
 use crate::backend::Access;
@@ -76,29 +76,47 @@ fn team_a_phrase_never_spans_the_title_the_heading_and_the_text() {
 }
 
 #[test]
-fn team_an_older_database_is_upgraded_so_a_phrase_cannot_span_fields() {
+fn team_a_new_database_has_the_phrase_columns_and_their_indexes_from_version_1() {
     let Some(db) = database() else { return };
     let mut store = db.open();
     fill(&mut store);
-    drop(store);
 
-    // What a version 1 database looks like: one `tsv`, no separate heading and text vectors.
-    db.admin()
-        .batch_execute(
-            "ALTER TABLE knowledge_chunks DROP COLUMN tsv_heading, DROP COLUMN tsv_text;
-             UPDATE knowledge_meta SET value = '1' WHERE key = 'schema_version';",
+    assert_eq!(store.schema_version().expect("version"), 1);
+
+    let mut admin = db.admin();
+    let columns: Vec<String> = admin
+        .query(
+            "SELECT column_name::text FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 'knowledge_chunks' AND column_name LIKE 'tsv%' ORDER BY 1",
+            &[&db.schema()],
         )
-        .expect("downgrade");
+        .expect("columns")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(columns, ["tsv", "tsv_heading", "tsv_text"]);
 
-    let Err(refused) = PostgresStore::open(db.url(), Access::Read) else {
-        panic!("an older database is refused to a read");
-    };
-    assert!(
-        crate::store::StoreError::from(refused).to_string().contains("older"),
-        "a read does not upgrade"
+    let indexes: Vec<String> = admin
+        .query(
+            "SELECT indexname::text FROM pg_indexes WHERE schemaname = $1 AND indexname LIKE 'knowledge_chunks_tsv%' ORDER BY 1",
+            &[&db.schema()],
+        )
+        .expect("indexes")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        indexes,
+        [
+            "knowledge_chunks_tsv",
+            "knowledge_chunks_tsv_heading",
+            "knowledge_chunks_tsv_text"
+        ]
     );
 
-    let mut upgraded = db.open();
-    assert!(!listed(&mut upgraded, "alpha beta").contains(&"Gateway".to_owned()));
-    assert_eq!(listed(&mut upgraded, "setup alpha"), ["Gateway"]);
+    // A read of it works as it is.
+    let mut read = PostgresStore::open(db.url(), Access::Read)
+        .expect("opens")
+        .expect("exists");
+    assert_eq!(listed(&mut read, "setup alpha"), ["Gateway"]);
 }
