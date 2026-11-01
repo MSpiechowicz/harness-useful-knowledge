@@ -94,8 +94,11 @@ pub(super) fn check(env: &Env, root: &Path) -> Result<(), String> {
 const SECRET_FOLDERS: [&str; 6] = [".ssh", ".gnupg", ".aws", ".password-store", ".kube", ".docker"];
 
 fn holds_secrets(root: &Path) -> bool {
-    root.components()
-        .any(|part| SECRET_FOLDERS.iter().any(|secret| part.as_os_str() == *secret))
+    root.components().any(|part| {
+        SECRET_FOLDERS
+            .iter()
+            .any(|secret| part.as_os_str().to_string_lossy().eq_ignore_ascii_case(secret))
+    })
 }
 
 #[cfg(unix)]
@@ -120,6 +123,7 @@ mod tests {
     fn folders_that_keep_keys_are_refused_even_as_projects() {
         assert!(super::holds_secrets(Path::new("/home/u/.password-store")));
         assert!(super::holds_secrets(Path::new("/home/u/.ssh/keys")));
+        assert!(super::holds_secrets(Path::new("/Users/u/.SSH")));
         assert!(!super::holds_secrets(Path::new("/home/u/code/sshd-config")));
     }
 }
