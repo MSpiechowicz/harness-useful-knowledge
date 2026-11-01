@@ -20,6 +20,10 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
         Sort::Title => "title_key",
         Sort::Updated => "updated_at",
         Sort::Size => "bytes",
+        Sort::Format => "format",
+        Sort::Chunks => "chunk_count",
+        // An array sorts by its smallest element ascending, an empty one (global) first.
+        Sort::Repos => "repo_keys",
     };
     let direction = if query.descending { -1 } else { 1 };
     let sort = doc! { key: direction, "_id": direction };

@@ -3,7 +3,7 @@
 //! object on stdout. Timestamps are RFC 3339, field names camelCase.
 //!
 //! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--sort
-//!   title|updated|size] [--desc] [--page N] [--per-page N]` prints `{"items": [...], "total": N}`:
+//!   title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N]` prints `{"items": [...], "total": N}`:
 //!   one page of the documents (see [`json::document`] for an item, it has its `links`). `--repo`
 //!   keeps the documents linked to that repository key, `--global` those linked to none, `--all`
 //!   (the default) every one. `--query` keeps the documents whose title contains it or whose text has
@@ -49,7 +49,7 @@ use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
-                         [--sort title|updated|size] [--desc] [--page N] [--per-page N] | docs get --json ID \
+                         [--sort title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] | docs get --json ID \
                          [--sections] [--chunk CID] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
                          --json (ID... | --all) | repos --json | stats --json | project-key --json \
@@ -236,6 +236,9 @@ fn parse_list(args: &[Option<&str>]) -> Result<ListQuery, Failure> {
         None | Some("updated") => Sort::Updated,
         Some("title") => Sort::Title,
         Some("size") => Sort::Size,
+        Some("format") => Sort::Format,
+        Some("chunks") => Sort::Chunks,
+        Some("repos") => Sort::Repos,
         Some(_) => return Err(Failure::Usage),
     };
 

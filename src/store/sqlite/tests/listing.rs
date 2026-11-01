@@ -292,3 +292,48 @@ fn counts_per_repository_and_overall() {
     assert_eq!(stats.model_id.as_deref(), Some(crate::store::testing::MODEL));
     assert_eq!(stats.schema_version, 1);
 }
+
+#[test]
+fn sorting_by_format_chunks_and_repositories_keeps_each_column_in_order() {
+    let mut store = big_store();
+
+    let by = |store: &mut SqliteStore, sort, descending| {
+        store
+            .list(&ListQuery {
+                sort,
+                descending,
+                limit: 200,
+                offset: 0,
+                ..everything()
+            })
+            .expect("list")
+    };
+
+    let formats: Vec<String> = by(&mut store, Sort::Format, false)
+        .items
+        .iter()
+        .map(|row| row.doc.format.clone())
+        .collect();
+    assert!(formats.windows(2).all(|pair| pair[0] <= pair[1]));
+
+    let chunks: Vec<usize> = by(&mut store, Sort::Chunks, true)
+        .items
+        .iter()
+        .map(|row| row.doc.chunk_count)
+        .collect();
+    assert!(chunks.windows(2).all(|pair| pair[0] >= pair[1]));
+
+    let first_repo = |row: &crate::store::DocumentRow| {
+        row.links
+            .iter()
+            .map(|link| link.repo_key.clone())
+            .min()
+            .unwrap_or_default()
+    };
+    let repos: Vec<String> = by(&mut store, Sort::Repos, false)
+        .items
+        .iter()
+        .map(first_repo)
+        .collect();
+    assert!(repos.windows(2).all(|pair| pair[0] <= pair[1]), "{repos:?}");
+}

@@ -33,6 +33,11 @@ pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result
         Sort::Title => "lower(d.title) COLLATE \"C\"",
         Sort::Updated => "d.updated_at",
         Sort::Size => "d.bytes",
+        Sort::Format => "d.format",
+        Sort::Chunks => "d.chunk_count",
+        Sort::Repos => {
+            "coalesce((SELECT min(l.repo_key) COLLATE \"C\" FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')"
+        }
     };
     let direction = if query.descending { "DESC" } else { "ASC" };
 

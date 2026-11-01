@@ -212,6 +212,9 @@ pub(crate) fn page_sql(filter: &str, query: &ListQuery, params: usize) -> String
         Sort::Title => "d.title COLLATE NOCASE",
         Sort::Updated => "d.updated_at",
         Sort::Size => "d.bytes",
+        Sort::Format => "d.format",
+        Sort::Chunks => "d.chunk_count",
+        Sort::Repos => "coalesce((SELECT min(l.repo_key) FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')",
     };
     let direction = if query.descending { "DESC" } else { "ASC" };
 

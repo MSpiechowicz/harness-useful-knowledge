@@ -212,6 +212,10 @@ pub enum Sort {
     Title,
     Updated,
     Size,
+    Format,
+    Chunks,
+    /// By the first repository key a document links to; global documents come first ascending.
+    Repos,
 }
 
 /// One page of the document list.
