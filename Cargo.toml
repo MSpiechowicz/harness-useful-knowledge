@@ -30,6 +30,10 @@ dunce = "1.0.5"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # The temporary file of an atomic private write.
 tempfile = "3.27.0"
+# The local database (SQLite with FTS5), built into the binary.
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+# The path globs of a document's repo links (`src/**/*.rs`).
+globset = { version = "0.4.21", default-features = false }
 
 # Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
 [target.'cfg(unix)'.dependencies]

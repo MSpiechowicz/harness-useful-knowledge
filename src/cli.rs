@@ -1,7 +1,8 @@
 //! What the commands share: their options, the settings, the repository `--project` names and the
 //! paging options of the lists.
 //!
-//! Usage errors exit 2, failures (settings, database) exit 1. A failure ends stderr with the line
+//! Usage errors and unsupported databases exit 2, failures (settings, database) exit 1, a missing
+//! capability of the database (`check`'s problem codes) exit 3. A failure ends stderr with the line
 //! that says why (`harness-knowledge: …`, after any warning), so a caller may show the last line.
 
 use std::path::PathBuf;
@@ -215,6 +216,25 @@ pub fn failed(message: &str) -> ExitCode {
     println!("{}", serde_json::json!({ "error": "failed", "message": message }));
     eprintln!("harness-knowledge: {message}");
     ExitCode::FAILURE
+}
+
+/// Prints a command this build does not support (a team database that has no store yet) as
+/// `{"error": "unsupported", "message"}` on stdout and the message on stderr; exit 2.
+pub fn unsupported(message: &str) -> ExitCode {
+    println!("{}", serde_json::json!({ "error": "unsupported", "message": message }));
+    eprintln!("harness-knowledge: {message}");
+    ExitCode::from(2)
+}
+
+/// Prints a missing capability of the database (`code` is a `check` problem code such as `no-fts5`) as
+/// `{"error": "missing", "code", "message"}` on stdout and the message on stderr; exit 3.
+pub fn missing_capability(code: &str, message: &str) -> ExitCode {
+    println!(
+        "{}",
+        serde_json::json!({ "error": "missing", "code": code, "message": message })
+    );
+    eprintln!("harness-knowledge: {message}");
+    ExitCode::from(3)
 }
 
 /// The environment and the settings, after printing their warnings; `None`, with the reason
