@@ -34,6 +34,17 @@ tempfile = "3.27.0"
 rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
 # The path globs of a document's repo links (`src/**/*.rs`).
 globset = { version = "0.4.21", default-features = false }
+# The PostgreSQL team backend (pgvector): the synchronous client, TLS through rustls with the ring
+# provider (no OpenSSL), and the platform's trusted roots.
+postgres = "0.19.14"
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+# The MongoDB team backend (Atlas Search and Vector Search): the official driver's blocking API, TLS
+# through rustls with ring, DNS for `mongodb+srv://` seed lists.
+mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver", "sync"] }
+# The libSQL team backend (sqld, Turso): a blocking HTTP client for the Hrana pipeline API.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
 
 # Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
 [target.'cfg(unix)'.dependencies]
