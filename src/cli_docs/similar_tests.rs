@@ -278,7 +278,8 @@ fn folders_expand_as_an_import_walks_them_and_files_that_fail_say_why() {
     assert_eq!(
         paths,
         [
-            first.to_string_lossy().as_ref(),
+            // Both come from walking the folder, so both are shown resolved (macOS: /var is /private/var).
+            dunce::canonicalize(&first).expect("a.md").to_string_lossy().as_ref(),
             dunce::canonicalize(lab.root.path().join("files/docs/sub/b.md"))
                 .expect("canonical")
                 .to_string_lossy()

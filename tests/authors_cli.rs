@@ -16,6 +16,13 @@ fn run(root: &Path, args: &[&str], stdin: &str) -> Vec<Value> {
         .args(args)
         .env_clear()
         .env("HOME", root)
+        // Windows finds the home folder through USERPROFILE, and git does not start without SystemRoot.
+        .env("USERPROFILE", root)
+        .envs(
+            ["SystemRoot", "SYSTEMROOT", "windir", "PATHEXT", "TEMP", "TMP"]
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| (*name, value))),
+        )
         .env("HARNESS_KNOWLEDGE_DIR", root.join("knowledge"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .current_dir(root)

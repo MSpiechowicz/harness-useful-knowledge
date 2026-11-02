@@ -10,6 +10,10 @@ use crate::location::FILE_NAME;
 use crate::store::testing::{Seed, axis};
 use crate::store::{Detail, SqliteStore};
 
+/// A budget no busy test machine runs out of, for the tests that check where the counts land (the real
+/// [`COUNT_BUDGET`] is checked by the test of a locked database).
+const LANDS: Duration = Duration::from_secs(10);
+
 /// `(id, shown)` of every document in the database under `dir`, in id order.
 fn shown(dir: &std::path::Path) -> Vec<(i64, i64)> {
     let path = dir.join("knowledge").join(FILE_NAME);
@@ -45,7 +49,7 @@ fn the_documents_a_recall_points_to_count_as_shown_and_the_others_do_not() {
     );
 
     let mut out: Vec<u8> = Vec::new();
-    print_and_count(&mut out, recalled, COUNT_BUDGET);
+    print_and_count(&mut out, recalled, LANDS);
 
     let pointed = String::from_utf8(out).expect("text").matches("<knowledge-doc ").count();
     let counts = shown(dir.path());
@@ -88,7 +92,7 @@ fn counting_starts_only_after_the_output_is_flushed() {
         seen: Rc::clone(&seen),
     };
 
-    print_and_count(&mut out, recalled, COUNT_BUDGET);
+    print_and_count(&mut out, recalled, LANDS);
 
     assert_eq!(*seen.borrow(), vec![0], "nothing counted when the output was flushed");
     assert_eq!(
@@ -128,7 +132,7 @@ fn an_unreachable_remote_does_not_stop_the_documents_of_this_computer_counting()
     setup.routing = Routing::new(crate::config::Where::RemoteLocal, crate::config::Where::RemoteLocal);
 
     let recalled = recalled_pointers(PROMPT, setup).expect("a block");
-    print_and_count(&mut Vec::new(), recalled, COUNT_BUDGET);
+    print_and_count(&mut Vec::new(), recalled, LANDS);
 
     assert_eq!(shown(dir.path()), vec![(1, 1)]);
 }
