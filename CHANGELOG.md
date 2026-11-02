@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.0.1...v1.1.0) (2026-11-02)
+
+
+### Features
+
+* **docs:** usefulness, authors and similar documents ([cdb483e](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/cdb483efadb301ac262ecbce08444f94de075e6d))
+
 ## [1.0.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.0.0...v1.0.1) (2026-11-01)
 
 
