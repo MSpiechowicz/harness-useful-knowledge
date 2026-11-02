@@ -6,7 +6,7 @@ use crate::store::SqliteStore;
 use crate::store::testing::{Seed, angled, axis, insert};
 
 /// An embedder that answers with a fixed vector, or fails, and counts its calls.
-struct Fake {
+pub(super) struct Fake {
     answer: Result<Vec<f32>, String>,
     asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -18,7 +18,7 @@ impl QueryEmbedder for Fake {
     }
 }
 
-fn answering(vector: Vec<f32>) -> Box<Fake> {
+pub(super) fn answering(vector: Vec<f32>) -> Box<Fake> {
     Box::new(Fake {
         answer: Ok(vector),
         asked: Default::default(),
@@ -33,7 +33,7 @@ fn down() -> Box<Fake> {
 }
 
 /// A data folder with a database holding `seeds`, and the setup to recall from it.
-fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> (tempfile::TempDir, Setup) {
+pub(super) fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> (tempfile::TempDir, Setup) {
     let dir = tempfile::tempdir().expect("temp dir");
     let folder = dir.path().join("knowledge");
 
@@ -57,7 +57,7 @@ fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> (tempfile::
     (dir, setup)
 }
 
-fn guide(title: &str, degrees: f32) -> Seed {
+pub(super) fn guide(title: &str, degrees: f32) -> Seed {
     Seed::new(title).embedded(
         "Install > Linux",
         &format!("Run the {title} installer and restart the gateway afterwards. It writes a service file."),
@@ -65,7 +65,7 @@ fn guide(title: &str, degrees: f32) -> Seed {
     )
 }
 
-const PROMPT: &str = "How do I install the gateway and restart it afterwards?";
+pub(super) const PROMPT: &str = "How do I install the gateway and restart it afterwards?";
 
 #[test]
 fn a_prompt_with_an_answer_gets_at_most_three_pointers_in_a_kilobyte() {

@@ -6,7 +6,10 @@ use serde_json::Value;
 
 use super::reply::Capped;
 use super::scope::{NO_PROJECT, repository, scope_arg, search_scope};
-use super::{PATHS_MAX, QUERY_MAX, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, Server, VECTORS_UNAVAILABLE, open_store};
+use super::{
+    DESKTOP_CLIENT, PATHS_MAX, QUERY_MAX, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, Server, VECTORS_UNAVAILABLE,
+    open_store,
+};
 use crate::search::render::{FRAME, Pointer, block, chunk_ref, words_of};
 use crate::search::{self, Query, Tuning, Vectors};
 use crate::store::clean;
@@ -39,6 +42,7 @@ pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<
         "knowledge_list" => parse(arguments)
             .and_then(|args| super::list::list(server, args))
             .map(|text| with_offline_notice(server, text)),
+        "knowledge_feedback" => parse(arguments).and_then(|args| super::feedback::feedback(server, args)),
         "knowledge_add" => parse(arguments).and_then(|args| super::add::add(server, args)),
         _ => return None,
     };
@@ -147,21 +151,34 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
 
     let words = words_of(&text);
 
+    // Only the documents the reply really shows count as shown: the cap can leave some out.
+    let mut shown: Vec<i64> = Vec::new();
+
     for scored in &found.hits {
         let pointer = Pointer::of(scored, &words);
 
-        if chunks {
+        let added = if chunks {
             reply.push(&block(
                 crate::search::render::DOC_TAG,
                 &pointer.attributes(),
                 &scored.hit.text,
-            ));
+            ))
         } else {
-            reply.push(&pointer.block());
+            reply.push(&pointer.block())
+        };
+
+        if added {
+            shown.push(scored.hit.doc_id);
         }
     }
 
     let mut text = reply.finish();
+
+    // The desktop searches in the background: that is not an agent being shown a document. The
+    // counter is written after the reply (see [`Server::after_reply`]) and never fails the search.
+    if server.client.as_deref() != Some(DESKTOP_CLIENT) {
+        server.counting.queue_shown(&shown);
+    }
 
     if !found.hits.is_empty() {
         let first = &found.hits[0].hit;

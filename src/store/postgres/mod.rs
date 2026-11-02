@@ -25,12 +25,14 @@
 //! Errors carry the SQLSTATE with a fixed description, never the server's message, stored text, the
 //! URL or a password (see [`error`]).
 
+mod columns;
 mod connect;
 mod documents;
 mod error;
 mod listing;
 mod meta;
 mod probe;
+mod quality;
 pub mod schema;
 mod search;
 mod session;
@@ -51,9 +53,10 @@ pub use vector::{Fault, Problem};
 
 use super::upgrade::{Plan, plan};
 use super::{
-    Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
+    Chunk, ChunkHit, ChunkMatches, Columns, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link,
+    ListQuery,
 };
-use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
+use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 use crate::backend::{Access, OpenError, Opened, Upgrade};
 use crate::config::Secrets;
 use error::{backend, ended};
@@ -68,6 +71,8 @@ pub struct PostgresStore {
     newer: bool,
     /// The pgvector this database has, `None` when it was dropped after the tables were made.
     pgvector: Option<Version>,
+    /// The columns added in place that the database has (see [`columns`]).
+    columns: Columns,
 }
 
 impl std::fmt::Debug for PostgresStore {
@@ -129,12 +134,19 @@ impl PostgresStore {
         };
 
         let pgvector = vector::installed(&mut client)?;
+        let newer = state == SchemaState::Newer;
+        let columns = if newer {
+            Columns::NONE
+        } else {
+            open_columns(&mut client, access)?
+        };
 
         Ok(Opened::Ready(Some(Self {
             settings,
             client,
-            newer: state == SchemaState::Newer,
+            newer,
             pgvector,
+            columns,
         })))
     }
 
@@ -250,6 +262,19 @@ fn transact<T>(
     Ok(result)
 }
 
+/// Adds the columns the database lacks when `access` writes, and reports which it has now. A
+/// database that refuses them (a role without the right to change the schema) is used with what it
+/// has, with one line on stderr.
+fn open_columns(client: &mut Client, access: Access) -> Result<Columns, StoreError> {
+    if matches!(access, Access::Existing | Access::Create)
+        && let Err(error) = columns::ensure(client)
+    {
+        super::quality::warn_unavailable(&error);
+    }
+
+    columns::present(client)
+}
+
 /// The error of a `COMMIT` whose connection closed: the server may or may not have saved it.
 fn uncertain(error: StoreError) -> StoreError {
     match error {
@@ -280,15 +305,26 @@ impl KnowledgeStore for PostgresStore {
         let links = clean::links(links)?;
         clean::chunks(chunks)?;
 
-        self.write(|tx| documents::put(tx, doc, &title, chunks, &links))
+        let columns = self.columns;
+
+        self.write(|tx| {
+            let id = documents::put(tx, doc, &title, chunks, &links)?;
+            documents::stamp_authors(tx, columns, id, doc)?;
+
+            Ok(id)
+        })
     }
 
     fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|client| documents::find(client, "content_sha256", sha))
+        let columns = self.columns;
+
+        self.read(|client| documents::find(client, columns, "content_sha256", sha))
     }
 
     fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|client| documents::find(client, "source_key", key))
+        let columns = self.columns;
+
+        self.read(|client| documents::find(client, columns, "source_key", key))
     }
 
     fn reusable_embeddings(
@@ -313,6 +349,29 @@ impl KnowledgeStore for PostgresStore {
         self.write(|tx| documents::set_embeddings(tx, model_id, embeddings))
     }
 
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.count_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.count_useful(ids, at)
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        let columns = self.columns;
+
+        self.read(|client| quality::by_title(client, columns, title, scope))
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|client| quality::sharing(client, chunk_shas))
+    }
+
+    /// Whether this role has the UPDATE privilege on the documents; `None` when the probe fails.
+    fn remote_writable(&mut self) -> Option<bool> {
+        self.read(|client| Ok(quality::may_update(client))).ok().flatten()
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -330,11 +389,15 @@ impl KnowledgeStore for PostgresStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-        self.read(|client| listing::list(client, query))
+        let columns = self.columns;
+
+        self.read(|client| listing::list(client, columns, query))
     }
 
     fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-        self.read(|client| listing::get(client, id, detail))
+        let columns = self.columns;
+
+        self.read(|client| listing::get(client, columns, id, detail))
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {

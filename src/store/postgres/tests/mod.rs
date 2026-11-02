@@ -9,6 +9,7 @@ mod embeddings;
 mod files;
 mod listing;
 mod phrase;
+mod quality;
 mod routed;
 mod search;
 mod support;

@@ -238,3 +238,42 @@ fn a_claim_left_behind_by_a_dead_process_is_put_back_after_ten_minutes() {
     assert!(path_of(&store, &id).is_file());
     assert!(store.claim(&id).expect("claim").is_some(), "it can be decided again");
 }
+
+#[test]
+fn the_name_of_the_author_is_kept_and_a_file_with_or_without_it_keeps_its_revision() {
+    let (_dir, store) = store();
+
+    let mut named = proposal("Guide", "text one");
+    named.added_by = Some("Ada".to_owned());
+    let id = store.hold(named).expect("held");
+    let plain = store.hold(proposal("Guide", "text two")).expect("held");
+
+    assert_eq!(
+        store.get(&id).expect("get").expect("held").added_by.as_deref(),
+        Some("Ada")
+    );
+
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path_of(&store, &plain)).expect("read")).expect("JSON");
+    assert!(
+        written.get("addedBy").is_none(),
+        "no name, no key: the file an older version wrote"
+    );
+
+    // The name is no part of the revision, so a file of an older version still loads once it is
+    // given one and a file of this version still loads for an older version that drops it.
+    let mut older: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path_of(&store, &id)).expect("read")).expect("JSON");
+    older.as_object_mut().expect("object").remove("addedBy");
+    std::fs::write(path_of(&store, &id), serde_json::to_vec(&older).expect("JSON")).expect("write");
+    assert_eq!(store.get(&id).expect("get").expect("held").added_by, None);
+
+    older["addedBy"] = serde_json::json!("Grace");
+    std::fs::write(path_of(&store, &id), serde_json::to_vec(&older).expect("JSON")).expect("write");
+    assert_eq!(
+        store.get(&id).expect("get").expect("held").added_by.as_deref(),
+        Some("Grace")
+    );
+
+    assert_eq!(store.list().expect("list").len(), 2);
+}

@@ -16,11 +16,13 @@
 //! sets it, so renaming or relinking a document leaves it as it was.
 
 pub mod clean;
+mod error;
 pub mod fuse;
 pub mod glob;
 pub mod libsql;
 pub mod mongo;
 pub mod postgres;
+pub mod quality;
 pub mod rank;
 pub mod reach;
 pub mod routed;
@@ -33,6 +35,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use error::StoreError;
+pub use quality::{Author, Columns, DocUsage, TitleScope, UsefulFilter};
 pub use reach::Reach;
 pub use routed::{Kinds, Part, RoutedStore};
 pub use sqlite::SqliteStore;
@@ -95,6 +99,11 @@ pub struct Document {
     pub origin: Origin,
     /// What the extraction noticed (a table dropped, a page without text).
     pub warnings: Vec<String>,
+    /// Who first stored it. Kept as it was when a stored document is put again (the input is
+    /// ignored then); `None` when no git name was known, or the database has no author columns.
+    pub added_by: Option<Author>,
+    /// Who stored the latest import of the content.
+    pub updated_by: Option<Author>,
 }
 
 /// A document's link to one repository, and the paths in it the document is about.
@@ -225,6 +234,20 @@ pub enum Sort {
     Chunks,
     /// By the first repository key a document links to; global documents come first ascending.
     Repos,
+    /// By how often agents found it useful (a document nobody rated counts 0).
+    Useful,
+    /// By when an agent last found it useful (never counts 0).
+    LastUseful,
+}
+
+impl Sort {
+    /// The order a database without the counter columns uses for the sorts by usefulness.
+    pub fn without_usage(self) -> Self {
+        match self {
+            Self::Useful | Self::LastUseful => Self::Updated,
+            other => other,
+        }
+    }
 }
 
 /// One page of the document list.
@@ -236,6 +259,8 @@ pub struct ListQuery {
     /// Keeps the documents whose title contains it, or whose text has all its words next to each
     /// other in that order (the last as a prefix). Blank keeps all.
     pub text: String,
+    /// Keeps the documents agents found useful, or never useful; `None` keeps all.
+    pub useful: Option<UsefulFilter>,
     pub sort: Sort,
     pub descending: bool,
     pub offset: usize,
@@ -247,6 +272,8 @@ pub struct ListQuery {
 pub struct DocumentRow {
     pub doc: Document,
     pub links: Vec<Link>,
+    /// `None` when the database has no counter columns.
+    pub usage: Option<DocUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +295,8 @@ pub struct Detail {
 pub struct DocumentDetail {
     pub doc: Document,
     pub links: Vec<Link>,
+    /// `None` when the database has no counter columns.
+    pub usage: Option<DocUsage>,
     /// Every chunk's outline, in order, when asked.
     pub sections: Option<Vec<Section>>,
     /// The chunk asked for, with its text and no vector.
@@ -326,49 +355,6 @@ pub struct Stats {
     pub model_id: Option<String>,
 }
 
-/// Store failures; every message is safe to show to the agent.
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    /// The input breaks a limit or a rule.
-    #[error("{0}")]
-    Invalid(String),
-    /// The document or chunk does not exist.
-    #[error("{0}")]
-    NotFound(String),
-    /// The database was written by a newer server; nothing is read or written.
-    #[error("the knowledge database is newer than this server")]
-    NewerSchema,
-    /// This SQLite build has no FTS5, so there is no keyword index.
-    #[error("this SQLite build has no FTS5 full-text search")]
-    NoFts5,
-    /// The database lacks a capability (a `check` problem code such as `no-pgvector`): a command
-    /// answers with exit 3.
-    #[error("{message}")]
-    Missing { code: &'static str, message: String },
-    /// The remote database could not be reached (connect timeout, refused connection, DNS, a lost
-    /// connection). A routed store answers from this computer meanwhile (see [`reach`]).
-    #[error("{0}")]
-    Unreachable(String),
-    /// The database failed (the message carries no stored text).
-    #[error("knowledge database error: {0}")]
-    Backend(String),
-}
-
-impl From<rusqlite::Error> for StoreError {
-    fn from(error: rusqlite::Error) -> Self {
-        if sqlite::is_missing_fts5(&error) {
-            return Self::NoFts5;
-        }
-
-        let message = match &error {
-            rusqlite::Error::SqliteFailure(code, _) => format!("{:?}", code.code),
-            other => other.to_string(),
-        };
-
-        Self::Backend(message.chars().take(200).collect())
-    }
-}
-
 /// A knowledge backend. Writes and reads take `&mut self`; one store serves one process.
 pub trait KnowledgeStore: Send {
     /// The value of a meta key (`schema_version`, `model_id`, `dims`, `generation`, ...).
@@ -411,6 +397,33 @@ pub trait KnowledgeStore: Send {
     /// bumps the generation. Chunk ids, texts and the keyword index stay as they are. A chunk that
     /// does not exist (deleted meanwhile) is skipped. How many chunks were updated.
     fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError>;
+
+    /// Counts a time shown to an agent on each document of `ids`. Best effort: one attempt that
+    /// never waits for a lock, and nothing without the counter columns. An unknown id is skipped.
+    fn record_shown(&mut self, _ids: &[i64]) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Counts a time found useful, at `at` (unix seconds), on each document of `ids`. As
+    /// [`KnowledgeStore::record_shown`].
+    fn record_useful(&mut self, _ids: &[i64], _at: i64) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The documents of `scope` whose title equals `title` once both are normalised (see
+    /// [`quality::normalise_title`]), by id. Scans the titles of the scope, at most
+    /// [`quality::TITLE_SCAN_MAX`], so it needs no index.
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError>;
+
+    /// For each document with a chunk whose hash is in `chunk_shas` (at most
+    /// [`crate::limits::SHARED_SHAS_MAX`]), the number of distinct hashes of them it has, by id.
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError>;
+
+    /// Whether the database this store writes to lets this user change documents: `None` when
+    /// that is not known (a failed probe, a handle opened to read, a server that cannot tell).
+    fn remote_writable(&mut self) -> Option<bool> {
+        None
+    }
 
     /// Replaces the links of a document; false when there is no such document.
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError>;

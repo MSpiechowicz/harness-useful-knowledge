@@ -12,7 +12,7 @@ fn both() -> Routing {
 }
 
 /// A server of a computer with one document of its own and a remote database that is down.
-fn offline_world() -> World {
+pub(super) fn offline_world() -> World {
     let mut world = World::new();
     let mut local = world.database();
     insert(

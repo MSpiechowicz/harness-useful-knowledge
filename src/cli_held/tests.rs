@@ -355,6 +355,7 @@ fn bad_arguments_are_usage_errors() {
     }
 }
 
+mod author;
 mod keys;
 mod replaces;
 

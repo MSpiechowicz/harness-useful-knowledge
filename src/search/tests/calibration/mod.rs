@@ -267,6 +267,7 @@ impl Lab {
                 filter: crate::store::RepoFilter::All,
                 format: None,
                 text: String::new(),
+                useful: None,
                 sort: crate::store::Sort::Title,
                 descending: false,
                 offset: 0,

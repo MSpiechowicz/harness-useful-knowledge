@@ -4,7 +4,7 @@ use super::Failure;
 use crate::cli::Args;
 use crate::config::Place;
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
-use crate::store::{ListQuery, RepoFilter, Sort, clean};
+use crate::store::{ListQuery, RepoFilter, Sort, UsefulFilter, clean};
 
 /// The query of `docs list` and the place `--place` narrows it to.
 pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Place>), Failure> {
@@ -16,6 +16,7 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         "--page",
         "--per-page",
         "--place",
+        "--useful",
     ];
     let parsed = Args::parse(args, &["--json", "--global", "--all", "--desc"], &valued).ok_or(Failure::Usage)?;
 
@@ -48,7 +49,14 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         Some("format") => Sort::Format,
         Some("chunks") => Sort::Chunks,
         Some("repos") => Sort::Repos,
+        Some("useful") => Sort::Useful,
+        Some("lastUseful") => Sort::LastUseful,
         Some(_) => return Err(Failure::Usage),
+    };
+
+    let useful = match parsed.value("--useful") {
+        None | Some("any") => None,
+        Some(raw) => Some(UsefulFilter::parse(raw).ok_or(Failure::Usage)?),
     };
 
     let page = match parsed.value("--page") {
@@ -78,6 +86,7 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         filter,
         format,
         text,
+        useful,
         sort,
         descending: parsed.flag("--desc"),
         offset: (page - 1).checked_mul(per_page).ok_or(Failure::Usage)?,

@@ -124,6 +124,11 @@ impl<'a> Events<'a> {
         self
     }
 
+    /// As [`Events::in_place`], for an import that moves on to another place.
+    pub fn set_place(&mut self, place: Option<Place>) {
+        self.place = place;
+    }
+
     /// True once a write failed (the reader closed the pipe): nobody is watching, so the import
     /// stops like a cancel.
     pub fn closed(&self) -> bool {

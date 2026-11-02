@@ -13,6 +13,10 @@
 //! only reads the cooldown: a probe of 1 s that ran out is recorded as a wait of 1 s, which a reader
 //! that waits longer does not honour, so a slow remote is not turned away for a minute by a hook.
 //!
+//! The documents the pointers name count as shown (see [`crate::mcp::counting`]): written after the
+//! block is printed and flushed, in a single attempt of at most [`COUNT_BUDGET`] that never waits for a
+//! lock, and dropped silently when it fails. The search itself reads through a read-only handle.
+//!
 //! While the embedder answers, only the vector list counts, above a stricter cosine floor, and only
 //! the pointers as close as the best one ([`rank::RECALL_COSINE_BAND`]). When it
 //! does not, recall never loads the model itself (that takes seconds and half a gigabyte, in a hook
@@ -45,6 +49,10 @@ pub const BLOCK_MAX: usize = 1024;
 
 /// The characters of the prompt that make the query: the start of a prompt says what it is about.
 const QUERY_CHARS: usize = 600;
+
+/// How long counting the documents as shown may take, after the block is out: the desktop gives a
+/// hook 3 s, [`DEADLINE`] is 2.5 s, and this ends the rest well before that.
+pub const COUNT_BUDGET: Duration = Duration::from_millis(300);
 
 /// The tag around the pointers.
 pub const TAG: &str = "harness-knowledge-recall";
@@ -85,7 +93,7 @@ fn run(args: &[Option<&str>], mut input: Box<dyn Read + Send>, deadline: Duratio
         let selection = config::select(&env).ok()?;
         let root = crate::embed::data_folder(&env)?;
 
-        pointers(
+        recalled_pointers(
             &prompt,
             Setup {
                 embedder: Box::new(SocketEmbedder::new(&root)),
@@ -97,9 +105,41 @@ fn run(args: &[Option<&str>], mut input: Box<dyn Read + Send>, deadline: Duratio
         )
     };
 
-    if let Some(block) = within(deadline, work).flatten() {
-        let _ = writeln!(out, "{block}");
+    if let Some(recalled) = within(deadline, work).flatten() {
+        print_and_count(out, recalled, COUNT_BUDGET);
     }
+}
+
+/// Prints the block and flushes it, then counts its documents as shown within `budget`.
+fn print_and_count(out: &mut dyn std::io::Write, recalled: Recalled, budget: Duration) {
+    let _ = writeln!(out, "{}", recalled.block);
+    let _ = out.flush();
+
+    let Tally {
+        env,
+        backend,
+        routing,
+        docs,
+    } = recalled.tally;
+
+    // A count that takes longer is given up on: the process ends first.
+    let _ = within(budget, move || {
+        crate::mcp::counting::record_shown_once(&env, &backend, routing, &docs)
+    });
+}
+
+/// The block of pointers and the documents it points to.
+pub struct Recalled {
+    pub block: String,
+    tally: Tally,
+}
+
+/// Where the documents of a block are counted as shown, and which.
+struct Tally {
+    env: Env,
+    backend: Backend,
+    routing: Routing,
+    docs: Vec<i64>,
 }
 
 /// What a recall needs, so tests can give it a fake embedder.
@@ -148,7 +188,12 @@ pub fn query_of(prompt: &str) -> Option<String> {
 }
 
 /// The block of pointers for `prompt`, or `None` when there is nothing to recall.
-pub fn pointers(prompt: &str, mut setup: Setup) -> Option<String> {
+pub fn pointers(prompt: &str, setup: Setup) -> Option<String> {
+    recalled_pointers(prompt, setup).map(|recalled| recalled.block)
+}
+
+/// [`pointers`] with the documents they point to.
+pub fn recalled_pointers(prompt: &str, mut setup: Setup) -> Option<Recalled> {
     let text = query_of(prompt)?;
 
     let mut projects = ProjectResolver::new(setup.env.clone(), std::env::current_dir().ok());
@@ -188,7 +233,21 @@ pub fn pointers(prompt: &str, mut setup: Setup) -> Option<String> {
         }
     }
 
-    fit(&chosen)
+    let block = fit(&chosen)?;
+
+    // Only the pointers the block really keeps: `fit` drops the last ones when they do not fit.
+    let kept = block.matches(&format!("<{DOC_TAG} ")).count();
+    let docs = chosen.iter().take(kept).map(|pointer| pointer.doc_id).collect();
+
+    Some(Recalled {
+        block,
+        tally: Tally {
+            env: setup.env,
+            backend: setup.backend,
+            routing: setup.routing,
+            docs,
+        },
+    })
 }
 
 /// The chunks worth recalling: from the vector list while the embedder answers, from the keyword
@@ -262,5 +321,7 @@ fn block(pointers: &[Pointer], snippet: usize) -> String {
     text
 }
 
+#[cfg(test)]
+mod counting_tests;
 #[cfg(test)]
 mod tests;

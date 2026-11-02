@@ -148,6 +148,26 @@ impl Row {
             .and_then(T::from_value)
             .ok_or_else(|| StoreError::Backend(format!("unexpected value in column {index}")))
     }
+
+    /// A text column that anybody with access to the database may have filled with something else:
+    /// only text is read, any other value reads as none.
+    pub(super) fn tolerant_text(&self, index: usize) -> Option<String> {
+        match self.0.get(index) {
+            Some(Value::Text(text)) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// A counter column the same way: an integer as it is, a float (an overflow, or a hand edit) cut
+    /// to the integers, anything else as 0. NULL, or a column the select list lacks, is none.
+    pub(super) fn tolerant_counter(&self, index: usize) -> Option<i64> {
+        match self.0.get(index)? {
+            Value::Null => None,
+            Value::Integer(count) => Some(*count),
+            Value::Real(count) => Some(*count as i64),
+            _ => Some(0),
+        }
+    }
 }
 
 /// What a statement without rows did.

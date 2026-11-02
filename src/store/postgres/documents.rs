@@ -14,16 +14,33 @@ use postgres::{GenericClient, Row};
 use super::error::{backend, column, count, int};
 use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
-use crate::store::{Chunk, Document, Link, Origin, PendingChunk, StoreError};
+use crate::store::{Author, Chunk, Columns, DocUsage, Document, Link, Origin, PendingChunk, StoreError};
 
 /// How many chunks one `INSERT` carries.
 const CHUNK_BATCH: usize = 100;
 
-/// The columns [`document`] reads, of a document aliased `d`.
-pub(super) const COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
+/// The columns of a document aliased `d` that every database has.
+const BASE_COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
      d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
 
-/// A [`Document`] from a row of [`COLUMNS`].
+/// The columns [`document`] and [`listed`] read, of a document aliased `d`: the base ones (0-12),
+/// the authors (13-16) and the usage (17-19). A column the database lacks is read as NULL.
+pub(super) fn columns_sql(columns: Columns) -> String {
+    let authors = if columns.authors {
+        "d.added_by_name, d.added_by_via, d.updated_by_name, d.updated_by_via"
+    } else {
+        "NULL::text, NULL::text, NULL::text, NULL::text"
+    };
+    let usage = if columns.usage {
+        "d.shown, d.useful, d.last_useful_at"
+    } else {
+        "NULL::bigint, NULL::bigint, NULL::bigint"
+    };
+
+    format!("{BASE_COLUMNS}, {authors}, {usage}")
+}
+
+/// A [`Document`] from a row of [`columns_sql`].
 pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
     let origin: String = column(row, 11)?;
     let bytes: i64 = column(row, 7)?;
@@ -42,7 +59,62 @@ pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
         updated_at: column(row, 10)?,
         origin: Origin::parse(&origin).ok_or_else(|| StoreError::Backend("a stored origin is unknown".to_owned()))?,
         warnings: column(row, 12)?,
+        added_by: Author::stored(column(row, 13)?, column(row, 14)?),
+        updated_by: Author::stored(column(row, 15)?, column(row, 16)?),
     })
+}
+
+/// A [`Document`] with its usage from a row of [`columns_sql`].
+pub(super) fn listed(row: &Row) -> Result<(Document, Option<DocUsage>), StoreError> {
+    let usage = DocUsage::stored(column(row, 17)?, column(row, 18)?, column(row, 19)?);
+
+    Ok((document(row)?, usage))
+}
+
+/// Document `id` with its usage.
+pub(super) fn by_id(
+    client: &mut impl GenericClient,
+    columns: Columns,
+    id: i64,
+) -> Result<Option<(Document, Option<DocUsage>)>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.id = $1",
+        columns_sql(columns)
+    );
+    let row = client.query_opt(&sql, &[&id]).map_err(backend)?;
+
+    row.map(|row| listed(&row)).transpose()
+}
+
+/// Records who stored `doc` as document `id`, which [`put`] has just written. A new document gets
+/// both authors, an update keeps who added it. Nothing without the author columns.
+pub(super) fn stamp_authors(
+    tx: &mut impl GenericClient,
+    columns: Columns,
+    id: i64,
+    doc: &Document,
+) -> Result<(), StoreError> {
+    if !columns.authors {
+        return Ok(());
+    }
+
+    let fresh = doc.id == 0;
+    let author = if fresh { &doc.added_by } else { &doc.updated_by };
+    let name = author.as_ref().map(|author| text(&author.name).into_owned());
+    let via = author
+        .as_ref()
+        .and_then(|author| author.via.as_deref())
+        .map(|via| text(via).into_owned());
+
+    let sql = if fresh {
+        "UPDATE knowledge_documents
+         SET added_by_name = $2, added_by_via = $3, updated_by_name = $2, updated_by_via = $3 WHERE id = $1"
+    } else {
+        "UPDATE knowledge_documents SET updated_by_name = $2, updated_by_via = $3 WHERE id = $1"
+    };
+    tx.execute(sql, &[&id, &name, &via]).map_err(backend)?;
+
+    Ok(())
 }
 
 /// `value` without the NUL characters the database cannot hold.
@@ -245,10 +317,14 @@ pub(super) fn delete(tx: &mut impl GenericClient, ids: &[i64]) -> Result<usize, 
 /// The oldest document whose `column` (`content_sha256` or `source_key`) is `value`.
 pub(super) fn find(
     client: &mut impl GenericClient,
+    columns: Columns,
     column_name: &str,
     value: &str,
 ) -> Result<Option<Document>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM knowledge_documents d WHERE d.{column_name} = $1 ORDER BY d.id LIMIT 1");
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.{column_name} = $1 ORDER BY d.id LIMIT 1",
+        columns_sql(columns)
+    );
     let row = client.query_opt(&sql, &[&value]).map_err(backend)?;
 
     row.map(|row| document(&row)).transpose()

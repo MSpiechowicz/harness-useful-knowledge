@@ -4,15 +4,15 @@
 use postgres::GenericClient;
 use postgres::types::ToSql;
 
-use super::documents::{COLUMNS, document, links_of};
+use super::documents::{by_id, columns_sql, links_of, listed};
 use super::error::{backend, column, count, int};
 use super::{meta, schema};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
 use crate::store::{
-    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+    Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, StoreError};
+use crate::store::{Section, Sort, Stats, StoreError, UsefulFilter};
 
 /// A document of no repository (aliased `d`).
 const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
@@ -21,8 +21,12 @@ const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.do
 type Param = Box<dyn ToSql + Sync>;
 
 /// One page of the documents `query` keeps, with the total over all pages.
-pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = conditions(query);
+pub(super) fn list(
+    client: &mut impl GenericClient,
+    columns: Columns,
+    query: &ListQuery,
+) -> Result<DocumentPage, StoreError> {
+    let (filter, mut params) = conditions(columns, query);
 
     let total = client
         .query_one(
@@ -34,7 +38,13 @@ pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result
     // The `C` collation keeps the order the same on every server, whatever its locale. A title folds
     // ASCII letters only (`lower` would also fold the letters of the server's locale), the one fold
     // every store does alike, so merged pages of two places are the pages of each one's own order.
-    let order = match query.sort {
+    // Without the counters the sorts by usefulness are the default order.
+    let sort = if columns.usage {
+        query.sort
+    } else {
+        query.sort.without_usage()
+    };
+    let order = match sort {
         Sort::Title => "translate(d.title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE \"C\"",
         Sort::Updated => "d.updated_at",
         Sort::Size => "d.bytes",
@@ -43,6 +53,8 @@ pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result
         Sort::Repos => {
             "coalesce((SELECT min(l.repo_key) COLLATE \"C\" FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')"
         }
+        Sort::Useful => "coalesce(d.useful, 0)",
+        Sort::LastUseful => "coalesce(d.last_useful_at, 0)",
     };
     let direction = if query.descending { "DESC" } else { "ASC" };
 
@@ -50,22 +62,24 @@ pub(super) fn list(client: &mut impl GenericClient, query: &ListQuery) -> Result
     params.push(Box::new(int(query.offset)));
 
     let sql = format!(
-        "SELECT {COLUMNS} FROM knowledge_documents d WHERE {filter}
+        "SELECT {} FROM knowledge_documents d WHERE {filter}
          ORDER BY {order} {direction}, d.id {direction} LIMIT ${} OFFSET ${}",
+        columns_sql(columns),
         params.len() - 1,
         params.len()
     );
 
     let rows = client.query(&sql, &refs(&params)).map_err(backend)?;
-    let docs = rows.iter().map(document).collect::<Result<Vec<_>, _>>()?;
+    let docs = rows.iter().map(listed).collect::<Result<Vec<_>, _>>()?;
 
-    let ids: Vec<i64> = docs.iter().map(|doc| doc.id).collect();
+    let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of(client, &ids)?;
 
     let items = docs
         .into_iter()
-        .map(|doc| DocumentRow {
+        .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
+            usage,
             doc,
         })
         .collect();
@@ -81,7 +95,7 @@ fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
 }
 
 /// The `WHERE` clause of `query`'s filters and its numbered parameters.
-fn conditions(query: &ListQuery) -> (String, Vec<Param>) {
+fn conditions(columns: Columns, query: &ListQuery) -> (String, Vec<Param>) {
     let mut clauses: Vec<String> = vec!["TRUE".to_owned()];
     let mut params: Vec<Param> = Vec::new();
 
@@ -101,6 +115,10 @@ fn conditions(query: &ListQuery) -> (String, Vec<Param>) {
     if let Some(format) = &query.format {
         params.push(Box::new(format.clone()));
         clauses.push(format!("d.format = ${}", params.len()));
+    }
+
+    if let Some(useful) = UsefulFilter::condition(query.useful, ("d.shown", "d.useful"), columns.usage) {
+        clauses.push(useful);
     }
 
     let text = query.text.trim();
@@ -228,17 +246,13 @@ pub(super) fn matching_chunks(
 /// Document `id` with its links, and what `detail` asks for.
 pub(super) fn get(
     client: &mut impl GenericClient,
+    columns: Columns,
     id: i64,
     detail: &Detail,
 ) -> Result<Option<DocumentDetail>, StoreError> {
-    let sql = format!("SELECT {COLUMNS} FROM knowledge_documents d WHERE d.id = $1");
-    let row = client.query_opt(&sql, &[&id]).map_err(backend)?;
-
-    let Some(row) = row else {
+    let Some((doc, usage)) = by_id(client, columns, id)? else {
         return Ok(None);
     };
-
-    let doc = document(&row)?;
 
     let sections = if detail.sections {
         Some(sections(client, id)?)
@@ -254,6 +268,7 @@ pub(super) fn get(
     Ok(Some(DocumentDetail {
         links: links_of(client, &[id])?.remove(&id).unwrap_or_default(),
         doc,
+        usage,
         sections,
         chunk,
     }))

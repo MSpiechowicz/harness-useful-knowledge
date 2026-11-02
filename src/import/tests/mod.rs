@@ -169,6 +169,7 @@ fn all_documents(store: &mut SqliteStore) -> Vec<DocumentRow> {
             filter: RepoFilter::All,
             format: None,
             text: String::new(),
+            useful: None,
             sort: Sort::Title,
             descending: false,
             offset: 0,
@@ -467,3 +468,4 @@ fn a_subtitle_file_in_a_folder_is_imported_as_a_transcript_with_a_section_per_st
 mod flow;
 mod keys;
 mod reindex;
+mod replacing;

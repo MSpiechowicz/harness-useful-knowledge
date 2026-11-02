@@ -2,20 +2,20 @@
 //! counts per repository and overall. The statements are the local file's (see
 //! [`crate::store::sqlite::sql_shared`]).
 
-use super::documents::{document, links_of, links_of_many};
+use super::documents::{by_id, links_of, links_of_many, listed};
 use super::meta;
 use super::sql::{Sql, Value, args, query_row};
 use crate::store::sqlite::sql_shared::{
-    DOCUMENT_COLUMNS, GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
+    GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
 };
 use crate::store::{
-    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+    Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
 };
 use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
-pub(super) fn list(db: &mut dyn Sql, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = list_conditions::<Value>(query);
+pub(super) fn list(db: &mut dyn Sql, columns: Columns, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+    let (filter, mut params) = list_conditions::<Value>(columns, query);
     let total = db.query(
         &format!("SELECT count(*) FROM knowledge_documents d WHERE {filter}"),
         &params,
@@ -25,20 +25,21 @@ pub(super) fn list(db: &mut dyn Sql, query: &ListQuery) -> Result<DocumentPage, 
     params.push(Value::Integer(page_limit(query)));
     params.push(Value::Integer(i64::try_from(query.offset).unwrap_or(i64::MAX)));
 
-    let sql = page_sql(&filter, query, params.len());
+    let sql = page_sql(columns, &filter, query, params.len());
     let docs = db
         .query(&sql, &params)?
         .iter()
-        .map(document)
+        .map(listed)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let ids: Vec<i64> = docs.iter().map(|doc| doc.id).collect();
+    let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of_many(db, &ids)?;
 
     let items = docs
         .into_iter()
-        .map(|doc| DocumentRow {
+        .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
+            usage,
             doc,
         })
         .collect();
@@ -73,12 +74,15 @@ pub(super) fn matching_chunks(db: &mut dyn Sql, id: i64, text: &str, limit: usiz
 }
 
 /// Document `id` with its links, and what `detail` asks for.
-pub(super) fn get(db: &mut dyn Sql, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-    let sql = format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.id = ?1");
-    let Some(row) = query_row(db, &sql, args![id])? else {
+pub(super) fn get(
+    db: &mut dyn Sql,
+    columns: Columns,
+    id: i64,
+    detail: &Detail,
+) -> Result<Option<DocumentDetail>, StoreError> {
+    let Some((doc, usage)) = by_id(db, columns, id)? else {
         return Ok(None);
     };
-    let doc = document(&row)?;
 
     let sections = if detail.sections { Some(sections(db, id)?) } else { None };
 
@@ -90,6 +94,7 @@ pub(super) fn get(db: &mut dyn Sql, id: i64, detail: &Detail) -> Result<Option<D
     Ok(Some(DocumentDetail {
         links: links_of(db, id)?,
         doc,
+        usage,
         sections,
         chunk,
     }))

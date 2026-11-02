@@ -41,8 +41,8 @@ use crate::import::place::write_place;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
-use crate::store::{Detail, KnowledgeStore, Origin, clean};
-use crate::support::Env;
+use crate::store::{Author, Detail, KnowledgeStore, Origin, clean};
+use crate::support::{Env, author};
 use crate::tokens::counter_for;
 
 /// The usage of these commands, for the executable's usage line.
@@ -174,13 +174,22 @@ fn list(held: &HeldStore, args: &[Option<&str>]) -> Reply {
     }
 }
 
-/// `item` as JSON, its `replaces` written as people and clients read ids (`12` or `local:12`),
+/// `item` as JSON, its `addedBy` cleaned, its `replaces` written as people and clients read ids (`12` or `local:12`),
 /// never the internal tagged number, which a JSON client reading doubles would round.
 fn public(item: &HeldItem) -> Value {
     let mut value = serde_json::to_value(item).unwrap_or(Value::Null);
 
     if let (Value::Object(fields), Some(id)) = (&mut value, item.replaces) {
         fields.insert("replaces".to_owned(), crate::store::routed::ids::json(id));
+    }
+
+    // The held file is plain text anybody with access to the folder may have edited: the name is
+    // cleaned like an approval cleans it, and a name that does not pass is not shown.
+    if let (Value::Object(fields), Some(name)) = (&mut value, &item.added_by) {
+        match author::clean(name) {
+            Some(name) => fields.insert("addedBy".to_owned(), json!(name)),
+            None => fields.remove("addedBy"),
+        };
     }
 
     value
@@ -339,7 +348,7 @@ fn import(
     // The text goes through a file of the format's extension, the way an imported file does.
     let folder =
         tempfile::tempdir().map_err(|error| Reply::Failed(format!("no temporary folder ({})", error.kind())))?;
-    let name = file_name(item);
+    let name = item.import_name();
     let path = folder.path().join(&name);
     std::fs::write(&path, item.content.as_bytes())
         .map_err(|error| Reply::Failed(format!("writing the text failed ({})", error.kind())))?;
@@ -372,6 +381,7 @@ fn import(
         .map(|embedder| embedder as &mut dyn embed::Embedder);
     importer.links = links;
     importer.replaces = item.replaces.map(|id| ids::split(id).1);
+    importer.author = author_of(env, item);
     importer.origin = Origin::AgentApproved;
     importer.trust_extracted_key = false;
     importer.title = Some(item.title.clone());
@@ -395,6 +405,23 @@ fn import(
                 .unwrap_or_else(|| "the document could not be imported".to_owned()),
         )),
     }
+}
+
+/// Who wrote an approved proposal: the name read when it was held, else (a proposal held by an
+/// older version) the git `user.name` of the folder it was made about, read now. Either way through
+/// the harness that proposed it. The held file is plain text anybody with access to the folder may
+/// have edited, so the name and the harness are cleaned again here (a name that does not pass is no
+/// author, see [`crate::support::author::clean`]).
+fn author_of(env: &Env, item: &HeldItem) -> Option<Author> {
+    let name = match &item.added_by {
+        Some(name) => author::clean(name),
+        None => HeldItem::author_name(env, item.project_path.as_deref()),
+    };
+
+    name.map(|name| Author {
+        name,
+        via: author::clean_via(&item.client),
+    })
 }
 
 /// Refuses the approval unless the document `id` of `store` is still the one the proposal was made
@@ -429,26 +456,6 @@ fn doc_id(id: Option<i64>, place: Place, routing: Routing) -> Value {
         Some(id) => json!(id),
         None => Value::Null,
     }
-}
-
-/// The name the text is imported under: the proposal's name with the extension of its format.
-fn file_name(item: &HeldItem) -> String {
-    let extension = match item.format.as_str() {
-        "text" => "txt",
-        "html" => "html",
-        "asciidoc" => "adoc",
-        "rst" => "rst",
-        "openapi" => "yaml",
-        _ => "md",
-    };
-
-    let stem = Path::new(&item.name)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| "document".to_owned());
-
-    format!("{stem}.{extension}")
 }
 
 #[cfg(test)]

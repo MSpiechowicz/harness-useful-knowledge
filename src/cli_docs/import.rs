@@ -2,8 +2,11 @@
 //!
 //! - `docs import --ndjson < manifest.json` imports the files the manifest names and prints one JSON
 //!   event per line as it goes (see [`crate::import::events`]). The manifest is
-//!   `{"paths": [...], "folders": [...], "links": [{"repo", "globs"}], "replaces": ID}`, all optional,
-//!   at most 4 MiB. SIGTERM, SIGINT or a closed stdout stop the import between two documents (the
+//!   `{"paths": [...], "folders": [...], "links": [{"repo", "globs"}], "replaces": ID, "replacing":
+//!   {"/abs/file.md": ID}, "place": "remote" | "local"}`, all optional, at most 4 MiB. `replaces` is the
+//!   document the one file replaces, `replacing` the document each of several files (all of them
+//!   in `paths`) replaces, each saved in the place of its document (see [`super::replacing`]).
+//!   The documents are written by the git `user.name` (see [`author_of`]). SIGTERM, SIGINT or a closed stdout stop the import between two documents (the
 //!   end of stdin does not: it carries the manifest). The exit code is 0 even when files failed,
 //!   each file's status is in its event, and 1 when the manifest itself is refused.
 //! - `docs reindex --json (ID... | --all)` gives the chunks that have no vector one and prints
@@ -28,8 +31,9 @@ use crate::import::place::write_place;
 use crate::import::reindex::{self, Which};
 use crate::import::{self, Importer, manifest};
 use crate::limits::{DELETE_IDS_MAX, MANIFEST_MAX};
-use crate::store::clean;
 use crate::store::routed::ids;
+use crate::store::{Author, Link, clean};
+use crate::support::author;
 use crate::tokens::counter_for;
 
 /// `docs import`.
@@ -68,6 +72,10 @@ pub(super) fn import_with(
     cancel: &dyn Fn() -> bool,
     out: &mut dyn Write,
 ) -> Result<import::Report, Failure> {
+    if !manifest.replacing.is_empty() {
+        return super::replacing::import_each_place(context, manifest, pdf, embedder, cancel, out);
+    }
+
     let links = clean::links(&manifest.links)?;
     let counter = counter_for(context.env);
     let place = import_place(context, manifest, Kind::of(links.len()))?;
@@ -77,6 +85,7 @@ pub(super) fn import_with(
 
     let mut importer = Importer::new(store.as_mut(), counter.as_ref(), pdf, cancel);
     importer.embedder = embedder.as_deref_mut().map(|embedder| embedder as &mut dyn Embedder);
+    importer.author = author_of(context, &links);
     importer.links = links;
     importer.replaces = manifest.replaces.map(|id| ids::split(id).1);
 
@@ -84,6 +93,19 @@ pub(super) fn import_with(
     let tagged = (context.routing.layout() == Layout::Both).then_some(place);
 
     import::run(&mut importer, manifest, &mut Events::new(out).in_place(tagged)).map_err(Failure::Failed)
+}
+
+/// The author of an import the person runs: their git `user.name`, read in the folder of the first
+/// link when that is a `path:` repository that exists, else in the current folder. `None` without one.
+pub(super) fn author_of(context: &Context, links: &[Link]) -> Option<Author> {
+    let root = links
+        .first()
+        .and_then(|link| link.repo_key.strip_prefix("path:"))
+        .map(std::path::PathBuf::from)
+        .filter(|root| root.is_dir());
+    let dir = root.or_else(|| std::env::current_dir().ok())?;
+
+    author::resolve(context.env, &dir).map(|name| Author { name, via: None })
 }
 
 /// Where an import saves: the manifest's `place`, else the place of the document it replaces, else

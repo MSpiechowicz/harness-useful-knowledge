@@ -68,6 +68,8 @@ pub(super) fn compare(a: &DocumentRow, b: &DocumentRow, sort: Sort, descending: 
         Sort::Format => a.doc.format.cmp(&b.doc.format),
         Sort::Chunks => a.doc.chunk_count.cmp(&b.doc.chunk_count),
         Sort::Repos => first_repo(a).cmp(first_repo(b)),
+        Sort::Useful => useful_of(a).cmp(&useful_of(b)),
+        Sort::LastUseful => last_useful_of(a).cmp(&last_useful_of(b)),
     };
 
     let ordering = by_key.then_with(|| a.doc.id.cmp(&b.doc.id));
@@ -82,4 +84,14 @@ fn first_repo(row: &DocumentRow) -> &str {
         .map(|link| link.repo_key.as_str())
         .min()
         .unwrap_or_default()
+}
+
+/// How often a document was found useful: 0 without counters, as the stores sort it.
+fn useful_of(row: &DocumentRow) -> i64 {
+    row.usage.map_or(0, |usage| usage.useful)
+}
+
+/// When a document was last found useful: 0 when never or without counters, as the stores sort it.
+fn last_useful_of(row: &DocumentRow) -> i64 {
+    row.usage.and_then(|usage| usage.last_useful_at).unwrap_or(0)
 }

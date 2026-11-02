@@ -3,16 +3,16 @@
 
 use std::collections::HashMap;
 
-use rusqlite::types::Type;
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::schema::EMBEDDING_BYTES;
-use super::sql_shared::DOCUMENT_COLUMNS;
+use super::sql_quality::{document_columns, stamp};
 use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
-use crate::store::{Chunk, Document, Link, Origin, PendingChunk, StoreError};
+use crate::store::{Author, Chunk, Columns, DocUsage, Document, Link, Origin, PendingChunk, StoreError};
 
-/// A [`Document`] from a row of [`DOCUMENT_COLUMNS`].
+/// A [`Document`] from a row of [`document_columns`].
 pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
     let origin: String = row.get(11)?;
     let warnings: String = row.get(12)?;
@@ -32,7 +32,67 @@ pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
         origin: Origin::parse(&origin)
             .ok_or_else(|| rusqlite::Error::InvalidColumnType(11, "origin".to_owned(), Type::Text))?,
         warnings: serde_json::from_str(&warnings).unwrap_or_default(),
+        added_by: Author::stored(tolerant_text(row, 13)?, tolerant_text(row, 14)?),
+        updated_by: Author::stored(tolerant_text(row, 15)?, tolerant_text(row, 16)?),
     })
+}
+
+/// A [`Document`] with its usage from a row of [`document_columns`].
+pub(super) fn listed(row: &Row) -> rusqlite::Result<(Document, Option<DocUsage>)> {
+    let usage = DocUsage::stored(
+        tolerant_counter(row, 17)?,
+        tolerant_counter(row, 18)?,
+        tolerant_counter(row, 19)?,
+    );
+
+    Ok((document(row)?, usage))
+}
+
+/// A text column that anybody with access to the file may have filled with something else: only
+/// text is read, any other value reads as none.
+fn tolerant_text(row: &Row, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    })
+}
+
+/// A counter column the same way: an integer as it is, a float (an overflow, or a hand edit) cut to
+/// the integers, anything else as 0. NULL (a column the file lacks) stays none.
+fn tolerant_counter(row: &Row, index: usize) -> rusqlite::Result<Option<i64>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Null => None,
+        ValueRef::Integer(count) => Some(count),
+        ValueRef::Real(count) => Some(count as i64),
+        _ => Some(0),
+    })
+}
+
+/// Document `id` with its usage.
+pub(super) fn by_id(
+    conn: &Connection,
+    columns: Columns,
+    id: i64,
+) -> Result<Option<(Document, Option<DocUsage>)>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.id = ?1",
+        document_columns(columns)
+    );
+
+    Ok(conn.query_row(&sql, [id], listed).optional()?)
+}
+
+/// Records who stored `doc` as document `id`, which [`put`] has just written. A new document gets
+/// both authors, an update keeps who added it. Nothing without the author columns.
+pub(super) fn stamp_authors(tx: &Transaction, columns: Columns, id: i64, doc: &Document) -> Result<(), StoreError> {
+    if !columns.authors {
+        return Ok(());
+    }
+
+    let (sql, name, via) = stamp(doc);
+    tx.execute(sql, params![id, name, via])?;
+
+    Ok(())
 }
 
 /// Stores `doc` (whose cleaned title is `title`) with `chunks` and `links`: inserted for id 0,
@@ -185,9 +245,16 @@ pub(super) fn delete(tx: &Transaction, ids: &[i64]) -> Result<usize, StoreError>
 }
 
 /// The oldest document whose `column` (`content_sha256` or `source_key`) is `value`.
-pub(super) fn find(conn: &Connection, column: &str, value: &str) -> Result<Option<Document>, StoreError> {
-    let sql =
-        format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1");
+pub(super) fn find(
+    conn: &Connection,
+    columns: Columns,
+    column: &str,
+    value: &str,
+) -> Result<Option<Document>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1",
+        document_columns(columns)
+    );
 
     Ok(conn.query_row(&sql, [value], document).optional()?)
 }

@@ -11,7 +11,7 @@ use super::schema::{CHUNKS, DOCUMENTS};
 use super::{int, strings, terms, text};
 use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
-use crate::store::{Chunk, DIMS, Document, Link, Origin, PendingChunk, StoreError};
+use crate::store::{Author, Chunk, DIMS, DocUsage, Document, Link, Origin, PendingChunk, StoreError};
 
 /// What a list sorted by title compares: the title with ASCII letters folded to lower case, like
 /// every other store does (see [`crate::store::routed`]'s merge). Compared bytewise.
@@ -34,6 +34,8 @@ fn fields(doc: &Document, title: &str, chunks: usize, links: &[Link]) -> Row {
         "origin": doc.origin.as_str(),
         "warnings": &doc.warnings,
         "updated_at": doc.updated_at,
+        "updated_by_name": doc.updated_by.as_ref().map(|author| author.name.as_str()),
+        "updated_by_via": doc.updated_by.as_ref().and_then(|author| author.via.as_deref()),
     };
 
     fields.extend(link_fields(links));
@@ -79,6 +81,22 @@ pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
         updated_at: int(row, "updated_at"),
         origin,
         warnings: strings(row, "warnings"),
+        added_by: Author::stored(text(row, "added_by_name"), text(row, "added_by_via")),
+        updated_by: Author::stored(text(row, "updated_by_name"), text(row, "updated_by_via")),
+    })
+}
+
+/// The counters of a stored document. The fields are schemaless, so a document no counter has
+/// touched reads as 0 (there is never a database without them).
+pub(super) fn usage(row: &Row) -> Option<DocUsage> {
+    Some(DocUsage {
+        shown: int(row, "shown"),
+        useful: int(row, "useful"),
+        last_useful_at: row.get("last_useful_at").and_then(|at| match at {
+            Bson::Int64(at) => Some(*at),
+            Bson::Int32(at) => Some(i64::from(*at)),
+            _ => None,
+        }),
     })
 }
 
@@ -147,9 +165,15 @@ pub(super) fn put(
     begun: &Cell<bool>,
 ) -> Result<i64, Fail> {
     let fresh = doc.id == 0;
+    // An update keeps who added the document, so the author is set on insert only.
+    let added = doc.added_by.as_ref();
     let update = doc! {
         "$set": fields(doc, title, chunks.len(), links),
-        "$setOnInsert": { "created_at": doc.created_at },
+        "$setOnInsert": {
+            "created_at": doc.created_at,
+            "added_by_name": added.map(|author| author.name.as_str()),
+            "added_by_via": added.and_then(|author| author.via.as_deref()),
+        },
     };
 
     if ctx.update_one(DOCUMENTS, doc! { "_id": id }, update, fresh)? == 0 {

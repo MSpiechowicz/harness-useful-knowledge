@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 mod flaky;
 mod offline;
 mod paging;
+mod quality;
 mod search;
 
 use super::*;
@@ -51,6 +52,7 @@ fn query(sort: Sort, descending: bool, offset: usize, limit: usize) -> ListQuery
         filter: RepoFilter::All,
         format: None,
         text: String::new(),
+        useful: None,
         sort,
         descending,
         offset,

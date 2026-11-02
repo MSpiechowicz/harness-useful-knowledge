@@ -69,6 +69,9 @@ fn features_list_what_this_build_can_do() {
         "held",
         "mcp",
         "offline-fallback",
+        "docs-useful",
+        "docs-similar",
+        "docs-authors",
     ] {
         assert!(features.contains(&feature), "{feature} in {features:?}");
     }
@@ -219,7 +222,7 @@ fn a_proposal_goes_from_an_agent_to_review_to_a_search_that_finds_it() {
     assert_eq!(initialized["result"]["serverInfo"]["name"], "harness-knowledge");
 
     let listed = session.request("tools/list", json!({}));
-    assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(4));
+    assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(5));
 
     assert_eq!(
         session.call(

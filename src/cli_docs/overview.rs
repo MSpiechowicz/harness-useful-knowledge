@@ -52,6 +52,11 @@ pub fn repos(context: &Context, args: &[Option<&str>]) -> Reply {
 /// could not be, see [`crate::store::Reach`]) is not counted: `places.remote` is `{"offline": true}`,
 /// the top-level counts are this computer's, and `offline` is `true` at the top level too (it is
 /// absent otherwise).
+///
+/// `remoteWritable` is whether the remote database lets this user change documents: `true` or
+/// `false` as the database says (PostgreSQL and MongoDB report the user's privileges), `null` when
+/// no remote database is in use, it cannot be reached, or it does not say. The desktop then keeps
+/// the actions enabled and shows the error of the one that fails.
 pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     json_only(args)?;
 
@@ -60,15 +65,20 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     let mut generations = serde_json::Map::new();
     let mut primary: Option<Value> = None;
     let mut offline = false;
+    let mut remote_writable: Option<bool> = None;
 
     for place in places {
-        let Some(stats) = place_stats(context, place)? else {
+        let Some((stats, writable)) = place_stats(context, place)? else {
             offline = true;
             by_place.insert(place.as_str().to_owned(), json!({ "offline": true }));
             continue;
         };
 
         generations.insert(place.as_str().to_owned(), json!(stats.generation));
+
+        if place == Place::Remote {
+            remote_writable = writable;
+        }
 
         let counts = counts(&stats);
         primary.get_or_insert_with(|| counts.clone());
@@ -84,6 +94,7 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     shown["held"] = json!(crate::held::HeldStore::open(context.env).map_or(0, |held| held.count()));
     shown["places"] = Value::Object(by_place);
     shown["generations"] = Value::Object(generations);
+    shown["remoteWritable"] = json!(remote_writable);
 
     if offline {
         shown["offline"] = json!(true);
@@ -92,9 +103,10 @@ pub fn stats(context: &Context, args: &[Option<&str>]) -> Reply {
     Ok(Done::ok(shown))
 }
 
-/// The counts of one place, all zero for a database that does not exist; `None` for a remote
-/// database that cannot be reached while this computer is in use too.
-fn place_stats(context: &Context, place: Place) -> Result<Option<Stats>, Failure> {
+/// The counts of one place, all zero for a database that does not exist, and for the remote one
+/// whether it lets this user write; `None` for a remote database that cannot be reached while this
+/// computer is in use too.
+fn place_stats(context: &Context, place: Place) -> Result<Option<(Stats, Option<bool>)>, Failure> {
     let empty = Stats {
         schema_version: SCHEMA_VERSION,
         ..Stats::default()
@@ -110,11 +122,19 @@ fn place_stats(context: &Context, place: Place) -> Result<Option<Stats>, Failure
     };
 
     let Some(mut store) = store else {
-        return Ok(Some(empty));
+        return Ok(Some((empty, None)));
     };
 
     match store.stats() {
-        Ok(stats) => Ok(Some(stats)),
+        Ok(stats) => {
+            let writable = if place == Place::Remote {
+                store.remote_writable()
+            } else {
+                None
+            };
+
+            Ok(Some((stats, writable)))
+        }
         Err(StoreError::Unreachable(message)) if place == Place::Remote && context.routing.layout() == Layout::Both => {
             backend::reach_of(context.env, context.backend).failed(&message);
             Ok(None)

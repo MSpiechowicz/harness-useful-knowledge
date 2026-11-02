@@ -86,6 +86,7 @@ fn collect(
         filter,
         format: None,
         text: text.to_owned(),
+        useful: None,
         sort: Sort::Updated,
         descending: true,
         offset,

@@ -6,8 +6,9 @@
 //! The DDL is a macro so each store can `concat!` it into its migration (a `const`). The
 //! statements number their parameters (`?1`), so both runners bind them the same way.
 
+use super::sql_quality::document_columns;
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
-use crate::store::{ListQuery, RepoFilter, Sort, StoreError};
+use crate::store::{Columns, ListQuery, RepoFilter, Sort, StoreError, UsefulFilter};
 
 /// The meta keys the store keeps itself.
 const RESERVED_META: [&str; 3] = ["generation", "schema_version", "dims"];
@@ -98,10 +99,6 @@ END;
 
 pub(crate) use {keyword_index, tables};
 
-/// The columns of a document aliased `d`, in the order of `Document`'s fields.
-pub(crate) const DOCUMENT_COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
-     d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
-
 /// A document linked to some repository (aliased `d`).
 pub(crate) const LINKED: &str = "EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
 
@@ -167,7 +164,7 @@ pub(crate) fn keyword_sql() -> String {
 }
 
 /// The `WHERE` clause of `query`'s filters and its numbered parameters.
-pub(crate) fn list_conditions<V: From<String>>(query: &ListQuery) -> (String, Vec<V>) {
+pub(crate) fn list_conditions<V: From<String>>(columns: Columns, query: &ListQuery) -> (String, Vec<V>) {
     let mut clauses: Vec<String> = vec!["1 = 1".to_owned()];
     let mut params: Vec<V> = Vec::new();
 
@@ -187,6 +184,10 @@ pub(crate) fn list_conditions<V: From<String>>(query: &ListQuery) -> (String, Ve
     if let Some(format) = &query.format {
         params.push(format.clone().into());
         clauses.push(format!("d.format = ?{}", params.len()));
+    }
+
+    if let Some(useful) = UsefulFilter::condition(query.useful, ("d.shown", "d.useful"), columns.usage) {
+        clauses.push(useful);
     }
 
     let text = query.text.trim();
@@ -213,20 +214,29 @@ pub(crate) fn list_conditions<V: From<String>>(query: &ListQuery) -> (String, Ve
 
 /// The page of the documents `filter` keeps, in `query`'s order. The limit and the offset are the
 /// last two of the `params` numbered parameters.
-pub(crate) fn page_sql(filter: &str, query: &ListQuery, params: usize) -> String {
-    let order = match query.sort {
+pub(crate) fn page_sql(columns: Columns, filter: &str, query: &ListQuery, params: usize) -> String {
+    // Without the counters the sorts by usefulness are the default order.
+    let sort = if columns.usage {
+        query.sort
+    } else {
+        query.sort.without_usage()
+    };
+    let order = match sort {
         Sort::Title => "d.title COLLATE NOCASE",
         Sort::Updated => "d.updated_at",
         Sort::Size => "d.bytes",
         Sort::Format => "d.format",
         Sort::Chunks => "d.chunk_count",
         Sort::Repos => "coalesce((SELECT min(l.repo_key) FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')",
+        Sort::Useful => "coalesce(d.useful, 0)",
+        Sort::LastUseful => "coalesce(d.last_useful_at, 0)",
     };
     let direction = if query.descending { "DESC" } else { "ASC" };
 
     format!(
-        "SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE {filter}
+        "SELECT {} FROM knowledge_documents d WHERE {filter}
          ORDER BY {order} {direction}, d.id {direction} LIMIT ?{} OFFSET ?{}",
+        document_columns(columns),
         params - 1,
         params
     )

@@ -33,6 +33,9 @@ use crate::store::StoreError;
 /// writer for about 5 s before it takes the lock from an idle transaction).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a counter write may take.
+pub(super) const COUNT_BUDGET: Duration = Duration::from_millis(750);
+
 /// How long connecting may take.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -111,6 +114,7 @@ impl Client {
             baton: None,
             base: None,
             closed: false,
+            budget: None,
         }
     }
 
@@ -139,7 +143,12 @@ impl Client {
         Ok(base)
     }
 
-    fn post(&self, base: &str, baton: Option<&str>, requests: Vec<serde_json::Value>) -> Result<Reply, Failed> {
+    fn post(
+        &self,
+        base: &str,
+        (baton, budget): (Option<&str>, Option<Duration>),
+        requests: Vec<serde_json::Value>,
+    ) -> Result<Reply, Failed> {
         let body = json!({ "baton": baton, "requests": requests }).to_string();
         let mut request = self
             .agent
@@ -148,6 +157,10 @@ impl Client {
 
         if let Some(authorization) = &self.authorization {
             request = request.header("authorization", authorization);
+        }
+
+        if let Some(budget) = budget {
+            request = request.config().timeout_global(Some(budget)).build();
         }
 
         let mut response = request.send(body).map_err(Failed::unanswered)?;
@@ -259,6 +272,9 @@ pub(super) struct Stream<'c> {
     base: Option<String>,
     /// The server ended a kept stream; its transaction is gone.
     closed: bool,
+    /// The most a request may take instead of the client's: for a statement that may be lost (a
+    /// counter), which the server may still apply later.
+    pub(super) budget: Option<Duration>,
 }
 
 impl Stream<'_> {
@@ -295,7 +311,7 @@ impl Stream<'_> {
         }
 
         let base = self.base.as_deref().unwrap_or(&self.client.base);
-        let reply = match self.client.post(base, self.baton.as_deref(), requests) {
+        let reply = match self.client.post(base, (self.baton.as_deref(), self.budget), requests) {
             Ok(reply) => reply,
             Err(error) => {
                 self.closed = self.keep;

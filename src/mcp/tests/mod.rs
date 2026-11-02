@@ -62,8 +62,17 @@ impl World {
         SqliteStore::open(&self.knowledge().join(FILE_NAME)).expect("create the database")
     }
 
-    /// The `result` of `tools/call` as `(text, isError)`.
+    /// The `result` of `tools/call` as `(text, isError)`, with the counters it queued written after
+    /// it, as the serve loop does.
     pub fn call(&mut self, name: &str, arguments: Value) -> (String, bool) {
+        let answered = self.call_unflushed(name, arguments);
+        self.server.after_reply();
+
+        answered
+    }
+
+    /// [`Self::call`] without the counters written yet.
+    pub fn call_unflushed(&mut self, name: &str, arguments: Value) -> (String, bool) {
         let reply = self
             .server
             .handle(json!({
@@ -106,7 +115,7 @@ pub(super) fn project_arg(world: &World) -> String {
 }
 
 #[test]
-fn tools_list_is_the_four_knowledge_tools_as_snapshotted() {
+fn tools_list_is_the_five_knowledge_tools_as_snapshotted() {
     let listed = tools::definitions();
     let snapshot = serde_json::to_string_pretty(&listed).expect("json") + "\n";
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/tools_list.snap.json");
@@ -126,7 +135,13 @@ fn tools_list_is_the_four_knowledge_tools_as_snapshotted() {
         .collect();
     assert_eq!(
         names,
-        ["knowledge_search", "knowledge_get", "knowledge_list", "knowledge_add"]
+        [
+            "knowledge_search",
+            "knowledge_get",
+            "knowledge_list",
+            "knowledge_feedback",
+            "knowledge_add"
+        ]
     );
 }
 
@@ -202,9 +217,13 @@ fn a_serve_loop_reads_lines_skips_blanks_and_survives_garbage() {
     assert_eq!(replies.len(), 3);
     assert_eq!(replies[0]["id"], 1);
     assert_eq!(replies[1]["error"]["code"], -32700);
-    assert_eq!(replies[2]["result"]["tools"].as_array().map(Vec::len), Some(4));
+    assert_eq!(replies[2]["result"]["tools"].as_array().map(Vec::len), Some(5));
 }
 
+mod author;
+mod counting;
+mod duplicates;
+mod feedback;
 mod offline;
 mod proposals;
 mod reading;

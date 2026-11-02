@@ -36,6 +36,15 @@ pub(super) enum Outcome {
 }
 
 impl Outcome {
+    /// [`Self::into_result`] for a statement that is not worth waiting for (a counter): a lock
+    /// another writer holds is [`StoreError::Busy`], not a failure of the server.
+    pub(super) fn into_single_attempt(self) -> Result<Response, StoreError> {
+        match self {
+            Self::Error { error } if error.is_contended() => Err(StoreError::Busy),
+            other => other.into_result(),
+        }
+    }
+
     /// The response, or the server's error as a [`StoreError`].
     pub(super) fn into_result(self) -> Result<Response, StoreError> {
         match self {
@@ -82,6 +91,12 @@ impl Failure {
     /// True when another writer held the lock.
     pub(super) fn is_busy(&self) -> bool {
         self.code().is_some_and(|code| code.contains("BUSY"))
+    }
+
+    /// True when another writer held the lock or the table (`SQLITE_BUSY`, `SQLITE_LOCKED`).
+    pub(super) fn is_contended(&self) -> bool {
+        self.code()
+            .is_some_and(|code| code.contains("BUSY") || code.contains("LOCKED"))
     }
 
     /// The server's error code when it looks like one (`[A-Z_]{1,40}`); anything else may be

@@ -4,19 +4,17 @@
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use super::documents::{document, links_of, links_of_many};
-use super::sql_shared::{
-    DOCUMENT_COLUMNS, GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
-};
+use super::documents::{by_id, links_of, links_of_many, listed};
+use super::sql_shared::{GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql};
 use super::{meta, schema};
 use crate::store::{
-    Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
+    Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
 };
 use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
-pub(super) fn list(conn: &Connection, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = list_conditions::<Value>(query);
+pub(super) fn list(conn: &Connection, columns: Columns, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+    let (filter, mut params) = list_conditions::<Value>(columns, query);
     let total: i64 = conn.query_row(
         &format!("SELECT count(*) FROM knowledge_documents d WHERE {filter}"),
         params_from_iter(params.iter()),
@@ -26,19 +24,20 @@ pub(super) fn list(conn: &Connection, query: &ListQuery) -> Result<DocumentPage,
     params.push(Value::Integer(page_limit(query)));
     params.push(Value::Integer(i64::try_from(query.offset).unwrap_or(i64::MAX)));
 
-    let sql = page_sql(&filter, query, params.len());
+    let sql = page_sql(columns, &filter, query, params.len());
     let mut statement = conn.prepare(&sql)?;
     let docs: Vec<_> = statement
-        .query_map(params_from_iter(params.iter()), document)?
+        .query_map(params_from_iter(params.iter()), listed)?
         .collect::<Result<_, _>>()?;
 
-    let ids: Vec<i64> = docs.iter().map(|doc| doc.id).collect();
+    let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of_many(conn, &ids)?;
 
     let items = docs
         .into_iter()
-        .map(|doc| DocumentRow {
+        .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
+            usage,
             doc,
         })
         .collect();
@@ -82,9 +81,13 @@ pub(super) fn matching_chunks(
 }
 
 /// Document `id` with its links, and what `detail` asks for.
-pub(super) fn get(conn: &Connection, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-    let sql = format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.id = ?1");
-    let Some(doc) = conn.query_row(&sql, [id], document).optional()? else {
+pub(super) fn get(
+    conn: &Connection,
+    columns: Columns,
+    id: i64,
+    detail: &Detail,
+) -> Result<Option<DocumentDetail>, StoreError> {
+    let Some((doc, usage)) = by_id(conn, columns, id)? else {
         return Ok(None);
     };
 
@@ -102,6 +105,7 @@ pub(super) fn get(conn: &Connection, id: i64, detail: &Detail) -> Result<Option<
     Ok(Some(DocumentDetail {
         links: links_of(conn, id)?,
         doc,
+        usage,
         sections,
         chunk,
     }))

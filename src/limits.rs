@@ -27,6 +27,10 @@ pub const CHUNKS_PER_DOC_MAX: usize = 4000;
 /// Most chunks one page of pending chunks, or one write of embeddings, carries.
 pub const EMBED_BATCH_MAX: usize = 256;
 
+/// Most chunk hashes one lookup of the documents that share them takes (a document has at most
+/// [`CHUNKS_PER_DOC_MAX`] chunks).
+pub const SHARED_SHAS_MAX: usize = CHUNKS_PER_DOC_MAX;
+
 /// Most document ids one `docs delete` takes.
 pub const DELETE_IDS_MAX: usize = 1000;
 

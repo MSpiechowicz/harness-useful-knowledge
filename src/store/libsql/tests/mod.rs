@@ -12,6 +12,7 @@ mod access;
 mod documents;
 mod embeddings;
 mod listing;
+mod quality;
 mod search;
 mod support;
 mod titles;

@@ -14,6 +14,7 @@ fn listed(store: &mut PostgresStore, text: &str) -> Vec<String> {
             filter: RepoFilter::All,
             format: None,
             text: text.to_owned(),
+            useful: None,
             sort: Sort::Title,
             descending: false,
             offset: 0,

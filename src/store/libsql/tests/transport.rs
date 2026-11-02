@@ -6,11 +6,11 @@ use std::thread;
 
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
-use crate::store::StoreError;
 use crate::store::libsql::hrana::Client;
 use crate::store::libsql::sql::{Sql, args};
 use crate::store::libsql::wire::execute;
 use crate::store::libsql::{CONNECT_TIMEOUT, LibsqlStore, endpoint, open_boxed};
+use crate::store::{Columns, KnowledgeStore, StoreError};
 
 /// A server that hangs up on the first `hangups` connections without a word, then answers every
 /// request with `body`. `abrupt` drops the socket unread (a reset), else it closes it cleanly
@@ -195,6 +195,11 @@ fn the_floats_of_a_vector_survive_their_text() {
 /// A server whose every statement succeeds with no rows, except the ones that mention
 /// `refuse`: those fail with `message`.
 fn refusing_server(refuse: &'static str, message: &'static str) -> String {
+    refusing_server_with(refuse, message, "SQLITE_ERROR")
+}
+
+/// [`refusing_server`] that names `code` for the error.
+fn refusing_server_with(refuse: &'static str, message: &'static str, code: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
 
@@ -215,7 +220,7 @@ fn refusing_server(refuse: &'static str, message: &'static str) -> String {
                         .unwrap_or("");
 
                     if sql.contains(refuse) {
-                        serde_json::json!({ "type": "error", "error": { "message": message, "code": "SQLITE_ERROR" } })
+                        serde_json::json!({ "type": "error", "error": { "message": message, "code": code } })
                     } else if request["type"] == "close" {
                         serde_json::json!({ "type": "ok", "response": { "type": "close" } })
                     } else {
@@ -315,4 +320,30 @@ fn opening_a_server_without_fts5_is_a_missing_capability() {
         .expect("the migration fails");
 
     assert_eq!(error, OpenError::no_fts5());
+}
+
+#[test]
+fn a_counter_refused_for_a_lock_is_busy_and_any_other_refusal_is_a_failure() {
+    for (code, busy) in [
+        ("SQLITE_BUSY", true),
+        ("SQLITE_BUSY_SNAPSHOT", true),
+        ("SQLITE_LOCKED", true),
+        ("SQLITE_ERROR", false),
+    ] {
+        let url = refusing_server_with("UPDATE", "database is locked", code);
+        let mut store = LibsqlStore {
+            client: client(&url),
+            newer: false,
+            writable: false,
+            columns: Columns::ALL,
+        };
+
+        for counted in [store.record_shown(&[1]), store.record_useful(&[1], 5)] {
+            match counted {
+                Err(StoreError::Busy) => assert!(busy, "{code} is a failure"),
+                Err(StoreError::Backend(_)) => assert!(!busy, "{code} is busy"),
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+    }
 }

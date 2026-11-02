@@ -43,6 +43,7 @@ pub fn open_boxed_with(
         Access::Read => Mode::ReadOnly,
         Access::Existing => Mode::Existing,
         Access::Create => Mode::Create,
+        Access::Counters => Mode::Counters,
     };
 
     match MongoStore::open_checked(url, mode, connect_timeout, upgrade) {
@@ -81,6 +82,29 @@ impl From<Opening> for StoreError {
 /// The client and the database of `url` (no request is sent yet): the URL and TLS rules applied,
 /// the database from the URL path.
 pub(super) fn connect_client(url: &str, selection_timeout: Duration) -> Result<(Client, Database), StoreError> {
+    connect_client_for(url, selection_timeout, Mode::ReadOnly)
+}
+
+/// [`connect_client`] for a connection in `mode`: a counting one is bound to notice a server that
+/// stops answering (see [`bound_counting`]).
+pub(super) fn connect_client_for(
+    url: &str,
+    selection_timeout: Duration,
+    mode: Mode,
+) -> Result<(Client, Database), StoreError> {
+    let (options, name) = client_options(url, selection_timeout, mode)?;
+    let client = Client::with_options(options).map_err(|error| connection::connect_error(&error, url))?;
+    let db = client.database(&name);
+
+    Ok((client, db))
+}
+
+/// The options of the client for `url` in `mode` and the name of its database (nothing is sent).
+pub(super) fn client_options(
+    url: &str,
+    selection_timeout: Duration,
+    mode: Mode,
+) -> Result<(ClientOptions, String), StoreError> {
     let checked = connection::check(url)?;
     let mut options = ClientOptions::parse(url)
         .run()
@@ -95,10 +119,37 @@ pub(super) fn connect_client(url: &str, selection_timeout: Duration) -> Result<(
     options.app_name.get_or_insert_with(|| "harness-knowledge".to_owned());
     options.server_selection_timeout.get_or_insert(selection_timeout);
 
-    let client = Client::with_options(options).map_err(|error| connection::connect_error(&error, url))?;
-    let db = client.database(&name);
+    if mode == Mode::Counters {
+        bound_counting(&mut options);
+    }
 
-    Ok((client, db))
+    Ok((options, name))
+}
+
+/// How long a connection of a counting client waits for its server's heartbeat before the server
+/// counts as gone.
+pub(super) const COUNT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often a counting client asks its server whether it is there (the least the driver allows).
+pub(super) const COUNT_HEARTBEAT: Duration = Duration::from_millis(500);
+
+/// Makes a counting client notice a server that stops answering (a half-open connection, a stopped
+/// process) within about a second and a half: the driver has no timeout for the reply to a request,
+/// but when the heartbeat of a server times out it interrupts the requests running on it, so a
+/// counter write that waits for it ends with an error. A bound the URL names itself is kept
+/// when it is shorter.
+pub(super) fn bound_counting(options: &mut ClientOptions) {
+    // A zero in the URL means "no limit" to the driver: it does not lift the bound.
+    let shorter = |named: Option<Duration>, bound: Duration| {
+        Some(
+            named
+                .filter(|named| !named.is_zero())
+                .map_or(bound, |named| named.min(bound)),
+        )
+    };
+
+    options.connect_timeout = shorter(options.connect_timeout, COUNT_CONNECT_TIMEOUT);
+    options.heartbeat_freq = shorter(options.heartbeat_freq, COUNT_HEARTBEAT).map(|freq| freq.max(COUNT_HEARTBEAT));
 }
 
 /// Asks the server what it is (the first contact) and returns whether writes can run in

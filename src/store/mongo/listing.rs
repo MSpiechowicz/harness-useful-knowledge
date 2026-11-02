@@ -4,7 +4,7 @@
 use mongodb::bson::{Bson, Document as Row, doc};
 
 use super::ctx::{Ctx, Fail};
-use super::documents::{document, links};
+use super::documents::{document, links, usage};
 use super::schema::{CHUNKS, DOCUMENTS};
 use super::{int, terms, text};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
@@ -12,7 +12,7 @@ use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, StoreError};
+use crate::store::{Section, Sort, Stats, StoreError, UsefulFilter};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage, Fail> {
@@ -27,6 +27,8 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
         Sort::Chunks => "chunk_count",
         // An array sorts by its smallest element ascending, an empty one (global) first.
         Sort::Repos => "repo_keys",
+        // A document nobody rated has no counters: it sorts as 0, in a field of its own.
+        Sort::Useful | Sort::LastUseful => USEFUL_ORDER,
     };
     let direction = if query.descending { -1 } else { 1 };
     let sort = doc! { key: direction, "_id": direction };
@@ -37,6 +39,8 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     // A limit of 0 asks for no limit in a query.
     let rows = if limit == 0 {
         Vec::new()
+    } else if key == USEFUL_ORDER {
+        ctx.aggregate(DOCUMENTS, useful_pipeline(query.sort, filter, sort, skip, limit))?
     } else {
         ctx.find(DOCUMENTS, filter, (sort, skip, limit), Row::new())?
     };
@@ -47,6 +51,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
             Ok(DocumentRow {
                 doc: document(row)?,
                 links: links(row),
+                usage: usage(row),
             })
         })
         .collect::<Result<_, StoreError>>()?;
@@ -57,7 +62,45 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     })
 }
 
-/// The filter of `query`: the repository, the format and the text.
+/// The field a page is sorted on for the sorts by usefulness.
+const USEFUL_ORDER: &str = "useful_order";
+
+/// The pipeline of a page sorted by usefulness: the order is a computed field (a missing counter
+/// is 0). The page is sorted again at the end: Amazon DocumentDB keeps the order of a `$sort` only
+/// when it is the last stage.
+fn useful_pipeline(sort: Sort, filter: Row, order: Row, skip: u64, limit: i64) -> Vec<Row> {
+    let counter = if sort == Sort::Useful {
+        "$useful"
+    } else {
+        "$last_useful_at"
+    };
+    let number =
+        doc! { "$cond": [{ "$in": [{ "$type": counter }, ["int", "long", "double", "decimal"]] }, counter, 0_i64] };
+
+    vec![
+        doc! { "$match": filter },
+        doc! { "$addFields": { USEFUL_ORDER: number } },
+        doc! { "$sort": order.clone() },
+        doc! { "$skip": i64::try_from(skip).unwrap_or(i64::MAX) },
+        doc! { "$limit": limit },
+        doc! { "$sort": order },
+    ]
+}
+
+/// The match that keeps the documents of `filter` by usefulness (nothing for no filter). A
+/// document nobody rated has no `useful` field, which counts as 0: `$not` of `$gte` also matches a
+/// missing field (and one that holds no number). `never` needs the document shown often enough.
+fn useful_match(filter: Option<UsefulFilter>) -> Option<Row> {
+    match filter? {
+        UsefulFilter::Ever => Some(doc! { "useful": { "$gte": 1_i64 } }),
+        UsefulFilter::Never => Some(doc! {
+            "shown": { "$gte": UsefulFilter::SHOWN_MIN },
+            "useful": { "$not": { "$gte": 1_i64 } },
+        }),
+    }
+}
+
+/// The filter of `query`: the repository, the format, how useful and the text.
 fn conditions(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<Row, Fail> {
     let mut all: Vec<Row> = Vec::new();
 
@@ -70,6 +113,10 @@ fn conditions(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<Row, Fail> {
 
     if let Some(format) = &query.format {
         all.push(doc! { "format": format });
+    }
+
+    if let Some(useful) = useful_match(query.useful) {
+        all.push(useful);
     }
 
     let wanted = query.text.trim();
@@ -184,6 +231,7 @@ pub(super) fn get(ctx: &mut Ctx<'_>, id: i64, detail: &Detail) -> Result<Option<
     Ok(Some(DocumentDetail {
         doc: document(&row)?,
         links: links(&row),
+        usage: usage(&row),
         sections,
         chunk,
     }))

@@ -6,12 +6,15 @@
 //! the file or of a folder on the way), at most [`CONTENT_MAX`] bytes of UTF-8. A text that holds a
 //! credential is refused. `replaces` is a document id as the tools show it (`12` or `local:12`) of a document
 //! that exists: the proposal keeps its text hash and key, and an approval replaces only that document.
+//! Without `replaces` and `distinct: true`, a stored document the text is probably a version of
+//! refuses the call, nothing is held ([`super::duplicate`]).
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::duplicate::{self, Proposed};
 use super::scope::repository;
 use super::{CONTENT_MAX, Server};
 use crate::config::Layout;
@@ -37,6 +40,9 @@ pub(super) struct AddArgs {
     /// with its place so an approval replaces that document and no other.
     #[serde(default, deserialize_with = "document_id")]
     replaces: Option<i64>,
+    /// True to add the document although a similar one exists (see [`super::duplicate`]).
+    #[serde(default)]
+    distinct: bool,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +103,21 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
     let replaces = args.replaces.map(|id| hold_replaces(server.routing, id)).transpose()?;
     let replaced = replaces.map(|id| replaced_document(server, id)).transpose()?;
 
-    let item = HeldItem::new(
+    if replaces.is_none() && !args.distinct {
+        let proposed = Proposed {
+            title: &title,
+            name: &name,
+            content: &content,
+            links: &links,
+            repo_key: repo.as_ref().map(|repo| repo.key.as_str()),
+        };
+
+        if let Some(refusal) = duplicate::refusal(server, &proposed) {
+            return Err(refusal);
+        }
+    }
+
+    let mut item = HeldItem::new(
         Source {
             client: server.client.clone().unwrap_or_else(|| "unknown".to_owned()),
             session: server.session.clone(),
@@ -118,6 +138,8 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
             replaced,
         },
     );
+
+    item.added_by = HeldItem::author_name(&server.env, item.project_path.as_deref());
 
     match held.hold(item) {
         Ok(id) => Ok(format!("held:{id}\n{SENT}")),

@@ -21,12 +21,15 @@ mod embeddings;
 mod listing;
 mod ordered;
 mod phrase;
+mod quality;
 mod search;
 mod titles;
 mod upgrade;
 mod url;
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +58,24 @@ pub(super) struct TestDb {
     pub url: String,
     pub name: String,
     client: Client,
+    /// Shares the test server with the other tests, unless this test holds it [`alone`].
+    _shared: Option<RwLockReadGuard<'static, ()>>,
+}
+
+/// The test server: shared by the tests, held alone by one that stops the whole server (`fsync` lock).
+static SERVER: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    static ALONE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Holds the test server alone until the guard is dropped: the other tests wait, so a test that locks the whole
+/// server for writes does not slow theirs. Call it before [`store`].
+pub(super) fn alone() -> RwLockWriteGuard<'static, ()> {
+    let guard = SERVER.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ALONE.with(|alone| alone.set(true));
+
+    guard
 }
 
 impl TestDb {
@@ -77,10 +98,13 @@ impl TestDb {
 
         let client = Client::with_uri_str(&base).expect("test server client");
 
+        let shared = (!ALONE.with(Cell::get)).then(|| SERVER.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+
         Some(Self {
             url: with_database(&base, &name),
             name,
             client,
+            _shared: shared,
         })
     }
 

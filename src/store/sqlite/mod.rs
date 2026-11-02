@@ -11,11 +11,14 @@
 //! The vectors are searched by brute force: a scope prefilter in SQL, then the dot product of the
 //! stored vectors with the query (all are L2-normalised, so it is the cosine), see [`search`].
 
+mod columns;
 mod documents;
 mod listing;
 mod meta;
+mod quality;
 pub mod schema;
 mod search;
+pub(crate) mod sql_quality;
 pub(crate) mod sql_shared;
 #[cfg(test)]
 mod tests;
@@ -29,7 +32,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use super::PendingChunk;
 use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{RepoCounts, Scope, Stats, StoreError, clean};
+use super::{Columns, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 use schema::SchemaState;
 
 /// How long a statement waits for another process's lock.
@@ -42,6 +45,11 @@ const BUSY_RETRY: Duration = Duration::from_millis(20);
 pub struct SqliteStore {
     conn: Connection,
     newer: bool,
+    /// The columns added in place that the file has (see [`columns`]).
+    columns: Columns,
+    /// How long a statement waits for another process's lock: [`BUSY_TIMEOUT`], or none for a
+    /// handle opened by [`SqliteStore::open_counters`].
+    busy: Duration,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -80,6 +88,46 @@ impl SqliteStore {
         .map(Some)
     }
 
+    /// Opens the database at `path` for counting alone: `None` when the file does not exist or holds
+    /// no database yet. It never creates, migrates or adds columns, and never waits for a lock
+    /// (not while opening, not for a statement), so a file another process is writing, an older one
+    /// that still needs its migration (an error) or one without the counter columns (counting then
+    /// does nothing) costs no more than a look at it. Only the counters are meant to be written
+    /// through it.
+    pub fn open_counters(path: &Path) -> Result<Option<Self>, StoreError> {
+        if !exists(path)? {
+            return Ok(None);
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::ZERO)?;
+
+        let version = schema::user_version(&conn)?;
+
+        if version == 0 {
+            return Ok(None);
+        }
+
+        if version < schema::SCHEMA_VERSION {
+            return Err(StoreError::Backend(
+                "the database is from an older server and has not been upgraded yet".to_owned(),
+            ));
+        }
+
+        let newer = version > schema::SCHEMA_VERSION;
+        let columns = if newer { Columns::NONE } else { columns::present(&conn)? };
+
+        Ok(Some(Self {
+            conn,
+            newer,
+            columns,
+            busy: Duration::ZERO,
+        }))
+    }
+
     /// Opens the database at `path` read-only, so it cannot be created, migrated or changed.
     /// `None` when the file does not exist or nothing was written to it yet (a server that has
     /// not finished creating it): there is nothing to read.
@@ -104,9 +152,13 @@ impl SqliteStore {
             ));
         }
 
+        let columns = columns::present(&conn)?;
+
         Ok(Some(Self {
             conn,
             newer: version > schema::SCHEMA_VERSION,
+            columns,
+            busy: BUSY_TIMEOUT,
         }))
     }
 
@@ -116,8 +168,14 @@ impl SqliteStore {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::migrate(&mut conn)?;
+        let columns = columns::install(&mut conn);
 
-        Ok(Self { conn, newer: false })
+        Ok(Self {
+            conn,
+            newer: false,
+            columns,
+            busy: BUSY_TIMEOUT,
+        })
     }
 
     /// True when the database was written by a newer server.
@@ -145,9 +203,18 @@ impl SqliteStore {
             }
         };
 
+        let newer = state == SchemaState::Newer;
+        let columns = if newer {
+            Columns::NONE
+        } else {
+            columns::install(&mut conn)
+        };
+
         Ok(Self {
             conn,
-            newer: state == SchemaState::Newer,
+            newer,
+            columns,
+            busy: BUSY_TIMEOUT,
         })
     }
 
@@ -194,15 +261,22 @@ impl KnowledgeStore for SqliteStore {
         let links = clean::links(links)?;
         clean::chunks(chunks)?;
 
-        self.write(|tx| documents::put(tx, doc, &title, chunks, &links))
+        let columns = self.columns;
+
+        self.write(|tx| {
+            let id = documents::put(tx, doc, &title, chunks, &links)?;
+            documents::stamp_authors(tx, columns, id, doc)?;
+
+            Ok(id)
+        })
     }
 
     fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        documents::find(self.conn()?, "content_sha256", sha)
+        documents::find(self.conn()?, self.columns, "content_sha256", sha)
     }
 
     fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        documents::find(self.conn()?, "source_key", key)
+        documents::find(self.conn()?, self.columns, "source_key", key)
     }
 
     fn reusable_embeddings(
@@ -223,6 +297,28 @@ impl KnowledgeStore for SqliteStore {
         self.write(|tx| documents::set_embeddings(tx, model_id, embeddings))
     }
 
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.count_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.count_useful(ids, at)
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        quality::by_title(self.conn()?, self.columns, title, scope)
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        quality::sharing(self.conn()?, chunk_shas)
+    }
+
+    /// True for a file opened for writing: this computer's file is the person's own. A handle
+    /// opened to read says nothing about the file's permissions.
+    fn remote_writable(&mut self) -> Option<bool> {
+        (!self.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(true)).then_some(true)
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -240,11 +336,11 @@ impl KnowledgeStore for SqliteStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-        listing::list(self.conn()?, query)
+        listing::list(self.conn()?, self.columns, query)
     }
 
     fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-        listing::get(self.conn()?, id, detail)
+        listing::get(self.conn()?, self.columns, id, detail)
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
@@ -274,7 +370,7 @@ fn initialize(conn: &mut Connection) -> rusqlite::Result<SchemaState> {
     schema::migrate(conn)
 }
 
-fn is_busy(error: &rusqlite::Error) -> bool {
+pub(super) fn is_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)

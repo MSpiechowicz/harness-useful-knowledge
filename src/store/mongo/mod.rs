@@ -44,6 +44,7 @@ mod meta;
 mod migrate;
 mod open;
 pub mod probe;
+mod quality;
 pub mod schema;
 mod search;
 mod terms;
@@ -53,13 +54,14 @@ mod write;
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use mongodb::bson::{Bson, Document as Row};
 use mongodb::error::Error;
 use mongodb::sync::{Client, Database};
 
-use open::{Opening, connect_client, transactions};
+use open::{Opening, connect_client, connect_client_for, transactions};
 pub use open::{open_boxed, open_boxed_with};
 
 use super::upgrade::{Plan, plan};
@@ -70,7 +72,7 @@ use schema::IndexState;
 use super::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
 };
-use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
+use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 
 /// The database used when the URL path names none.
 pub const DEFAULT_DATABASE: &str = "harness_knowledge";
@@ -87,6 +89,9 @@ pub(super) enum Mode {
     Existing,
     /// Reads and writes, creating the database when it does not exist.
     Create,
+    /// Counts and nothing else: nothing is created, migrated or brought back, and writes other than
+    /// the counters are refused.
+    Counters,
 }
 
 /// The MongoDB team backend. See the module docs.
@@ -99,6 +104,8 @@ pub struct MongoStore {
     read_only: bool,
     /// Both search indexes answered queries once, so they are not asked about again.
     searchable: bool,
+    /// A counter write is running on its own thread (see [`quality`]).
+    counting: &'static AtomicBool,
 }
 
 impl std::fmt::Debug for MongoStore {
@@ -148,7 +155,7 @@ impl MongoStore {
         selection_timeout: Duration,
         upgrade: Upgrade,
     ) -> Result<Opened<Self>, Opening> {
-        let (client, db) = connect_client(url, selection_timeout)?;
+        let (client, db) = connect_client_for(url, selection_timeout, mode)?;
         let transactions = transactions(&client)?;
         let failed = |error: Error| match connection::missing(&error) {
             Some((code, message)) => Opening::Missing { code, message },
@@ -160,6 +167,7 @@ impl MongoStore {
             Mode::ReadOnly => Access::Read,
             Mode::Existing => Access::Existing,
             Mode::Create => Access::Create,
+            Mode::Counters => Access::Counters,
         };
 
         let newer = match plan(
@@ -170,7 +178,7 @@ impl MongoStore {
         ) {
             Plan::Absent => return Ok(Opened::Ready(None)),
             // A writer also brings back a search index that was dropped, whatever the version.
-            Plan::Current if mode != Mode::ReadOnly => schema::migrate(&db).map_err(failed)?,
+            Plan::Current if matches!(mode, Mode::Existing | Mode::Create) => schema::migrate(&db).map_err(failed)?,
             Plan::Current => false,
             Plan::Newer => true,
             Plan::TooOld => {
@@ -187,8 +195,9 @@ impl MongoStore {
             client,
             transactions,
             newer,
-            read_only: mode == Mode::ReadOnly,
+            read_only: matches!(mode, Mode::ReadOnly | Mode::Counters),
             searchable: false,
+            counting: quality::counting_gate(),
         })))
     }
 
@@ -333,6 +342,28 @@ impl KnowledgeStore for MongoStore {
         clean::embeddings(model_id, embeddings)?;
 
         self.write(|ctx| documents::set_embeddings(ctx, model_id, embeddings))
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.count_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.count_useful(ids, at)
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        self.read(|ctx| quality::by_title(ctx, title, scope))
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|ctx| quality::sharing(ctx, chunk_shas))
+    }
+
+    /// Whether the connected user holds the `update` privilege on the documents, as the server
+    /// reports it; `None` when it does not say.
+    fn remote_writable(&mut self) -> Option<bool> {
+        self.may_update()
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {

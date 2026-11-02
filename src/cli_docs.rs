@@ -2,9 +2,15 @@
 //! terminal, never for an agent's MCP calls. Every one of them takes `--json` and prints one JSON
 //! object on stdout. Timestamps are RFC 3339, field names camelCase.
 //!
-//! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--sort
-//!   title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] [--place remote|local]` prints `{"items": [...], "total": N}`:
-//!   one page of the documents (see [`json::document`] for an item, it has its `links`). `--repo`
+//! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--useful
+//!   any|ever|never] [--sort title|updated|size|format|chunks|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local]`
+//!   prints `{"items": [...], "total": N}`:
+//!   one page of the documents (see [`json::document`] for an item: its `links`, `addedBy` and
+//!   `updatedBy`, and the counters `shown`, `useful` and `lastUsefulAt`, which are absent while the
+//!   database has no counter columns). `--useful ever` keeps the documents an agent found useful
+//!   at least once, `never` those shown at least 3 times and found useful by none, `any` (the default) all.
+//!   On a database without the counter columns `ever` and `never` keep none, `any` all, and the sorts
+//!   by `useful` and `lastUseful` (a document never rated counts 0) are the default order. `--repo`
 //!   keeps the documents linked to that repository key, `--global` those linked to none, `--all`
 //!   (the default) every one. `--query` keeps the documents whose title contains it or whose text has
 //!   all its words. Sorted by `updated` unless `--sort` says otherwise, ascending unless `--desc`,
@@ -16,7 +22,8 @@
 //!   `--place remote` while the remote cannot be reached exits 1 like `docs get` of a remote id.
 //!   `offline` is `true` (and absent otherwise) while the remote database cannot be
 //!   reached and the page comes from this computer alone (see [`crate::store::routed`]).
-//! - `docs get --json ID [--sections] [--chunk CID]` prints `{"document": {... "links"}}` and, as
+//! - `docs get --json ID [--sections] [--chunk CID]` prints `{"document": {... "links"}}` (the item
+//!   of `docs list`) and, as
 //!   asked, `"sections"` (the outline: every chunk's id, position, heading path and size) and
 //!   `"chunk"` (that chunk of the document, with its text).
 //! - `docs matches --json ID --query Q [--limit N]` prints `{"matches": [{"chunkId", "ordinal",
@@ -35,8 +42,12 @@
 //! - `docs import --ndjson` reads a manifest from stdin and prints one JSON event per line while it
 //!   imports, `docs reindex --json (ID... | --all)` embeds the chunks that have no vector (see
 //!   [`import`]).
+//! - `docs similar --json [--repo KEY | --global] PATH...` prints `{"similar": [{"path", "match"}]}`: for
+//!   each file (a folder gives its files) the stored document it is probably a version of, or `null`
+//!   (see [`similar`]). Read only.
 //! - `repos --json` prints `{"global": N, "repos": [{"key", "docs"}]}` (and `"offline": true`
-//!   like `docs list`), `stats --json` the counts of [`overview::stats`], `project-key --json --path PATH` the repository key of a folder, and
+//!   like `docs list`), `stats --json` the counts of [`overview::stats`] (and `remoteWritable`),
+//!   `project-key --json --path PATH` the repository key of a folder, and
 //!   `check --json` what the database can do (see [`check`]).
 //!
 //! A read never creates the local database: without it every list is empty and exit 0. With both
@@ -53,6 +64,8 @@ mod json;
 mod listing;
 mod matches;
 mod overview;
+mod replacing;
+mod similar;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -69,10 +82,11 @@ use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
-                         [--sort title|updated|size|format|chunks|repos] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
+                         [--useful any|ever|never] [--sort title|updated|size|format|chunks|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
                          [--sections] [--chunk CID] | docs matches --json ID --query Q [--limit N] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
-                         --json (ID... | --all) | repos --json | stats --json | project-key --json \
+                         --json (ID... | --all) | docs similar --json [--repo KEY | --global] PATH... | \
+                         repos --json | stats --json | project-key --json \
                          --path PATH | check --json";
 
 /// Where a command runs: the environment and the database it reads.
@@ -242,6 +256,7 @@ pub fn docs_reply(context: &Context, args: &[Option<&str>], input: &mut dyn Read
         [Some("delete"), rest @ ..] => delete(context, rest),
         [Some("import"), rest @ ..] => import::import(context, rest, input),
         [Some("reindex"), rest @ ..] => import::reindex(context, rest),
+        [Some("similar"), rest @ ..] => similar::similar(context, rest),
         _ => Err(Failure::Usage),
     }
 }
@@ -263,7 +278,7 @@ fn list(context: &Context, args: &[Option<&str>]) -> Reply {
     let items: Vec<Value> = page
         .items
         .iter()
-        .map(|row| json::document(&row.doc, &row.links))
+        .map(|row| json::document(&row.doc, &row.links, row.usage))
         .collect();
     let mut shown = json!({ "items": items, "total": page.total });
 
@@ -316,7 +331,7 @@ fn get(context: &Context, args: &[Option<&str>]) -> Reply {
     };
 
     let found = store.get(id, &detail)?.ok_or_else(|| not_found(id))?;
-    let mut shown = json!({ "document": json::document(&found.doc, &found.links) });
+    let mut shown = json!({ "document": json::document(&found.doc, &found.links, found.usage) });
 
     if let Some(sections) = &found.sections {
         shown["sections"] = sections.iter().map(json::section).collect();
@@ -423,6 +438,10 @@ fn delete(context: &Context, args: &[Option<&str>]) -> Reply {
 #[cfg(test)]
 mod offline_tests;
 #[cfg(test)]
+mod quality_tests;
+#[cfg(test)]
 mod routing_tests;
+#[cfg(test)]
+mod similar_tests;
 #[cfg(test)]
 mod tests;

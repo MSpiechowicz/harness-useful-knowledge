@@ -8,8 +8,14 @@
 //! - Tool validation and store failures are tool results with `isError: true`.
 //! - Nothing a client sends is written to stderr.
 //! - The tools read the documentation ([`calls`]) and `knowledge_add` writes only to the review
-//!   queue ([`add`]), never to the database. Every document text in a reply is wrapped as untrusted
-//!   ([`crate::search::render`]).
+//!   queue ([`add`]). The one thing written to the database is the usefulness counters (`shown`,
+//!   `useful`, `last_useful_at`, see [`counting`]): queued by `knowledge_search` and
+//!   `knowledge_feedback`, written after the reply, once per document and session, through a handle
+//!   that does nothing else. That handle never migrates or upgrades the database, never adds the
+//!   counter columns (a database without them counts nothing: they are added by a write path that
+//!   may wait, an import, an approval, a CLI write, the desktop), never waits for a lock and is cut
+//!   off after a hard time budget, and a failed count is dropped silently. The search handle itself
+//!   is read-only. Every document text in a reply is wrapped as untrusted ([`crate::search::render`]).
 //! - The store opens on the first call that needs it and is opened again after a database failure,
 //!   so a team database that was down, or a local one that did not exist yet, is picked up later.
 //! - With both places in use, a remote database that cannot be reached leaves the answers of
@@ -19,6 +25,9 @@
 
 mod add;
 mod calls;
+pub(crate) mod counting;
+mod duplicate;
+mod feedback;
 mod folder;
 mod get;
 mod list;
@@ -56,6 +65,13 @@ pub const SEARCH_LIMIT_MAX: usize = 10;
 /// Most paths of one search.
 pub const PATHS_MAX: usize = 20;
 
+/// Most characters of the reason of a `knowledge_feedback`.
+pub const FEEDBACK_REASON_MAX: usize = 200;
+
+/// The client name Harness Desktop initializes the server with: its background searches are not
+/// an agent being shown a document.
+const DESKTOP_CLIENT: &str = "harness-desktop";
+
 /// Chunks of context `knowledge_get` may add on each side.
 pub const NEIGHBORS_MAX: usize = 2;
 
@@ -83,6 +99,8 @@ pub struct Server {
     vector_notice: bool,
     /// Whether the line saying the remote database is unreachable was shown since it last was.
     offline_notice: bool,
+    /// The usefulness counters queued and written (see [`counting`]).
+    counting: counting::Counting,
 }
 
 impl std::fmt::Debug for Server {
@@ -115,7 +133,14 @@ impl Server {
             session,
             vector_notice: false,
             offline_notice: false,
+            counting: counting::Counting::default(),
         }
+    }
+
+    /// Writes the usefulness counters the last answer queued. [`serve`] calls it once the answer is
+    /// written and flushed, so a counter never delays a reply. Nothing is reported, whatever happens.
+    pub fn after_reply(&mut self) {
+        self.counting.flush(&self.env, &self.backend, self.routing);
     }
 
     /// The same server reading and writing where `routing` says.
@@ -281,6 +306,9 @@ pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W, server: &mut Se
         if let Some(reply) = reply {
             protocol::write_message(&mut writer, &reply)?;
         }
+
+        // Counted after the answer is out.
+        server.after_reply();
     }
 }
 

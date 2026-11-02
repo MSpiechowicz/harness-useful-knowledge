@@ -30,8 +30,11 @@ pub(crate) fn plan(version: Option<i64>, access: Access, current: i64, readable_
         (None, Access::Create) => Plan::Migrate { creates: true },
         (None, _) => Plan::Absent,
         (Some(version), _) if version > current => Plan::Newer,
+        // A reader copes with an additive change, but a database that is not at the version of this
+        // server yet is not counted in: counting never touches what an upgrade is about to change.
+        (Some(version), Access::Counters) if version < current => Plan::TooOld,
         (Some(version), Access::Read) if version < readable_from => Plan::TooOld,
-        (Some(_), Access::Read) => Plan::Current,
+        (Some(_), Access::Read | Access::Counters) => Plan::Current,
         (Some(version), _) if version < current => Plan::Migrate { creates: false },
         (Some(_), _) => Plan::Current,
     }
@@ -65,5 +68,18 @@ mod tests {
         }
 
         assert_eq!(plan(Some(4), Access::Read, 3, 2), Plan::Newer);
+    }
+
+    #[test]
+    fn counting_never_migrates_and_leaves_a_database_that_is_not_current_alone() {
+        assert_eq!(plan(None, Access::Counters, 3, 2), Plan::Absent);
+        assert_eq!(plan(Some(1), Access::Counters, 3, 2), Plan::TooOld);
+        assert_eq!(
+            plan(Some(2), Access::Counters, 3, 2),
+            Plan::TooOld,
+            "readable, but not current"
+        );
+        assert_eq!(plan(Some(3), Access::Counters, 3, 2), Plan::Current);
+        assert_eq!(plan(Some(4), Access::Counters, 3, 2), Plan::Newer);
     }
 }

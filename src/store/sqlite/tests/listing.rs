@@ -11,6 +11,7 @@ pub(super) fn everything() -> ListQuery {
         filter: RepoFilter::All,
         format: None,
         text: String::new(),
+        useful: None,
         sort: Sort::Updated,
         descending: true,
         offset: 0,
@@ -170,6 +171,7 @@ fn filters_by_repository_format_and_text_combine_and_the_total_follows_them() {
     let one = store
         .list(&ListQuery {
             text: "doc 0042".to_owned(),
+            useful: None,
             ..everything()
         })
         .expect("list");
@@ -195,6 +197,7 @@ fn the_text_filter_reads_titles_and_chunk_text_and_wildcards_are_plain_character
         let page = store
             .list(&ListQuery {
                 text: text.to_owned(),
+                useful: None,
                 sort: Sort::Title,
                 descending: false,
                 ..everything()
@@ -265,6 +268,7 @@ fn the_text_filter_is_a_phrase_whose_last_word_is_a_prefix() {
         let page = store
             .list(&ListQuery {
                 text: text.to_owned(),
+                useful: None,
                 sort: Sort::Title,
                 descending: false,
                 ..everything()

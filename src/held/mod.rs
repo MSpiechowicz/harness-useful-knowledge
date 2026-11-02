@@ -22,6 +22,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ pub use ids::{is_held_id, random_id};
 pub use store::{Claim, HeldStore, HoldError};
 
 use crate::store::Link;
+use crate::support::{Env, author};
 
 /// The folder next to the database that holds the proposals.
 pub const HELD_FOLDER: &str = "held";
@@ -87,6 +89,12 @@ pub struct HeldItem {
     /// still this one (a document that was deleted and a new one that took its number is not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced: Option<Replaced>,
+    /// The git `user.name` of the person the proposal is written for, read when it is held (absent
+    /// when none was known, and in proposals held by an older version). The approval writes it as
+    /// the document's author, with [`Self::client`] as the harness. It is not part of the
+    /// [`Self::digest`], so a file with or without it has the revision it always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
     /// The [`Self::digest`] of the content, set when it is held.
     pub revision: String,
 }
@@ -143,22 +151,55 @@ impl HeldItem {
             links: proposal.links,
             replaces: proposal.replaces,
             replaced: proposal.replaced,
+            added_by: None,
             revision: String::new(),
         }
     }
 
     /// The lowercase hex SHA-256 of the item's canonical JSON (keys sorted, no blanks) without its
-    /// `revision`.
+    /// `revision` and `addedBy`.
     pub fn digest(&self) -> String {
         let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
 
         if let Value::Object(fields) = &mut value {
             fields.remove("revision");
+            fields.remove("addedBy");
         }
 
         let text = serde_json::to_vec(&sorted(value)).unwrap_or_default();
 
         hex(&Sha256::digest(&text))
+    }
+
+    /// The name the text is imported under: the proposal's name with the extension of its format.
+    pub fn import_name(&self) -> String {
+        let extension = match self.format.as_str() {
+            "text" => "txt",
+            "html" => "html",
+            "asciidoc" => "adoc",
+            "rst" => "rst",
+            "openapi" => "yaml",
+            _ => "md",
+        };
+
+        let stem = Path::new(&self.name)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "document".to_owned());
+
+        format!("{stem}.{extension}")
+    }
+
+    /// The git `user.name` for a proposal about `project_path`: read in that folder when it is one,
+    /// else in the current folder.
+    pub fn author_name(env: &Env, project_path: Option<&str>) -> Option<String> {
+        let dir = project_path
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .or_else(|| std::env::current_dir().ok())?;
+
+        author::resolve(env, &dir)
     }
 
     /// The same proposal as `other` (a retry): same text, title, format, links and replacement (the

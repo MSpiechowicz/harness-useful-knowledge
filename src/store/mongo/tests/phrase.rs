@@ -16,6 +16,7 @@ fn filtered(store: &mut MongoStore, text: &str) -> DocumentPage {
             filter: RepoFilter::All,
             format: None,
             text: text.to_owned(),
+            useful: None,
             sort: Sort::Title,
             descending: false,
             offset: 0,

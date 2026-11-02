@@ -3,7 +3,9 @@
 //! - [`manifest`]: what `docs import --ndjson` reads from stdin.
 //! - [`place`]: where a document is saved.
 //! - [`walk`]: the files of the manifest's paths and folders, with the folder walk's rules.
+//! - [`prepare`]: one file read the way an import reads it (text, title, chunks, hashes, source key).
 //! - [`document`]: one file, from bytes to a stored document ([`Importer`]).
+//! - [`similar`]: the stored document a file is probably a version of (`docs similar`).
 //! - [`embed`]: the [`Embedder`] trait and the reuse of vectors an import does not recompute.
 //! - [`events`]: the NDJSON the import prints.
 //! - [`reindex`]: `docs reindex`, which gives chunks that have no vector one.
@@ -17,7 +19,9 @@ pub mod embed;
 pub mod events;
 pub mod manifest;
 pub mod place;
+mod prepare;
 pub mod reindex;
+pub mod similar;
 pub mod walk;
 
 #[cfg(test)]
@@ -27,6 +31,7 @@ pub use document::{Importer, Outcome};
 pub use embed::{EmbedError, Embedder};
 pub use manifest::Manifest;
 
+use crate::store::routed::ids;
 use events::{Counts, Events};
 
 /// How an import ended.
@@ -38,7 +43,75 @@ pub struct Report {
     pub pending: usize,
 }
 
-/// Imports what `manifest` names with `importer`, printing the events. `Err` when the manifest
+/// How far an import is, across the importers (one per place) that take turns.
+pub struct Progress {
+    report: Report,
+    done: usize,
+    total: usize,
+}
+
+impl Progress {
+    /// The start of an import of `total` files; prints the plan.
+    pub fn new(total: usize, events: &mut Events) -> Self {
+        events.plan(total);
+
+        Self {
+            report: Report {
+                counts: Counts::default(),
+                cancelled: false,
+                pending: 0,
+            },
+            done: 0,
+            total,
+        }
+    }
+
+    /// True once the import was cancelled: nothing more is imported.
+    pub fn cancelled(&self) -> bool {
+        self.report.cancelled
+    }
+
+    /// Imports `candidate` with `importer` over the document `replaces` names (the id the
+    /// importer's store knows), printing its events. False once the import is cancelled.
+    pub fn file(
+        &mut self,
+        importer: &mut Importer,
+        candidate: &walk::Candidate,
+        replaces: Option<i64>,
+        events: &mut Events,
+    ) -> bool {
+        if (importer.cancel)() || events.closed() {
+            self.report.cancelled = true;
+            return false;
+        }
+
+        match importer.import_replacing(candidate, replaces) {
+            Outcome::Finished { event, pending } => {
+                self.report.counts.count(event.status);
+                self.report.pending += pending;
+                self.done += 1;
+                events.file(&event);
+                events.progress(self.done, self.total);
+
+                true
+            }
+            Outcome::Cancelled => {
+                self.report.cancelled = true;
+                false
+            }
+        }
+    }
+
+    /// Prints the end of the import; `counter` is what counted the tokens.
+    pub fn finish(self, counter: &str, events: &mut Events) -> Report {
+        events.done(self.report.counts, self.report.cancelled, counter, self.report.pending);
+        self.report
+    }
+}
+
+/// Imports what `manifest` names with `importer`, printing the events. A file of the manifest's
+/// `replacing` replaces its document in the importer's store, whatever place its id carries (the
+/// caller has chosen the store, see `docs import` for the one per place). `Err` when the manifest
 /// cannot be carried out at all (too many files, a replacement of more than one file).
 pub fn run(importer: &mut Importer, manifest: &Manifest, events: &mut Events) -> Result<Report, String> {
     let candidates = walk::plan(manifest)?;
@@ -47,36 +120,19 @@ pub fn run(importer: &mut Importer, manifest: &Manifest, events: &mut Events) ->
         return Err("replaces takes exactly one file".to_owned());
     }
 
-    let total = candidates.len();
-    let mut report = Report {
-        counts: Counts::default(),
-        cancelled: false,
-        pending: 0,
-    };
+    let replacing = manifest.replacing_by_path();
+    let mut progress = Progress::new(candidates.len(), events);
 
-    events.plan(total);
+    for candidate in &candidates {
+        let replaces = replacing
+            .get(&manifest::canonical(&candidate.path))
+            .map(|id| ids::split(*id).1)
+            .or(importer.replaces);
 
-    for (done, candidate) in candidates.iter().enumerate() {
-        if (importer.cancel)() || events.closed() {
-            report.cancelled = true;
+        if !progress.file(importer, candidate, replaces, events) {
             break;
-        }
-
-        match importer.import(candidate) {
-            Outcome::Finished { event, pending } => {
-                report.counts.count(event.status);
-                report.pending += pending;
-                events.file(&event);
-                events.progress(done + 1, total);
-            }
-            Outcome::Cancelled => {
-                report.cancelled = true;
-                break;
-            }
         }
     }
 
-    events.done(report.counts, report.cancelled, importer.counter.name(), report.pending);
-
-    Ok(report)
+    Ok(progress.finish(importer.counter.name(), events))
 }

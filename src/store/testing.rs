@@ -1,7 +1,11 @@
 //! Test-only helpers: documents with chunks and fake embeddings, inserted without an importer
 //! (the real import is built on `put_document` too).
 
-use super::{Chunk, DIMS, Detail, Document, KnowledgeStore, Link, Origin, SqliteStore, StoreError};
+mod quality;
+
+pub use quality::*;
+
+use super::{Author, Chunk, DIMS, Detail, Document, KnowledgeStore, Link, Origin, SqliteStore, StoreError};
 
 /// The model the fake embeddings claim to come from.
 pub const MODEL: &str = "test-model";
@@ -16,6 +20,7 @@ pub struct Seed {
     updated_at: i64,
     chunks: Vec<(String, String, Option<Vec<f32>>)>,
     links: Vec<Link>,
+    author: Option<Author>,
 }
 
 impl Seed {
@@ -28,6 +33,7 @@ impl Seed {
             updated_at: 1_000,
             chunks: Vec::new(),
             links: Vec::new(),
+            author: None,
         }
     }
 
@@ -63,6 +69,15 @@ impl Seed {
         self
     }
 
+    /// The author the document is stored by.
+    pub fn by(mut self, name: &str, via: Option<&str>) -> Self {
+        self.author = Some(Author {
+            name: name.to_owned(),
+            via: via.map(str::to_owned),
+        });
+        self
+    }
+
     pub fn link(mut self, repo: &str, globs: &[&str]) -> Self {
         self.links.push(Link {
             repo_key: repo.to_owned(),
@@ -87,6 +102,8 @@ impl Seed {
             updated_at: self.updated_at,
             origin: Origin::User,
             warnings: Vec::new(),
+            added_by: self.author.clone(),
+            updated_by: self.author.clone(),
         };
 
         let chunks = self
@@ -363,6 +380,7 @@ pub fn title_order_contract(store: &mut dyn KnowledgeStore) {
                 filter: RepoFilter::All,
                 format: None,
                 text: String::new(),
+                useful: None,
                 sort: Sort::Title,
                 descending,
                 offset,

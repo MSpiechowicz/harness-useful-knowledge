@@ -18,6 +18,7 @@ fn everything() -> ListQuery {
         filter: RepoFilter::All,
         format: None,
         text: String::new(),
+        useful: None,
         sort: Sort::Updated,
         descending: true,
         offset: 0,

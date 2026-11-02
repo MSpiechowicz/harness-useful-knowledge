@@ -12,7 +12,7 @@ use crate::config::Secrets;
 use crate::store::testing::{Seed, insert, store};
 use crate::store::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
-    PendingChunk, Reach, RepoCounts, Scope, SqliteStore, Stats, StoreError,
+    PendingChunk, Reach, RepoCounts, Scope, SqliteStore, Stats, StoreError, TitleScope,
 };
 
 /// How long a failed attempt is not repeated in these tests.
@@ -28,6 +28,8 @@ pub(super) struct Net {
     dials: Arc<AtomicUsize>,
     /// Milliseconds a dial takes before it fails (a network that drops the packets).
     lag: Arc<AtomicUsize>,
+    /// Another process holds the lock a counter needs.
+    busy: Arc<AtomicBool>,
 }
 
 impl Net {
@@ -36,7 +38,13 @@ impl Net {
             up: Arc::new(AtomicBool::new(up)),
             dials: Arc::new(AtomicUsize::new(0)),
             lag: Arc::new(AtomicUsize::new(0)),
+            busy: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Makes the counters of the remote answer that another process holds the lock.
+    pub(super) fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::SeqCst);
     }
 
     /// Makes every failing dial take `lag` before it gives up.
@@ -51,6 +59,14 @@ impl Net {
 
     pub(super) fn dials(&self) -> usize {
         self.dials.load(Ordering::SeqCst)
+    }
+
+    fn counting(&self) -> Result<(), StoreError> {
+        if self.busy.load(Ordering::SeqCst) {
+            Err(StoreError::Busy)
+        } else {
+            Ok(())
+        }
     }
 
     fn check(&self) -> Result<(), StoreError> {
@@ -116,6 +132,33 @@ impl KnowledgeStore for Flaky {
     fn set_chunk_embeddings(&mut self, model_id: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<usize, StoreError> {
         self.net.check()?;
         self.inner.set_chunk_embeddings(model_id, embeddings)
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.net.check()?;
+        self.net.counting()?;
+        self.inner.record_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.net.check()?;
+        self.net.counting()?;
+        self.inner.record_useful(ids, at)
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        self.net.check()?;
+        self.inner.find_by_title(title, scope)
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.net.check()?;
+        self.inner.docs_sharing_chunks(chunk_shas)
+    }
+
+    fn remote_writable(&mut self) -> Option<bool> {
+        self.net.check().ok()?;
+        self.inner.remote_writable()
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {

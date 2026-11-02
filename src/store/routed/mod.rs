@@ -25,6 +25,7 @@ pub mod ids;
 mod kinds;
 mod merge;
 mod overview;
+mod quality;
 mod remote;
 mod rows;
 
@@ -38,7 +39,7 @@ use crate::config::{Kind, Place, Routing};
 use crate::limits::LIST_PAGE_MAX;
 use crate::store::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, DocumentRow, KnowledgeStore, Link,
-    ListQuery, PendingChunk, RepoCounts, Scope, Stats, StoreError,
+    ListQuery, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope,
 };
 use rows::{interleave, tag_detail, tag_document, tagged_hits};
 
@@ -183,37 +184,32 @@ impl KnowledgeStore for RoutedStore {
     }
 
     fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        for place in self.present()? {
-            if let Some(mut found) = self
-                .store(place)
-                .and_then(|store| store.find_by_content_sha(sha).transpose())
-            {
-                if let Ok(doc) = &mut found {
-                    tag_document(place, doc);
-                }
-
-                return found.map(Some);
-            }
-        }
-
-        Ok(None)
+        self.first_found(|store| store.find_by_content_sha(sha))
     }
 
     fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        for place in self.present()? {
-            if let Some(mut found) = self
-                .store(place)
-                .and_then(|store| store.find_by_source_key(key).transpose())
-            {
-                if let Ok(doc) = &mut found {
-                    tag_document(place, doc);
-                }
+        self.first_found(|store| store.find_by_source_key(key))
+    }
 
-                return found.map(Some);
-            }
-        }
+    /// Counted in the place each id carries, see [`RoutedStore::count`].
+    fn record_shown(&mut self, doc_ids: &[i64]) -> Result<(), StoreError> {
+        self.count(doc_ids, |store, own| store.record_shown(own))
+    }
 
-        Ok(None)
+    fn record_useful(&mut self, doc_ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.count(doc_ids, |store, own| store.record_useful(own, at))
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        self.titled(title, scope)
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.sharing(chunk_shas)
+    }
+
+    fn remote_writable(&mut self) -> Option<bool> {
+        self.remote_may_write()
     }
 
     fn reusable_embeddings(

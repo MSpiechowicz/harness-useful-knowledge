@@ -27,15 +27,15 @@ pub(super) struct GetArgs {
 }
 
 /// Which documents a read may open.
-struct Visible {
+pub(super) struct Visible {
     /// The repository key; `None` when it is not known.
-    repo: Option<String>,
-    everything: bool,
+    pub repo: Option<String>,
+    pub everything: bool,
 }
 
 impl Visible {
     /// True for a global document, one linked to the repository, or any with `everything`.
-    fn allows(&self, detail: &DocumentDetail) -> bool {
+    pub fn allows(&self, detail: &DocumentDetail) -> bool {
         self.everything
             || detail.links.is_empty()
             || self
@@ -58,7 +58,7 @@ impl Visible {
 }
 
 /// What an id names.
-enum Target {
+pub(super) enum Target {
     Document(i64),
     /// A chunk of a document.
     Chunk(i64, i64),
@@ -66,7 +66,7 @@ enum Target {
 
 /// `12` (or the number 12) is a document, `12:340` a chunk of it, and `local:12`, `local:12:340`
 /// the same on this computer when both places are in use.
-fn target(raw: &Value) -> Result<Target, String> {
+pub(super) fn target(raw: &Value) -> Result<Target, String> {
     let wrong = || {
         "id must be a document id like 12 or a chunk id like 12:340, as a search shows it (local:12 and \
          local:12:340 on this computer)"

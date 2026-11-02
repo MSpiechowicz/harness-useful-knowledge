@@ -5,23 +5,16 @@
 //! merged in), else the same source key is `updated` in place (its chunks replaced, the vectors of
 //! chunks whose hash did not change reused), else the document is `added`.
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::embed::{self, Embedder};
 use super::events::{FileEvent, Status};
-use super::walk::{Candidate, Problem};
-use crate::chunk::{self, Chunked, passage};
-use crate::digest::sha256_hex;
-use crate::extract::{self, Extracted, Format, Refusal, pdf::PdfPages};
-use crate::limits::{CHUNKS_PER_DOC_MAX, FILE_BYTES_MAX, PDF_BYTES_MAX, TEXT_BYTES_MAX, TITLE_MAX};
-use crate::store::{Chunk, Detail, Document, KnowledgeStore, Link, Origin, StoreError, clean};
+use super::prepare::{Prepared, Stop, prepare};
+use super::walk::Candidate;
+use crate::chunk::{Chunked, passage};
+use crate::extract::pdf::PdfPages;
+use crate::store::{Author, Chunk, Detail, Document, KnowledgeStore, Link, Origin, clean};
 use crate::tokens::{APPROX_COUNTER, TokenCounter};
-
-/// How many bytes of a file decide its format.
-const HEAD_BYTES: u64 = 8192;
 
 /// What importing one file came to.
 pub enum Outcome {
@@ -34,28 +27,6 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// Why a file was not stored.
-enum Stop {
-    Skipped(String),
-    Failed(String),
-    Cancelled,
-}
-
-impl From<Refusal> for Stop {
-    fn from(refusal: Refusal) -> Self {
-        match refusal {
-            Refusal::Unsupported(reason) | Refusal::Skipped(reason) => Self::Skipped(reason),
-            Refusal::Failed(reason) => Self::Failed(reason),
-        }
-    }
-}
-
-impl From<StoreError> for Stop {
-    fn from(error: StoreError) -> Self {
-        Self::Failed(error.to_string())
-    }
-}
-
 /// Imports files into a store.
 pub struct Importer<'a> {
     pub store: &'a mut dyn KnowledgeStore,
@@ -65,8 +36,13 @@ pub struct Importer<'a> {
     pub embedder: Option<&'a mut dyn Embedder>,
     /// The repositories every document of this import links to.
     pub links: Vec<Link>,
-    /// The document the one file of this import replaces.
+    /// The document every file of this import replaces, unless [`Importer::import_replacing`] names
+    /// one for the file.
     pub replaces: Option<i64>,
+    /// Who writes the documents of this import: set as `added_by` of a new document and as
+    /// `updated_by` of a changed one, which keeps the `added_by` it had. An unchanged document keeps
+    /// both. `None` when no git name is known.
+    pub author: Option<Author>,
     /// Who the documents of this import come from: [`Origin::User`], or an agent's proposal the
     /// person approved. A document an import updates keeps its origin, unless it is `replaces`.
     pub origin: Origin,
@@ -79,14 +55,6 @@ pub struct Importer<'a> {
     pub cancel: &'a dyn Fn() -> bool,
     /// Set when the embedder failed: later files do not try it again.
     embedder_failed: bool,
-}
-
-/// A file read and extracted.
-struct Loaded {
-    format: Format,
-    size: u64,
-    file_sha: String,
-    extracted: Extracted,
 }
 
 impl<'a> Importer<'a> {
@@ -103,6 +71,7 @@ impl<'a> Importer<'a> {
             embedder: None,
             links: Vec::new(),
             replaces: None,
+            author: None,
             origin: Origin::User,
             title: None,
             trust_extracted_key: true,
@@ -111,11 +80,17 @@ impl<'a> Importer<'a> {
         }
     }
 
-    /// Imports `candidate`.
+    /// Imports `candidate`, replacing [`Self::replaces`] when that is set.
     pub fn import(&mut self, candidate: &Candidate) -> Outcome {
+        self.import_replacing(candidate, self.replaces)
+    }
+
+    /// Imports `candidate` over the document `replaces` names (the id the store knows) instead
+    /// of [`Self::replaces`], so each file of a batch can replace a document of its own.
+    pub fn import_replacing(&mut self, candidate: &Candidate, replaces: Option<i64>) -> Outcome {
         let mut event = FileEvent::new(&candidate.display, Status::Failed);
 
-        match self.import_inner(candidate, &mut event) {
+        match self.import_inner(candidate, replaces, &mut event) {
             Ok(pending) => Outcome::Finished { event, pending },
             Err(Stop::Cancelled) => Outcome::Cancelled,
             Err(Stop::Skipped(reason)) => {
@@ -131,47 +106,31 @@ impl<'a> Importer<'a> {
         }
     }
 
-    fn import_inner(&mut self, candidate: &Candidate, event: &mut FileEvent) -> Result<usize, Stop> {
-        match &candidate.problem {
-            Some(Problem::Skipped(reason)) => return Err(Stop::Skipped(reason.clone())),
-            Some(Problem::Failed(reason)) => return Err(Stop::Failed(reason.clone())),
-            None => {}
-        }
-
-        let loaded = self.load(candidate)?;
-        let title = match &self.title {
-            Some(title) => clean::title(title)?,
-            None => title_of(&loaded.extracted, &candidate.name),
-        };
-        let text_bytes: usize = loaded.extracted.sections.iter().map(|section| section.text.len()).sum();
-
-        if text_bytes > TEXT_BYTES_MAX {
-            return Err(Stop::Failed(format!(
-                "the text is over {} MiB",
-                TEXT_BYTES_MAX / (1024 * 1024)
-            )));
-        }
-
-        let chunked = chunk::chunk_document(&title, &loaded.extracted.sections, self.counter);
-
-        if chunked.pieces.is_empty() {
-            return Err(Stop::Failed("the file has no text".to_owned()));
-        }
-
-        if chunked.pieces.len() > CHUNKS_PER_DOC_MAX {
-            return Err(Stop::Failed(format!(
-                "the document would have {} chunks, at most {CHUNKS_PER_DOC_MAX} are kept",
-                chunked.pieces.len()
-            )));
-        }
-
-        // The title is part of the content: a renamed document is updated and embedded again.
-        let content_sha = sha256_hex(format!("{title}\n{}", chunked.text).as_bytes());
-        let extracted_key = loaded.extracted.source_key.clone().filter(|_| self.trust_extracted_key);
-        let source_key = extracted_key.unwrap_or_else(|| candidate.source_key.clone());
+    fn import_inner(
+        &mut self,
+        candidate: &Candidate,
+        replaces: Option<i64>,
+        event: &mut FileEvent,
+    ) -> Result<usize, Stop> {
+        let Prepared {
+            format,
+            size,
+            file_sha,
+            extracted,
+            title,
+            chunked,
+            content_sha,
+            source_key,
+        } = prepare(
+            candidate,
+            self.pdf,
+            self.counter,
+            self.title.as_deref(),
+            self.trust_extracted_key,
+        )?;
 
         if let Some(existing) = self.store.find_by_content_sha(&content_sha)? {
-            if self.replaces.is_some_and(|id| id != existing.id) {
+            if replaces.is_some_and(|id| id != existing.id) {
                 return Err(Stop::Failed(format!(
                     "the same content is already document {}",
                     existing.id
@@ -185,7 +144,7 @@ impl<'a> Importer<'a> {
             return Ok(0);
         }
 
-        let previous = match self.replaces {
+        let previous = match replaces {
             Some(id) => Some(
                 self.store
                     .get(id, &Detail::default())?
@@ -195,13 +154,13 @@ impl<'a> Importer<'a> {
             None => self.store.find_by_source_key(&source_key)?,
         };
 
-        if !self.trust_extracted_key && self.replaces.is_none() && previous.is_some() {
+        if !self.trust_extracted_key && replaces.is_none() && previous.is_some() {
             return Err(Stop::Failed("a document with this key exists already".to_owned()));
         }
 
         let previous_links = self.links_of(previous.as_ref())?;
         let now = now();
-        let mut warnings = loaded.extracted.warnings.clone();
+        let mut warnings = extracted.warnings.clone();
 
         if self.counter.name() == APPROX_COUNTER {
             warnings.push("token counts are estimated: the tokenizer is not installed yet".to_owned());
@@ -212,18 +171,24 @@ impl<'a> Importer<'a> {
             title: title.clone(),
             source_name: candidate.name.clone(),
             source_key,
-            format: loaded.format.as_str().to_owned(),
+            format: format.as_str().to_owned(),
             content_sha256: content_sha,
-            file_sha256: loaded.file_sha,
-            bytes: loaded.size,
+            file_sha256: file_sha,
+            bytes: size,
             chunk_count: 0,
             created_at: previous.as_ref().map_or(now, |doc| doc.created_at),
             updated_at: now,
             origin: match &previous {
-                Some(doc) if self.replaces.is_none() && self.origin != Origin::AgentApproved => doc.origin,
+                Some(doc) if replaces.is_none() && self.origin != Origin::AgentApproved => doc.origin,
                 _ => self.origin,
             },
             warnings: warnings.clone(),
+            // A stored document keeps who first stored it.
+            added_by: match &previous {
+                Some(doc) => doc.added_by.clone(),
+                None => self.author.clone(),
+            },
+            updated_by: self.author.clone(),
         };
 
         let mut chunks = to_chunks(&chunked);
@@ -241,7 +206,7 @@ impl<'a> Importer<'a> {
             Status::Added
         };
 
-        if previous.is_some() && self.replaces.is_none() && unrelated(&previous_links, &self.links) {
+        if previous.is_some() && replaces.is_none() && unrelated(&previous_links, &self.links) {
             event.reason = Some("replaced a document with the same name".to_owned());
         }
 
@@ -251,54 +216,6 @@ impl<'a> Importer<'a> {
         event.warnings = warnings;
 
         Ok(pending)
-    }
-
-    /// Reads the file and extracts its text. The first bytes decide the format, and so which size
-    /// limit applies, before the rest is read.
-    fn load(&mut self, candidate: &Candidate) -> Result<Loaded, Stop> {
-        let path = &candidate.path;
-        let unreadable = |_| Stop::Failed("the file cannot be read".to_owned());
-        let mut file = File::open(path).map_err(unreadable)?;
-        let size = file.metadata().map_err(unreadable)?.len();
-
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(HEAD_BYTES)
-            .read_to_end(&mut bytes)
-            .map_err(unreadable)?;
-
-        let format = extract::detect(&candidate.name, &bytes)
-            .ok_or_else(|| Stop::Skipped("unsupported format: the file holds binary data".to_owned()))?;
-        let limit = if format == Format::Pdf {
-            PDF_BYTES_MAX
-        } else {
-            FILE_BYTES_MAX
-        };
-
-        if size > limit {
-            return Err(Stop::Skipped(format!("larger than {} MiB", limit / (1024 * 1024))));
-        }
-
-        // The limit holds even when the file grows while it is read.
-        file.take(limit + 1 - bytes.len() as u64)
-            .read_to_end(&mut bytes)
-            .map_err(unreadable)?;
-
-        if bytes.len() as u64 > limit {
-            return Err(Stop::Skipped(format!("larger than {} MiB", limit / (1024 * 1024))));
-        }
-
-        let extracted = match format {
-            Format::Pdf => extract::pdf::extract(self.pdf, path)?,
-            other => extract::extract(other, &candidate.name, &bytes)?,
-        };
-
-        Ok(Loaded {
-            format,
-            size: bytes.len() as u64,
-            file_sha: sha256_hex(&bytes),
-            extracted,
-        })
     }
 
     /// The links the document has now: none for a new one.
@@ -395,21 +312,6 @@ fn to_chunks(chunked: &Chunked) -> Vec<Chunk> {
             model_id: None,
         })
         .collect()
-}
-
-/// The document's title: its own, else the file name without its extension.
-fn title_of(extracted: &Extracted, name: &str) -> String {
-    let stem = Path::new(name)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned());
-
-    [extracted.title.clone(), stem]
-        .into_iter()
-        .flatten()
-        .map(|title| clean::line(&title).chars().take(TITLE_MAX).collect::<String>())
-        .map(|title| title.trim().to_owned())
-        .find(|title| !title.is_empty())
-        .unwrap_or_else(|| "Untitled".to_owned())
 }
 
 /// Unix seconds now.

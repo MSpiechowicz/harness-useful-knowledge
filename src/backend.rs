@@ -52,6 +52,11 @@ pub enum Access {
     Existing,
     /// Reads and writes, creating the database when it does not exist (an import).
     Create,
+    /// Writes usefulness counters and nothing else, for a handle that must never hold anything up:
+    /// it does not create the database, migrate or upgrade it, add columns or run any other DDL
+    /// (a database that needs one of those is not counted in, and one without the counter columns
+    /// counts nothing), and it never waits for a lock.
+    Counters,
 }
 
 /// Whether an open that finds a database from an older version upgrades it.
@@ -431,6 +436,7 @@ fn open_local(env: &Env, access: Access) -> Result<Option<Box<dyn KnowledgeStore
         Access::Read => SqliteStore::open_read_only(&path),
         Access::Existing => SqliteStore::open_existing(&path),
         Access::Create => SqliteStore::open(&path).map(Some),
+        Access::Counters => SqliteStore::open_counters(&path),
     };
 
     match opened {

@@ -26,12 +26,14 @@
 //! `Authorization: Bearer` and appears in no message, like the URL. Proxy variables are ignored
 //! ([`hrana`]). [`probe`] reports what the server can do, for `check`.
 
+mod columns;
 mod documents;
 mod endpoint;
 mod hrana;
 mod listing;
 mod meta;
 mod probe;
+mod quality;
 mod schema;
 mod search;
 mod sql;
@@ -43,7 +45,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hrana::{Client, Stream};
+use hrana::{COUNT_BUDGET, Client, Stream};
 use sql::Sql;
 use wire::{Outcome, execute};
 
@@ -55,7 +57,7 @@ use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 
 use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, clean};
+use super::{Columns, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 
 /// How long a write keeps asking for a lock the server reports busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,6 +74,9 @@ enum Mode {
     Existing,
     /// Creates the tables and migrates.
     Create,
+    /// Counters only: like [`Mode::Read`] (nothing is created, migrated or added, a database that is
+    /// not current is an error), and every request is given up after [`COUNT_BUDGET`].
+    Counters,
 }
 
 /// The team backend on a libSQL server. See the module docs.
@@ -80,6 +85,8 @@ pub struct LibsqlStore {
     newer: bool,
     /// False for a store opened with [`LibsqlStore::open_read_only`]: its writes are refused.
     writable: bool,
+    /// The columns added in place that the database has (see [`columns`]).
+    columns: Columns,
 }
 
 impl std::fmt::Debug for LibsqlStore {
@@ -106,6 +113,13 @@ impl LibsqlStore {
         Self::open(url, token, Mode::Existing)
     }
 
+    /// Connects for counting alone: nothing is created, migrated or added (a database that lacks
+    /// the counter columns counts nothing, an older one is an error), and every request is given
+    /// up after [`COUNT_BUDGET`]. `None` when the database has no tables yet.
+    pub fn open_counters(url: &str, token: Option<&str>) -> Result<Option<Self>, StoreError> {
+        Self::open(url, token, Mode::Counters)
+    }
+
     /// Connects without creating or migrating anything: `None` when the database has no tables
     /// yet, an error when it is from an older server that has not upgraded it.
     pub fn open_read_only(url: &str, token: Option<&str>) -> Result<Option<Self>, StoreError> {
@@ -128,16 +142,23 @@ impl LibsqlStore {
         connect_timeout: Duration,
     ) -> Result<Option<Self>, StoreError> {
         let client = Client::within(endpoint::parse(url)?, token, connect_timeout)?;
-        let found = schema::version(&mut client.single())?;
+        let mut first = client.single();
+
+        if mode == Mode::Counters {
+            first.budget = Some(COUNT_BUDGET);
+        }
+
+        let found = schema::version(&mut first)?;
         let mut store = Self {
             client,
             newer: false,
-            writable: mode != Mode::Read,
+            writable: matches!(mode, Mode::Existing | Mode::Create),
+            columns: Columns::NONE,
         };
 
         match (found, mode) {
-            (None, Mode::Read | Mode::Existing) => return Ok(None),
-            (Some(version), Mode::Read) if version < SCHEMA_VERSION => {
+            (None, Mode::Read | Mode::Existing | Mode::Counters) => return Ok(None),
+            (Some(version), Mode::Read | Mode::Counters) if version < SCHEMA_VERSION => {
                 return Err(StoreError::Backend(
                     "the database is from an older server and has not been upgraded yet".to_owned(),
                 ));
@@ -145,6 +166,10 @@ impl LibsqlStore {
             (Some(SCHEMA_VERSION), _) => {}
             (Some(version), _) if version > SCHEMA_VERSION => store.newer = true,
             _ => store.newer = store.migrate()?,
+        }
+
+        if !store.newer {
+            store.columns = store.open_columns(mode)?;
         }
 
         Ok(Some(store))
@@ -245,15 +270,26 @@ impl KnowledgeStore for LibsqlStore {
         let links = clean::links(links)?;
         clean::chunks(chunks)?;
 
-        self.write(|db| documents::put(db, doc, &title, chunks, &links))
+        let columns = self.columns;
+
+        self.write(|db| {
+            let id = documents::put(db, doc, &title, chunks, &links)?;
+            documents::stamp_authors(db, columns, id, doc)?;
+
+            Ok(id)
+        })
     }
 
     fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|db| documents::find(db, "content_sha256", sha))
+        let columns = self.columns;
+
+        self.read(|db| documents::find(db, columns, "content_sha256", sha))
     }
 
     fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|db| documents::find(db, "source_key", key))
+        let columns = self.columns;
+
+        self.read(|db| documents::find(db, columns, "source_key", key))
     }
 
     fn reusable_embeddings(
@@ -274,6 +310,30 @@ impl KnowledgeStore for LibsqlStore {
         self.write(|db| documents::set_embeddings(db, model_id, embeddings))
     }
 
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.count_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.count_useful(ids, at)
+    }
+
+    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+        let columns = self.columns;
+
+        self.read(|db| quality::by_title(db, columns, title, scope))
+    }
+
+    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|db| quality::sharing(db, chunk_shas))
+    }
+
+    /// True for a database opened for writing, as far as this store can tell: a token that may
+    /// only read is not noticed. A handle opened to read says nothing.
+    fn remote_writable(&mut self) -> Option<bool> {
+        self.writable.then_some(true)
+    }
+
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
         let links = clean::links(links)?;
 
@@ -291,11 +351,15 @@ impl KnowledgeStore for LibsqlStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-        self.read(|db| listing::list(db, query))
+        let columns = self.columns;
+
+        self.read(|db| listing::list(db, columns, query))
     }
 
     fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {
-        self.read(|db| listing::get(db, id, detail))
+        let columns = self.columns;
+
+        self.read(|db| listing::get(db, columns, id, detail))
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
@@ -368,6 +432,7 @@ pub fn open_boxed(
         Access::Read => Mode::Read,
         Access::Existing => Mode::Existing,
         Access::Create => Mode::Create,
+        Access::Counters => Mode::Counters,
     };
     let opened = LibsqlStore::open_within(url, token, mode, connect_timeout);
 

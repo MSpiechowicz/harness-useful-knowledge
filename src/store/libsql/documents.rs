@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use super::sql::{Row, Sql, Value, args, query_row};
 use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
-use crate::store::sqlite::sql_shared::DOCUMENT_COLUMNS;
-use crate::store::{Chunk, DIMS, Document, Link, Origin, PendingChunk, StoreError};
+use crate::store::sqlite::sql_quality::{document_columns, stamp};
+use crate::store::{Author, Chunk, Columns, DIMS, DocUsage, Document, Link, Origin, PendingChunk, StoreError};
 
-/// A [`Document`] from a row of [`DOCUMENT_COLUMNS`].
+/// A [`Document`] from a row of [`document_columns`].
 pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
     let origin: String = row.get(11)?;
     let warnings: String = row.get(12)?;
@@ -32,7 +32,47 @@ pub(super) fn document(row: &Row) -> Result<Document, StoreError> {
         origin: Origin::parse(&origin)
             .ok_or_else(|| StoreError::Backend("unexpected value in column 11".to_owned()))?,
         warnings: serde_json::from_str(&warnings).unwrap_or_default(),
+        added_by: Author::stored(row.tolerant_text(13), row.tolerant_text(14)),
+        updated_by: Author::stored(row.tolerant_text(15), row.tolerant_text(16)),
     })
+}
+
+/// A [`Document`] with its usage from a row of [`document_columns`].
+pub(super) fn listed(row: &Row) -> Result<(Document, Option<DocUsage>), StoreError> {
+    let usage = DocUsage::stored(
+        row.tolerant_counter(17),
+        row.tolerant_counter(18),
+        row.tolerant_counter(19),
+    );
+
+    Ok((document(row)?, usage))
+}
+
+/// Document `id` with its usage.
+pub(super) fn by_id(
+    db: &mut dyn Sql,
+    columns: Columns,
+    id: i64,
+) -> Result<Option<(Document, Option<DocUsage>)>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.id = ?1",
+        document_columns(columns)
+    );
+
+    query_row(db, &sql, args![id])?.map(|row| listed(&row)).transpose()
+}
+
+/// Records who stored `doc` as document `id`, which [`put`] has just written. A new document gets
+/// both authors, an update keeps who added it. Nothing without the author columns.
+pub(super) fn stamp_authors(db: &mut dyn Sql, columns: Columns, id: i64, doc: &Document) -> Result<(), StoreError> {
+    if !columns.authors {
+        return Ok(());
+    }
+
+    let (sql, name, via) = stamp(doc);
+    db.execute(sql, args![id, name, via])?;
+
+    Ok(())
 }
 
 /// Stores `doc` (whose cleaned title is `title`) with `chunks` and `links`: inserted for id 0,
@@ -191,9 +231,16 @@ pub(super) fn delete(db: &mut dyn Sql, ids: &[i64]) -> Result<usize, StoreError>
 }
 
 /// The oldest document whose `column` (`content_sha256` or `source_key`) is `value`.
-pub(super) fn find(db: &mut dyn Sql, column: &str, value: &str) -> Result<Option<Document>, StoreError> {
-    let sql =
-        format!("SELECT {DOCUMENT_COLUMNS} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1");
+pub(super) fn find(
+    db: &mut dyn Sql,
+    columns: Columns,
+    column: &str,
+    value: &str,
+) -> Result<Option<Document>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1",
+        document_columns(columns)
+    );
 
     query_row(db, &sql, args![value])?.map(|row| document(&row)).transpose()
 }
