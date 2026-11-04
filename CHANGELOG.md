@@ -1,3 +1,23 @@
+# [2.0.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.1.0...v2.0.0) (2026-11-04)
+
+
+* feat(docs)!: drafts, team approval and review of knowledge documents ([9fe2d71](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/9fe2d71522ae9a1c994dc0e3176f3fa2fc0c124b))
+
+
+### Bug Fixes
+
+* **postgres:** two clients that create pgvector at the same moment both go on ([328dbbd](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/328dbbdc608df821a72ad3b54adf83c940051aeb))
+
+
+### BREAKING CHANGES
+
+* the database schema moves to version 2 on every backend
+(review state, events, comments, stored originals). Older harness-knowledge
+builds refuse a version 2 database; run `harness-knowledge upgrade` (the
+desktop runs it) to move a team database.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
 # [1.1.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.0.1...v1.1.0) (2026-11-02)
 
 
