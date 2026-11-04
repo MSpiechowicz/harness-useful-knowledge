@@ -139,6 +139,7 @@ fn a_file_extended_by_this_version_keeps_its_schema_version_and_opens_read_only_
                 descending: false,
                 offset: 0,
                 limit: 10,
+                status: crate::store::StatusFilter::All,
             })
             .is_ok()
     );
@@ -166,6 +167,7 @@ fn a_file_extended_by_this_version_keeps_its_schema_version_and_opens_read_only_
             descending: false,
             offset: 0,
             limit: 10,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list")
         .items;

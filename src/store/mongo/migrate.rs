@@ -4,9 +4,6 @@
 //! trip per chunk (millions of them, far past any bound an open has). [`update_in_pages`] sends
 //! them as `update` commands of [`PAGE`] updates each, which every server version runs.
 
-// The upgrade of the next schema version is the first caller of any of this.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::error::Error;
 use mongodb::sync::Database;

@@ -22,7 +22,7 @@ fn same_named_folders_of_different_repositories_keep_their_own_documents() {
     assert_eq!(file_event(&events, "guide.md")["status"], "added");
     assert_eq!(all_documents(&mut db).len(), 2);
     assert!(
-        db.find_by_source_key("git:github.com/o/a/docs/guide.md")
+        db.find_by_source_key("git:github.com/o/a/docs/guide.md", crate::store::Visibility::Live)
             .expect("find")
             .is_some()
     );

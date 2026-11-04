@@ -7,11 +7,12 @@ use serde::{Deserialize, Deserializer};
 
 use crate::config::Place;
 use crate::limits::FILES_PER_IMPORT_MAX;
-use crate::store::Link;
 use crate::store::routed::ids;
+use crate::store::{Link, review};
 
 /// `{"paths": ["/docs/a.md"], "folders": ["/docs"], "links": [{"repo": "git:h/o/r", "globs": ["src/**"]}],
-/// "replaces": 12, "replacing": {"/docs/a.md": "local:7"}, "place": "remote"}`. Every field is optional.
+/// "replaces": 12, "replacing": {"/docs/a.md": "local:7"}, "place": "remote", "draft": true, "ask": true,
+/// "note": "Rewrote the intro"}`. Every field is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -37,6 +38,17 @@ pub struct Manifest {
     /// not given, and the place of the document `replaces` names.
     #[serde(default, deserialize_with = "place")]
     pub place: Option<Place>,
+    /// Store the files as drafts (a replaced live document gets a pending version) instead of
+    /// making them live. Team approval being on for the remote database has the same effect there.
+    #[serde(default)]
+    pub draft: bool,
+    /// Ask for approval right after writing a draft or pending version (replace and ask again in
+    /// one step). Refused while team approval is off.
+    #[serde(default)]
+    pub ask: bool,
+    /// The note that goes with the ask, at most [`review::EVENT_COMMENT_MAX`] characters.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// A document id as it is written: a number or text (`"12"`, `"local:12"`).
@@ -87,6 +99,20 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
 }
 
 impl Manifest {
+    /// Refuses a note without an ask or one that is too long, and cleans the note (one line, as an
+    /// event's comment is). A blank note is none.
+    pub fn check_ask(&mut self) -> Result<(), String> {
+        let note = review::event_comment(self.note.as_deref()).map_err(|error| error.to_string())?;
+
+        if note.is_some() && !self.ask {
+            return Err("a note goes with ask: ask for approval to add one".to_owned());
+        }
+
+        self.note = note;
+
+        Ok(())
+    }
+
     /// The document each file of `replacing` replaces, by the file's canonical path.
     pub fn replacing_by_path(&self) -> HashMap<PathBuf, i64> {
         self.replacing
@@ -108,7 +134,7 @@ fn place<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Place>, D:
 
 /// The manifest in `text`.
 pub fn parse(text: &str) -> Result<Manifest, String> {
-    let manifest: Manifest = serde_json::from_str(text).map_err(|_| {
+    let mut manifest: Manifest = serde_json::from_str(text).map_err(|_| {
         "the manifest must be JSON like {\"paths\": [...], \"folders\": [...], \"links\": [{\"repo\": \"git:host/owner/repo\", \
          \"globs\": [...]}], \"place\": \"remote\" or \"local\"}"
             .to_owned()
@@ -119,6 +145,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     }
 
     check_replacing(&manifest)?;
+    manifest.check_ask()?;
 
     Ok(manifest)
 }
@@ -204,6 +231,21 @@ mod tests {
         assert!(parse(r#"{"files":[]}"#).is_err());
         assert!(parse("not json").is_err());
         assert!(parse(r#"{"replaces":0}"#).is_err());
+    }
+
+    #[test]
+    fn draft_ask_and_note_are_read_and_a_note_needs_an_ask() {
+        let asked = parse(r#"{"draft":true,"ask":true,"note":"  Rewrote\nthe intro "}"#).expect("ask");
+        assert!(asked.draft && asked.ask);
+        assert_eq!(asked.note.as_deref(), Some("Rewrote the intro"), "one line, trimmed");
+
+        let plain = parse("{}").expect("plain");
+        assert!(!plain.draft && !plain.ask);
+        assert_eq!(plain.note, None);
+
+        assert_eq!(parse(r#"{"ask":true,"note":"  "}"#).expect("blank").note, None);
+        assert!(parse(r#"{"note":"why"}"#).is_err(), "a note needs an ask");
+        assert!(parse(&format!(r#"{{"ask":true,"note":"{}"}}"#, "x".repeat(501))).is_err());
     }
 
     #[test]

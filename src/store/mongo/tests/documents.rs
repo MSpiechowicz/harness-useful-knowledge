@@ -33,6 +33,7 @@ fn team_mongo_a_document_comes_back_with_its_chunks_links_and_counts() {
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )
         .expect("get")
@@ -83,6 +84,7 @@ fn team_mongo_a_chunk_is_read_whole_only_from_its_own_document() {
             &Detail {
                 sections: false,
                 chunk: Some(chunk_id),
+                drafts: false,
             },
         )
         .expect("get")
@@ -96,6 +98,7 @@ fn team_mongo_a_chunk_is_read_whole_only_from_its_own_document() {
         &Detail {
             sections: false,
             chunk: Some(chunk_id),
+            drafts: false,
         },
     );
     assert!(matches!(wrong, Err(StoreError::NotFound(_))));
@@ -202,19 +205,29 @@ fn team_mongo_documents_are_found_by_content_hash_and_by_source() {
     );
 
     let by_source = store
-        .find_by_source_key("/docs/guide.md")
+        .find_by_source_key("/docs/guide.md", crate::store::Visibility::Live)
         .expect("find")
         .expect("found");
     assert_eq!(by_source.id, id);
 
     let by_content = store
-        .find_by_content_sha(&by_source.content_sha256)
+        .find_by_content_sha(&by_source.content_sha256, crate::store::Visibility::Live)
         .expect("find")
         .expect("found");
     assert_eq!(by_content.id, id);
 
-    assert!(store.find_by_source_key("/docs/missing.md").expect("find").is_none());
-    assert!(store.find_by_content_sha("nope").expect("find").is_none());
+    assert!(
+        store
+            .find_by_source_key("/docs/missing.md", crate::store::Visibility::Live)
+            .expect("find")
+            .is_none()
+    );
+    assert!(
+        store
+            .find_by_content_sha("nope", crate::store::Visibility::Live)
+            .expect("find")
+            .is_none()
+    );
 }
 
 #[test]
@@ -229,7 +242,10 @@ fn team_mongo_the_oldest_of_two_documents_with_one_source_is_found() {
         &Seed::new("Newer").source("/docs/same.md").chunk("A", "two"),
     );
 
-    let found = store.find_by_source_key("/docs/same.md").expect("find").expect("found");
+    let found = store
+        .find_by_source_key("/docs/same.md", crate::store::Visibility::Live)
+        .expect("find")
+        .expect("found");
     assert_eq!(found.id, older);
 }
 
@@ -310,7 +326,7 @@ fn team_mongo_relinking_moves_the_chunks_between_scopes() {
 }
 
 #[test]
-fn team_mongo_renaming_changes_what_the_keyword_index_finds_and_not_the_import_time() {
+fn team_mongo_renaming_changes_what_the_keyword_index_finds_and_keeps_who_wrote_it() {
     let Some((_db, mut store)) = store() else { return };
     let id = insert(
         &mut store,
@@ -322,7 +338,7 @@ fn team_mongo_renaming_changes_what_the_keyword_index_finds_and_not_the_import_t
         |ids| ids.len() == 1,
     );
 
-    assert!(store.rename(id, "  Zulu\nhandbook ").expect("rename"));
+    assert!(store.rename(id, "  Zulu\nhandbook ", Some("Zed"), 500).expect("rename"));
 
     eventually(
         "the new title is indexed",
@@ -336,10 +352,18 @@ fn team_mongo_renaming_changes_what_the_keyword_index_finds_and_not_the_import_t
     );
 
     let doc = store.get(id, &Detail::default()).expect("get").expect("document").doc;
-    assert_eq!((doc.title.as_str(), doc.updated_at), ("Zulu handbook", 100));
+    assert_eq!(
+        (
+            doc.title.as_str(),
+            doc.updated_at,
+            doc.updated_by.map(|author| author.name)
+        ),
+        ("Zulu handbook", 500, None),
+        "a rename is a change of the title and its time, not of who wrote the content"
+    );
 
-    assert!(!store.rename(999, "Anything").expect("missing"));
-    assert!(matches!(store.rename(id, " "), Err(StoreError::Invalid(_))));
+    assert!(!store.rename(999, "Anything", None, 0).expect("missing"));
+    assert!(matches!(store.rename(id, " ", None, 0), Err(StoreError::Invalid(_))));
 }
 
 #[test]
@@ -404,7 +428,7 @@ fn team_mongo_every_write_grows_the_generation_and_reads_do_not() {
     let id = insert(&mut store, &Seed::new("Guide").chunk("A", "text"));
     assert_eq!(store.generation().expect("generation"), 1);
 
-    store.rename(id, "Guide 2").expect("rename");
+    store.rename(id, "Guide 2", None, 0).expect("rename");
     store.set_links(id, &[]).expect("links");
     store.set_meta("model_id", MODEL).expect("meta");
     store.delete(&[id]).expect("delete");
@@ -432,12 +456,12 @@ fn team_mongo_the_meta_keys_the_store_owns_cannot_be_set() {
     assert_eq!(store.meta("model_id").expect("meta").as_deref(), Some(MODEL));
     assert_eq!(store.meta("missing").expect("meta"), None);
     assert_eq!(store.meta("dims").expect("meta").as_deref(), Some("384"));
-    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("2"));
 
     // A key named like an internal document cannot reach a counter or the schema.
     store.set_meta("counter:documents", "oops").expect("a plain key");
     store.set_meta("schema", "oops").expect("a plain key");
-    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(store.meta("schema_version").expect("meta").as_deref(), Some("2"));
     let id = insert(&mut store, &Seed::new("Guide").chunk("A", "text"));
     assert!(id > 0);
 }

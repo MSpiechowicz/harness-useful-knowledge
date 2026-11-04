@@ -6,6 +6,10 @@ pub enum StoreError {
     /// The input breaks a limit or a rule.
     #[error("{0}")]
     Invalid(String),
+    /// A team database was asked to store a repository key that is a folder on this computer
+    /// (`path:`): only a `git:` key leaves it. The message names the folder, never its path.
+    #[error("{0}")]
+    LocalPath(String),
     /// The document or chunk does not exist.
     #[error("{0}")]
     NotFound(String),

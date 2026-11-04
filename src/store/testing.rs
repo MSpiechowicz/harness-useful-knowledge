@@ -1,11 +1,13 @@
 //! Test-only helpers: documents with chunks and fake embeddings, inserted without an importer
 //! (the real import is built on `put_document` too).
 
+mod drafts;
 mod quality;
 
+pub use drafts::*;
 pub use quality::*;
 
-use super::{Author, Chunk, DIMS, Detail, Document, KnowledgeStore, Link, Origin, SqliteStore, StoreError};
+use super::{Author, Chunk, DIMS, Detail, Document, KnowledgeStore, Link, Origin, SqliteStore, Status, StoreError};
 
 /// The model the fake embeddings claim to come from.
 pub const MODEL: &str = "test-model";
@@ -21,6 +23,8 @@ pub struct Seed {
     chunks: Vec<(String, String, Option<Vec<f32>>)>,
     links: Vec<Link>,
     author: Option<Author>,
+    status: Status,
+    pending_of: Option<i64>,
 }
 
 impl Seed {
@@ -34,7 +38,22 @@ impl Seed {
             chunks: Vec::new(),
             links: Vec::new(),
             author: None,
+            status: Status::Live,
+            pending_of: None,
         }
+    }
+
+    /// Stored as a draft (or in another state a new row may start in).
+    pub fn status(mut self, status: Status) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Stored as the pending version of live document `live` (a draft).
+    pub fn pending_of(mut self, live: i64) -> Self {
+        self.pending_of = Some(live);
+        self.status = Status::Draft;
+        self
     }
 
     pub fn source(mut self, key: &str) -> Self {
@@ -104,6 +123,9 @@ impl Seed {
             warnings: Vec::new(),
             added_by: self.author.clone(),
             updated_by: self.author.clone(),
+            status: self.status,
+            pending_of: self.pending_of,
+            review_rev: 0,
         };
 
         let chunks = self
@@ -178,6 +200,7 @@ fn chunk_ids(store: &mut dyn KnowledgeStore, doc: i64) -> Vec<i64> {
     let detail = Detail {
         sections: true,
         chunk: None,
+        drafts: false,
     };
     let found = store.get(doc, &detail).expect("get").expect("the document exists");
 
@@ -274,6 +297,7 @@ pub fn pending_chunks_contract(store: &mut dyn KnowledgeStore) {
             &Detail {
                 sections: false,
                 chunk: Some(alpha),
+                drafts: false,
             },
         )
         .expect("get")
@@ -385,6 +409,7 @@ pub fn title_order_contract(store: &mut dyn KnowledgeStore) {
                 descending,
                 offset,
                 limit,
+                status: crate::store::StatusFilter::All,
             })
             .expect("list")
             .items

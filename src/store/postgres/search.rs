@@ -1,6 +1,7 @@
 //! The two candidate lists of a search: keyword (`ts_rank_cd`) and vector (pgvector cosine).
 //!
-//! Both read only the chunks of the documents the [`Scope`] sees ([`visible`]).
+//! Both read only the chunks of the documents the [`Scope`] sees ([`visible`]): live documents, and
+//! with `scope.drafts` also drafts (never a pending version).
 //!
 //! Keyword: the words of the query are folded to lowercase letters and digits, quoted and OR-ed
 //! (`'git' | 'cli'`) for `to_tsquery('simple')`, so `tsquery` operators, quotes and stray `*`, `!`,
@@ -25,15 +26,22 @@ use super::error::{backend, column, count};
 use super::vector::{Problem, Version};
 use super::{meta, schema};
 use crate::limits::{CANDIDATES_MAX, QUERY_TOKENS_MAX};
-use crate::store::{ChunkHit, DIMS, Scope, StoreError};
+use crate::store::{ChunkHit, DIMS, Scope, Status, StoreError};
 
 /// True for the documents of the scope: parameter `${all}` is true for every document, else the
 /// global documents (no link) and the ones linked to the repository in `${repo}` (NULL for none).
-fn visible(all: usize, repo: usize) -> String {
+/// Only live documents, unless the scope sees `drafts`, which sees every row but a pending version.
+fn visible(all: usize, repo: usize, drafts: bool) -> String {
+    let state = if drafts {
+        "d.pending_of IS NULL"
+    } else {
+        "d.status = 'live'"
+    };
+
     format!(
-        "(${all}::boolean
+        "({state} AND (${all}::boolean
           OR NOT EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id)
-          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ${repo}::text))"
+          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ${repo}::text)))"
     )
 }
 
@@ -88,7 +96,7 @@ pub(super) fn keyword_top_k(
     let sql = format!(
         "WITH q AS (SELECT to_tsquery('simple'::regconfig, {words}) AS query)
          SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
-                ts_rank_cd(c.tsv, q.query)::float8 AS relevance, d.updated_at, {globs}
+                ts_rank_cd(c.tsv, q.query)::float8 AS relevance, d.updated_at, {globs}, d.status
          FROM q
          CROSS JOIN knowledge_chunks c
          JOIN knowledge_documents d ON d.id = c.doc_id
@@ -97,7 +105,7 @@ pub(super) fn keyword_top_k(
          LIMIT $4",
         words = schema::fold("$1::text"),
         globs = linked_globs(3),
-        visible = visible(2, 3),
+        visible = visible(2, 3, scope.drafts),
     );
 
     let rows = limit(k);
@@ -145,13 +153,13 @@ pub(super) fn vector_top_k(
              ORDER BY c.embedding <=> $1::real[]::vector
              LIMIT $5)
          SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
-                (1 - n.distance)::float8, d.updated_at, {globs}
+                (1 - n.distance)::float8, d.updated_at, {globs}, d.status
          FROM nearest n
          JOIN knowledge_chunks c ON c.id = n.id
          JOIN knowledge_documents d ON d.id = c.doc_id
          ORDER BY n.distance, c.id
          LIMIT $6",
-        visible = visible(2, 3),
+        visible = visible(2, 3, scope.drafts),
         globs = linked_globs(3),
     );
 
@@ -198,6 +206,11 @@ fn hit(row: &Row) -> Result<ChunkHit, StoreError> {
         score: column(row, 6)?,
         updated_at: column(row, 7)?,
         repo_globs: column(row, 8)?,
+        status: {
+            let status: String = column(row, 9)?;
+
+            Status::parse(&status).ok_or_else(|| StoreError::Backend("a stored status is unknown".to_owned()))?
+        },
     })
 }
 

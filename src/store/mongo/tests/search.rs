@@ -109,6 +109,7 @@ fn team_mongo_including_other_repositories_or_searching_every_repository_sees_ev
     let others = Scope {
         repo: Some(repo(A)),
         include_other_repos: true,
+        drafts: false,
     };
     let every = Scope::from_repo(Some(ProjectKey::every()));
     let all = ["Both", "Global", "Only A", "Only B"];
@@ -144,6 +145,7 @@ fn team_mongo_a_hit_carries_the_globs_of_its_link_to_the_scope_repository() {
             &Scope {
                 repo: Some(repo(A)),
                 include_other_repos: true,
+                drafts: false,
             },
         );
         let only_b = seen_from_other.iter().find(|hit| hit.title == "Only B").expect("found");

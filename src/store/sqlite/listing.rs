@@ -4,7 +4,7 @@
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use super::documents::{by_id, links_of, links_of_many, listed};
+use super::documents::{by_id, links_of, links_of_many, listed, pending_of_many};
 use super::sql_shared::{GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql};
 use super::{meta, schema};
 use crate::store::{
@@ -32,12 +32,14 @@ pub(super) fn list(conn: &Connection, columns: Columns, query: &ListQuery) -> Re
 
     let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of_many(conn, &ids)?;
+    let mut pending = pending_of_many(conn, columns, &ids)?;
 
     let items = docs
         .into_iter()
         .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
             usage,
+            pending: pending.remove(&doc.id),
             doc,
         })
         .collect();
@@ -91,6 +93,17 @@ pub(super) fn get(
         return Ok(None);
     };
 
+    // Agents read live documents only: a draft or a pending version is not there for them.
+    if !detail.drafts && !doc.status.is_live() {
+        return Ok(None);
+    }
+
+    let pending = if detail.drafts {
+        pending_of_many(conn, columns, &[id])?.remove(&id)
+    } else {
+        None
+    };
+
     let sections = if detail.sections {
         Some(sections(conn, id)?)
     } else {
@@ -108,6 +121,7 @@ pub(super) fn get(
         usage,
         sections,
         chunk,
+        pending,
     }))
 }
 
@@ -162,11 +176,13 @@ fn chunk(conn: &Connection, id: i64, chunk_id: i64) -> Result<Chunk, StoreError>
 pub(super) fn repos(conn: &Connection) -> Result<RepoCounts, StoreError> {
     let global = count(
         conn,
-        &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+        &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
     )?;
 
     let mut statement = conn.prepare(
-        "SELECT repo_key, count(*) AS docs FROM knowledge_doc_links GROUP BY repo_key ORDER BY docs DESC, repo_key",
+        "SELECT l.repo_key, count(*) AS docs FROM knowledge_doc_links l
+         JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL
+         GROUP BY l.repo_key ORDER BY docs DESC, l.repo_key",
     )?;
     let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)))?;
 
@@ -179,7 +195,7 @@ pub(super) fn repos(conn: &Connection) -> Result<RepoCounts, StoreError> {
 pub(super) fn stats(conn: &Connection) -> Result<Stats, StoreError> {
     let model_id = meta::get(conn, "model_id")?;
     let (documents, bytes): (usize, u64) = conn.query_row(
-        "SELECT count(*), coalesce(sum(bytes), 0) FROM knowledge_documents",
+        "SELECT count(*), coalesce(sum(bytes), 0) FROM knowledge_documents WHERE pending_of IS NULL",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -197,12 +213,29 @@ pub(super) fn stats(conn: &Connection) -> Result<Stats, StoreError> {
         bytes,
         global_documents: count(
             conn,
-            &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+            &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
         )?,
-        repositories: count(conn, "SELECT count(DISTINCT repo_key) FROM knowledge_doc_links")?,
+        repositories: count(
+            conn,
+            "SELECT count(DISTINCT l.repo_key) FROM knowledge_doc_links l
+             JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL",
+        )?,
         generation: meta::generation(conn)?,
         schema_version: schema::user_version(conn)?,
         model_id,
+        drafts: count(conn, "SELECT count(*) FROM knowledge_documents WHERE status = 'draft'")?,
+        waiting: count(
+            conn,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'waiting'",
+        )?,
+        changes_requested: count(
+            conn,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'changesRequested'",
+        )?,
+        pending: count(
+            conn,
+            "SELECT count(*) FROM knowledge_documents WHERE pending_of IS NOT NULL",
+        )?,
     })
 }
 

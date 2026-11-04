@@ -174,6 +174,7 @@ fn all_documents(store: &mut SqliteStore) -> Vec<DocumentRow> {
             descending: false,
             offset: 0,
             limit: 200,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list")
         .items
@@ -322,7 +323,7 @@ fn the_dedupe_matrix_unchanged_updated_with_reuse_and_added() {
 
     let id = first["docId"].as_i64().expect("doc id");
     let created = db
-        .find_by_source_key(&source_key)
+        .find_by_source_key(&source_key, crate::store::Visibility::Live)
         .expect("find")
         .expect("stored")
         .created_at;
@@ -465,6 +466,7 @@ fn a_subtitle_file_in_a_folder_is_imported_as_a_transcript_with_a_section_per_st
     );
 }
 
+mod drafts;
 mod flow;
 mod keys;
 mod reindex;

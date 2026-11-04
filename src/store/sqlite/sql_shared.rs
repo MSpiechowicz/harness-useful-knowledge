@@ -8,7 +8,7 @@
 
 use super::sql_quality::document_columns;
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
-use crate::store::{Columns, ListQuery, RepoFilter, Sort, StoreError, UsefulFilter};
+use crate::store::{Columns, ListQuery, RepoFilter, Sort, StatusFilter, StoreError, UsefulFilter};
 
 /// The meta keys the store keeps itself.
 const RESERVED_META: [&str; 3] = ["generation", "schema_version", "dims"];
@@ -97,7 +97,88 @@ END;
     };
 }
 
-pub(crate) use {keyword_index, tables};
+/// Version 2: the review of drafts (see [`super::schema`] for what the tables hold). The columns are
+/// added to the documents table, so every existing document is live at revision 0.
+///
+/// - `status`: `live`, `draft`, `waiting` or `changesRequested`.
+/// - `pending_of`: the live document a row is the pending version of. A live row has none, and a
+///   document has at most one pending version (the partial unique index).
+/// - `knowledge_doc_events`: the history. `knowledge_doc_comments`: the comments of reviews, a reply
+///   pointing at its parent (`quote`: the lines a line comment was written on, a JSON array of
+///   `{line, kind, text}`, see [`crate::store::QuoteLine`], null for any other comment).
+///   `knowledge_doc_files`: the original file, its bytes kept in the parts of
+///   `knowledge_doc_file_parts` ([`super::sql_review::FILE_PART_BYTES`] each, because a libSQL server
+///   refuses a single argument of more than a few MiB). `knowledge_doc_snapshots`:
+///   the section texts as of an ask, a JSON array of `{heading, text}` at the revision it made.
+///
+/// Everything but the documents table is removed with its document.
+macro_rules! review {
+    () => {
+        "
+ALTER TABLE knowledge_documents ADD COLUMN status TEXT NOT NULL DEFAULT 'live'
+    CHECK (status IN ('live', 'draft', 'waiting', 'changesRequested'));
+ALTER TABLE knowledge_documents ADD COLUMN review_rev INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE knowledge_documents ADD COLUMN pending_of INTEGER
+    REFERENCES knowledge_documents(id) ON DELETE CASCADE
+    CHECK (pending_of IS NULL OR status <> 'live');
+CREATE UNIQUE INDEX knowledge_documents_pending ON knowledge_documents (pending_of) WHERE pending_of IS NOT NULL;
+CREATE INDEX knowledge_documents_status ON knowledge_documents (status);
+
+CREATE TABLE knowledge_doc_events (
+    id INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    by_name TEXT,
+    comment TEXT,
+    at INTEGER NOT NULL
+);
+CREATE INDEX knowledge_doc_events_doc ON knowledge_doc_events (doc_id, id);
+
+CREATE TABLE knowledge_doc_comments (
+    id INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    review_id INTEGER,
+    section TEXT,
+    occurrence INTEGER,
+    side TEXT CHECK (side IS NULL OR side IN ('old', 'new')),
+    line_from INTEGER,
+    line_to INTEGER,
+    body TEXT NOT NULL,
+    by_name TEXT,
+    at INTEGER NOT NULL,
+    parent_id INTEGER REFERENCES knowledge_doc_comments(id) ON DELETE CASCADE,
+    resolved_at INTEGER,
+    resolved_by TEXT,
+    revision INTEGER NOT NULL,
+    quote TEXT
+);
+CREATE INDEX knowledge_doc_comments_doc ON knowledge_doc_comments (doc_id, id);
+
+CREATE TABLE knowledge_doc_files (
+    doc_id INTEGER PRIMARY KEY REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL
+);
+
+CREATE TABLE knowledge_doc_file_parts (
+    doc_id INTEGER NOT NULL REFERENCES knowledge_doc_files(doc_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    part INTEGER NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (doc_id, part)
+) WITHOUT ROWID;
+
+CREATE TABLE knowledge_doc_snapshots (
+    doc_id INTEGER NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    sections TEXT NOT NULL,
+    PRIMARY KEY (doc_id, revision)
+) WITHOUT ROWID;
+"
+    };
+}
+
+pub(crate) use {keyword_index, review, tables};
 
 /// A document linked to some repository (aliased `d`).
 pub(crate) const LINKED: &str = "EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
@@ -107,11 +188,18 @@ pub(crate) const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l
 
 /// True for the documents of the scope: parameter `?{all}` is 1 for every document, else the
 /// global documents (no link) and the ones linked to the repository in `?{repo}` (NULL for none).
-pub(crate) fn visible(all: usize, repo: usize) -> String {
+/// Only live documents, unless the scope sees `drafts`, which sees every row but a pending version.
+pub(crate) fn visible(all: usize, repo: usize, drafts: bool) -> String {
+    let state = if drafts {
+        "d.pending_of IS NULL"
+    } else {
+        "d.status = 'live'"
+    };
+
     format!(
-        "(?{all} = 1
+        "({state} AND (?{all} = 1
           OR NOT EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id)
-          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ?{repo}))"
+          OR EXISTS (SELECT 1 FROM knowledge_doc_links v WHERE v.doc_id = d.id AND v.repo_key = ?{repo})))"
     )
 }
 
@@ -147,11 +235,12 @@ pub(crate) fn fts_query(text: &str) -> Option<String> {
 
 /// The keyword candidates of the FTS5 query `?1` for the scope `?2` (all) and `?3` (repository),
 /// at most `?4`: a word in the title counts four times, in the heading path twice, in the text once.
-/// Columns: the shared hit columns (see `ChunkHit`), the score being the negated BM25.
-pub(crate) fn keyword_sql() -> String {
+/// Columns: the shared hit columns (see `ChunkHit`), the score being the negated BM25, the last the
+/// state of the document.
+pub(crate) fn keyword_sql(drafts: bool) -> String {
     format!(
         "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
-                -bm25(knowledge_chunks_fts, 4, 2, 1) AS relevance, d.updated_at, {globs}
+                -bm25(knowledge_chunks_fts, 4, 2, 1) AS relevance, d.updated_at, {globs}, d.status
          FROM knowledge_chunks_fts
          JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
          JOIN knowledge_documents d ON d.id = c.doc_id
@@ -159,8 +248,29 @@ pub(crate) fn keyword_sql() -> String {
          ORDER BY relevance DESC, c.id
          LIMIT ?4",
         globs = linked_globs(3),
-        visible = visible(2, 3),
+        visible = visible(2, 3, drafts),
     )
+}
+
+/// The condition (on a document aliased `d`) that keeps the rows `status` lists, as a live
+/// document is kept by the state of its pending version.
+pub(crate) fn status_condition(status: StatusFilter) -> String {
+    let pending =
+        |extra: &str| format!("EXISTS (SELECT 1 FROM knowledge_documents p WHERE p.pending_of = d.id{extra})");
+
+    match status {
+        StatusFilter::All => "d.pending_of IS NULL".to_owned(),
+        StatusFilter::Live => "d.status = 'live'".to_owned(),
+        StatusFilter::Pending => format!("(d.status = 'live' AND {})", pending("")),
+        state => {
+            let wanted = state.state().map_or("live", |state| state.as_str());
+
+            format!(
+                "((d.pending_of IS NULL AND d.status = '{wanted}') OR (d.status = 'live' AND {}))",
+                pending(&format!(" AND p.status = '{wanted}'"))
+            )
+        }
+    }
 }
 
 /// The `WHERE` clause of `query`'s filters and its numbered parameters.
@@ -180,6 +290,8 @@ pub(crate) fn list_conditions<V: From<String>>(columns: Columns, query: &ListQue
             ));
         }
     }
+
+    clauses.push(status_condition(query.status));
 
     if let Some(format) = &query.format {
         params.push(format.clone().into());

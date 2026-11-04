@@ -21,6 +21,7 @@ fn filtered(store: &mut MongoStore, text: &str) -> DocumentPage {
             descending: false,
             offset: 0,
             limit: 50,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list")
 }
@@ -109,7 +110,7 @@ fn team_mongo_a_new_database_has_the_phrase_text_and_the_title_keys_from_version
             .expect("find")
             .expect("schema")
             .get_i64("version"),
-        Ok(1)
+        Ok(2)
     );
     assert_eq!(db.count(CHUNKS, doc! {}), 2);
     assert_eq!(db.count(CHUNKS, doc! { "phrase_text": { "$exists": false } }), 0);

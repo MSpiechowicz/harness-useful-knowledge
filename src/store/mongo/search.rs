@@ -4,9 +4,11 @@
 //! Both read only the chunks of the documents the [`Scope`] sees. The scope is a prefilter inside
 //! the index (the `repo_keys` and `global` fields every chunk carries), so a vector query asks
 //! the index for its `k` nearest chunks among the visible ones rather than filtering afterwards.
-//! A hit is checked against the scope once more from the stored chunk, so a document whose links
-//! changed a moment ago and whose chunks the index has not caught up with is never shown to a
-//! repository that can no longer see it.
+//! So is the review state: a chunk carries `review` (`live`, `draft` or `pending`), an agent's
+//! scope keeps `live` only, and a scope that sees drafts keeps `live` and `draft`, never `pending`.
+//! A hit is checked against the scope and the review state once more from the stored chunk, so a
+//! document whose links or state changed a moment ago and whose chunks the index has not caught up
+//! with is never shown to a repository or an agent that can no longer see it.
 //!
 //! Keyword: the words of the query (see [`terms::query_words`]) are a `text` operator on each of
 //! the three fields, and a chunk needs one of them in one field. The operator takes no syntax, so
@@ -24,10 +26,10 @@ use mongodb::bson::{Bson, Document as Row, doc};
 
 use super::ctx::{Ctx, Fail};
 use super::documents::links;
-use super::schema::{CHUNKS, DOCUMENTS, KEYWORD_INDEX, VECTOR_INDEX};
+use super::schema::{CHUNKS, DOCUMENTS, KEYWORD_INDEX, REVIEW_DRAFT, REVIEW_LIVE, VECTOR_INDEX};
 use super::{int, strings, terms, text};
 use crate::limits::CANDIDATES_MAX;
-use crate::store::{ChunkHit, DIMS, Scope, StoreError};
+use crate::store::{ChunkHit, DIMS, Scope, Status, StoreError};
 
 /// The weights of the title, the heading path and the text in the keyword score.
 const TITLE_BOOST: f64 = 4.0;
@@ -41,25 +43,38 @@ const CANDIDATES_FLOOR: usize = 100;
 fn hit_fields() -> Row {
     doc! {
         "doc_id": 1, "title": 1, "ordinal": 1, "heading_path": 1, "text": 1, "updated_at": 1,
-        "repo_keys": 1, "global": 1,
+        "repo_keys": 1, "global": 1, "review": 1,
     }
 }
 
-/// The `$search` filter keeping the chunks `scope` sees; `None` when it sees all.
-pub(super) fn keyword_scope(scope: &Scope) -> Option<Row> {
+/// The `$search` filters keeping the chunks `scope` sees: always the review state (an agent's scope
+/// keeps live chunks only), and the repositories when the scope does not see everything.
+pub(super) fn keyword_scope(scope: &Scope) -> Vec<Row> {
+    let review = |value: &str| doc! { "equals": { "path": "review", "value": value } };
+
+    let state = if scope.drafts {
+        doc! { "compound": { "should": [review(REVIEW_LIVE), review(REVIEW_DRAFT)], "minimumShouldMatch": 1 } }
+    } else {
+        review(REVIEW_LIVE)
+    };
+
+    let mut filters = vec![state];
+
     if scope.sees_everything() {
-        return None;
+        return filters;
     }
 
     let global = doc! { "equals": { "path": "global", "value": true } };
 
     let Some(repo) = scope.repo_key() else {
-        return Some(global);
+        filters.push(global);
+        return filters;
     };
 
     let linked = doc! { "equals": { "path": "repo_keys", "value": repo } };
 
-    Some(doc! { "compound": { "should": [global, linked], "minimumShouldMatch": 1 } })
+    filters.push(doc! { "compound": { "should": [global, linked], "minimumShouldMatch": 1 } });
+    filters
 }
 
 /// The `$vectorSearch` filter keeping the chunks `scope` sees and `model` made.
@@ -69,6 +84,12 @@ pub(super) fn vector_filter(scope: &Scope, model: Option<&str>) -> Row {
     if let Some(model) = model {
         all.push(doc! { "model_id": model });
     }
+
+    all.push(if scope.drafts {
+        doc! { "review": { "$in": [REVIEW_LIVE, REVIEW_DRAFT] } }
+    } else {
+        doc! { "review": REVIEW_LIVE }
+    });
 
     if !scope.sees_everything() {
         let mut visible = vec![doc! { "global": true }];
@@ -81,7 +102,6 @@ pub(super) fn vector_filter(scope: &Scope, model: Option<&str>) -> Row {
     }
 
     match all.len() {
-        0 => Row::new(),
         1 => all.remove(0),
         _ => doc! { "$and": all },
     }
@@ -108,9 +128,7 @@ pub(super) fn keyword_stage(words: &[String], scope: &Scope) -> Row {
         "minimumShouldMatch": 1,
     };
 
-    if let Some(filter) = keyword_scope(scope) {
-        compound.insert("filter", vec![filter]);
-    }
+    compound.insert("filter", keyword_scope(scope));
 
     doc! { "$search": { "index": KEYWORD_INDEX, "compound": compound } }
 }
@@ -127,11 +145,7 @@ pub(super) fn vector_stage(vector: &[f32], scope: &Scope, model: Option<&str>, l
         "limit": i64::try_from(limit).unwrap_or(0),
     };
 
-    let filter = vector_filter(scope, model);
-
-    if !filter.is_empty() {
-        stage.insert("filter", filter);
-    }
+    stage.insert("filter", vector_filter(scope, model));
 
     doc! { "$vectorSearch": stage }
 }
@@ -196,20 +210,22 @@ pub(super) fn vector_top_k(
 }
 
 /// The hits of `rows` the scope sees, with the globs of each document's link to the scope's
-/// repository. `score` turns the index's score into the one a hit carries.
+/// repository and its state. `score` turns the index's score into the one a hit carries.
 fn hits(ctx: &mut Ctx<'_>, rows: &[Row], scope: &Scope, score: impl Fn(f64) -> f64) -> Result<Vec<ChunkHit>, Fail> {
     let visible: Vec<&Row> = rows.iter().filter(|row| sees(scope, row)).collect();
 
     let ids: Vec<Bson> = visible.iter().map(|row| Bson::Int64(int(row, "doc_id"))).collect();
-    let globs = match scope.repo_key() {
-        Some(repo) if !ids.is_empty() => globs_of(ctx, &ids, repo)?,
-        _ => Vec::new(),
+    let facts = if ids.is_empty() || (scope.repo_key().is_none() && !scope.drafts) {
+        Vec::new()
+    } else {
+        facts_of(ctx, &ids, scope.repo_key())?
     };
 
     Ok(visible
         .iter()
         .map(|row| {
             let doc_id = int(row, "doc_id");
+            let fact = facts.iter().find(|fact| fact.id == doc_id);
 
             ChunkHit {
                 chunk_id: int(row, "_id"),
@@ -220,17 +236,26 @@ fn hits(ctx: &mut Ctx<'_>, rows: &[Row], scope: &Scope, score: impl Fn(f64) -> f
                 text: text(row, "text").unwrap_or_default(),
                 score: score(row.get_f64("score").unwrap_or(0.0)),
                 updated_at: int(row, "updated_at"),
-                repo_globs: globs
-                    .iter()
-                    .find(|(id, _)| *id == doc_id)
-                    .map(|(_, globs)| globs.clone()),
+                repo_globs: fact.and_then(|fact| fact.globs.clone()),
+                status: fact.map_or(Status::Live, |fact| fact.status),
             }
         })
         .collect())
 }
 
-/// True when `scope` sees the chunk `row` (from the chunk's own `global` and `repo_keys`).
+/// True when `scope` sees the chunk `row`: its review state (from the chunk's own `review`, so a
+/// chunk without one is never seen) and its repository (from its own `global` and `repo_keys`).
 fn sees(scope: &Scope, row: &Row) -> bool {
+    let state = match text(row, "review").as_deref() {
+        Some(REVIEW_LIVE) => true,
+        Some(REVIEW_DRAFT) => scope.drafts,
+        _ => false,
+    };
+
+    if !state {
+        return false;
+    }
+
     if scope.sees_everything() || row.get_bool("global").unwrap_or(false) {
         return true;
     }
@@ -240,21 +265,36 @@ fn sees(scope: &Scope, row: &Row) -> bool {
         .is_some_and(|repo| strings(row, "repo_keys").iter().any(|key| key == repo))
 }
 
-/// The globs of each of the documents `ids` to its link to `repo`; none for a document not
-/// linked to it.
-fn globs_of(ctx: &mut Ctx<'_>, ids: &[Bson], repo: &str) -> Result<Vec<(i64, Vec<String>)>, Fail> {
+/// What a hit says about its document.
+struct Fact {
+    id: i64,
+    status: Status,
+    /// The globs of its link to the scope's repository; none for a document not linked to it.
+    globs: Option<Vec<String>>,
+}
+
+/// The state of each of the documents `ids`, and the globs of its link to `repo`.
+fn facts_of(ctx: &mut Ctx<'_>, ids: &[Bson], repo: Option<&str>) -> Result<Vec<Fact>, Fail> {
     let rows = ctx.find(
         DOCUMENTS,
         doc! { "_id": { "$in": ids } },
         (Row::new(), 0, 0),
-        doc! { "links": 1 },
+        doc! { "links": 1, "status": 1 },
     )?;
 
     Ok(rows
         .iter()
-        .filter_map(|row| {
-            let link = links(row).into_iter().find(|link| link.repo_key == repo)?;
-            Some((int(row, "_id"), link.globs))
+        .map(|row| Fact {
+            id: int(row, "_id"),
+            status: text(row, "status")
+                .and_then(|status| Status::parse(&status))
+                .unwrap_or(Status::Live),
+            globs: repo.and_then(|repo| {
+                links(row)
+                    .into_iter()
+                    .find(|link| link.repo_key == repo)
+                    .map(|link| link.globs)
+            }),
         })
         .collect())
 }
@@ -274,16 +314,27 @@ mod tests {
         }))
     }
 
+    fn live() -> Bson {
+        Bson::Document(doc! { "equals": { "path": "review", "value": "live" } })
+    }
+
     #[test]
-    fn a_scope_filters_the_keyword_query_by_global_and_by_repository() {
-        assert_eq!(keyword_scope(&Scope::everything()), None);
-        assert_eq!(keyword_scope(&Scope::from_repo(Some(ProjectKey::every()))), None);
+    fn a_scope_filters_the_keyword_query_by_review_state_global_and_repository() {
+        // An agent's scope keeps live chunks even when it sees every repository.
+        for scope in [Scope::everything(), Scope::from_repo(Some(ProjectKey::every()))] {
+            assert_eq!(
+                keyword_scope(&scope),
+                [doc! { "equals": { "path": "review", "value": "live" } }]
+            );
+        }
 
-        let only_global = keyword_scope(&Scope::from_repo(None)).expect("filter");
-        assert_eq!(only_global, doc! { "equals": { "path": "global", "value": true } });
+        let only_global = keyword_scope(&Scope::from_repo(None));
+        assert_eq!(only_global.len(), 2);
+        assert_eq!(Bson::Document(only_global[0].clone()), live());
+        assert_eq!(only_global[1], doc! { "equals": { "path": "global", "value": true } });
 
-        let from_a = keyword_scope(&from("git:h/o/a")).expect("filter");
-        let should = from_a
+        let from_a = keyword_scope(&from("git:h/o/a"));
+        let should = from_a[1]
             .get_document("compound")
             .and_then(|compound| compound.get_array("should"))
             .expect("should");
@@ -291,6 +342,29 @@ mod tests {
         assert_eq!(
             should[1],
             Bson::Document(doc! { "equals": { "path": "repo_keys", "value": "git:h/o/a" } })
+        );
+    }
+
+    #[test]
+    fn a_scope_that_sees_drafts_keeps_live_and_draft_chunks_and_never_a_pending_one() {
+        let filters = keyword_scope(&Scope::everything().with_drafts());
+        assert_eq!(filters.len(), 1);
+
+        let should = filters[0]
+            .get_document("compound")
+            .and_then(|compound| compound.get_array("should"))
+            .expect("should");
+        assert_eq!(
+            should,
+            &vec![
+                live(),
+                Bson::Document(doc! { "equals": { "path": "review", "value": "draft" } })
+            ]
+        );
+
+        assert_eq!(
+            vector_filter(&Scope::everything().with_drafts(), None),
+            doc! { "review": { "$in": ["live", "draft"] } }
         );
     }
 
@@ -327,7 +401,11 @@ mod tests {
             .and_then(|text| text.get_array("query").ok())
             .expect("query");
         assert_eq!(queried.len(), 2, "the words are a list, never a query string");
-        assert!(compound.get("filter").is_none(), "everything needs no filter");
+        assert_eq!(
+            compound.get_array("filter").expect("filter").len(),
+            1,
+            "everything still needs the review state"
+        );
     }
 
     #[test]
@@ -340,29 +418,59 @@ mod tests {
         assert_eq!(search.get_i64("limit"), Ok(50));
         assert_eq!(
             search.get_document("filter").expect("filter"),
-            &doc! { "$and": [{ "model_id": "m1" }, { "$or": [{ "global": true }, { "repo_keys": "git:h/o/a" }] }] }
+            &doc! { "$and": [
+                { "model_id": "m1" },
+                { "review": "live" },
+                { "$or": [{ "global": true }, { "repo_keys": "git:h/o/a" }] },
+            ] }
         );
 
         let small = vector_stage(&vector, &Scope::everything(), None, 3);
         let search = small.get_document("$vectorSearch").expect("stage");
         assert_eq!(search.get_i64("numCandidates"), Ok(100), "at least 100 candidates");
-        assert!(search.get("filter").is_none(), "no scope and no model need no filter");
+        assert_eq!(
+            search.get_document("filter").expect("filter"),
+            &doc! { "review": "live" },
+            "no scope and no model still need the review state"
+        );
 
         assert_eq!(
             vector_filter(&Scope::from_repo(None), None),
-            doc! { "$or": [{ "global": true }] }
+            doc! { "$and": [{ "review": "live" }, { "$or": [{ "global": true }] }] }
         );
     }
 
     #[test]
     fn a_hit_the_scope_cannot_see_is_dropped_even_when_the_index_returned_it() {
-        let linked = doc! { "global": false, "repo_keys": ["git:h/o/a"] };
-        let global = doc! { "global": true, "repo_keys": [] };
+        let linked = doc! { "global": false, "repo_keys": ["git:h/o/a"], "review": "live" };
+        let global = doc! { "global": true, "repo_keys": [], "review": "live" };
 
         assert!(sees(&from("git:h/o/a"), &linked));
         assert!(!sees(&from("git:h/o/b"), &linked));
         assert!(!sees(&Scope::from_repo(None), &linked));
         assert!(sees(&Scope::from_repo(None), &global));
         assert!(sees(&Scope::everything(), &linked));
+    }
+
+    #[test]
+    fn a_chunk_that_is_not_live_is_dropped_for_an_agent_even_when_the_index_returned_it() {
+        let chunk = |review: Option<&str>| {
+            let mut chunk = doc! { "global": true, "repo_keys": [] };
+
+            if let Some(review) = review {
+                chunk.insert("review", review);
+            }
+
+            chunk
+        };
+
+        for scope in [Scope::everything(), Scope::from_repo(None), from("git:h/o/a")] {
+            assert!(sees(&scope, &chunk(Some("live"))));
+            assert!(!sees(&scope, &chunk(Some("draft"))));
+            assert!(!sees(&scope, &chunk(Some("pending"))));
+            assert!(!sees(&scope, &chunk(None)), "a chunk without a state is not seen");
+            assert!(sees(&scope.clone().with_drafts(), &chunk(Some("draft"))));
+            assert!(!sees(&scope.with_drafts(), &chunk(Some("pending"))));
+        }
     }
 }

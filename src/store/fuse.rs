@@ -102,6 +102,7 @@ mod tests {
             score: relevance,
             updated_at: 0,
             repo_globs: None,
+            status: crate::store::Status::Live,
         }
     }
 

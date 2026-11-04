@@ -324,4 +324,6 @@ fn block(pointers: &[Pointer], snippet: usize) -> String {
 #[cfg(test)]
 mod counting_tests;
 #[cfg(test)]
+mod drafts_tests;
+#[cfg(test)]
 mod tests;

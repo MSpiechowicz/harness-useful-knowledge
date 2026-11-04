@@ -16,7 +16,7 @@ use crate::store::routed::ids;
 
 /// The place of the document `id` names while `routing` is in use: the place it carries, else the
 /// remote database's when both places are in use, else the only place.
-fn place_in_use(routing: Routing, id: i64) -> Place {
+pub fn place_in_use(routing: Routing, id: i64) -> Place {
     match (ids::split(id).0, routing.places().as_slice()) {
         (Some(place), _) => place,
         (None, [only]) => *only,

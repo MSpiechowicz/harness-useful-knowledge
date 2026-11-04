@@ -125,6 +125,70 @@ fn a_place_the_routing_does_not_keep_the_kind_in_is_refused_before_anything_is_o
     assert!(!setup.database_exists());
 }
 
+/// What a refusal prints: `{"error", "message"}`.
+fn printed(refused: &Result<impl std::fmt::Debug, Failure>) -> (String, String) {
+    match refused {
+        Err(Failure::Refused { code, message }) => ((*code).to_owned(), message.clone()),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_folder_of_this_computer_is_never_linked_to_a_team_document() {
+    let setup = Setup::new();
+    let folder = "path:/home/secret-owner/projects/ledger";
+
+    // The whole import is refused before anything is opened or written, the remote one by name or by routing.
+    for routing in [
+        Routing::new(Where::Remote, Where::Remote),
+        Routing::new(Where::RemoteLocal, Where::RemoteLocal),
+    ] {
+        let refused = setup.import(
+            routing,
+            &setup.manifest(Some(Place::Remote), &["git:github.com/o/r", folder]),
+        );
+        let (code, message) = printed(&refused);
+
+        assert_eq!(code, "localPath");
+        assert_eq!(
+            message,
+            "ledger has no git remote, so a team document cannot be linked to it (only a git: project key leaves this computer)"
+        );
+        assert!(
+            !message.contains("secret-owner") && !message.contains("/home"),
+            "{message}"
+        );
+    }
+
+    // Replacing files goes the same way.
+    let mut replacing = setup.manifest(Some(Place::Remote), &[folder]);
+    let file = replacing.paths[0].clone();
+    replacing.replacing.insert(file, 1);
+    let (code, _) = printed(&setup.import(Routing::new(Where::Remote, Where::Remote), &replacing));
+    assert_eq!(code, "localPath");
+
+    // Links set on a remote document.
+    let context = Context::new(&setup.env, &setup.backend, Routing::new(Where::Remote, Where::Remote));
+    let args = [Some("links"), Some("set"), Some("--json"), Some("1")];
+    let links = format!(r#"[{{"repo": "{folder}", "globs": []}}]"#);
+    let refused = docs_reply(&context, &args, &mut links.as_bytes());
+    let (code, message) = printed(&refused);
+    assert_eq!((code.as_str(), message.contains("ledger has")), ("localPath", true));
+    assert!(!message.contains("secret-owner"), "{message}");
+
+    assert!(!setup.database_exists());
+
+    // This computer's own database takes the folder.
+    let local = Setup::new();
+    let events = local
+        .import(
+            Routing::new(Where::Local, Where::Local),
+            &local.manifest(None, &[folder]),
+        )
+        .expect("imports locally");
+    assert_eq!(events[1]["status"], "added");
+}
+
 #[test]
 fn without_a_remote_database_only_this_computer_is_a_place() {
     let setup = Setup::new();
@@ -164,6 +228,9 @@ fn a_replacement_goes_to_the_place_of_the_document_it_replaces() {
     assert_eq!(listed.json["total"], 1);
 }
 
+/// How many [`Schema`]s this process made.
+static SCHEMAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A schema of the PostgreSQL server `HARNESS_KNOWLEDGE_TEST_POSTGRES_URL` names (with pgvector),
 /// dropped on drop. `None` (after saying so) without the variable.
 struct Schema {
@@ -182,7 +249,9 @@ impl Schema {
             return None;
         };
 
-        let name = format!("hk_replacing_{}", std::process::id());
+        // One per test: the tests of a process (`cargo test`) share the process id and run at once.
+        let number = SCHEMAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("hk_replacing_{}_{number}", std::process::id());
         let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls).expect("the test server answers");
 
         admin
@@ -342,4 +411,86 @@ fn files_replacing_documents_of_both_places_are_saved_each_where_its_document_is
         (json!(1), json!("remote"))
     );
     assert_eq!(found(0)["reason"], "sourceKey");
+}
+
+#[test]
+fn approval_set_on_an_unreachable_team_database_is_unreachable_whoever_asks() {
+    let setup = Setup::new();
+    let context = Context::new(&setup.env, &setup.backend, Routing::new(Where::Remote, Where::Remote));
+
+    // The remote is checked before the name, as the review's other refusals are ordered.
+    for actor in [None, Some("Ada")] {
+        let refused = approval::approval_as(&context, &[Some("set"), Some("--json"), Some("on")], actor);
+
+        assert!(matches!(&refused, Err(Failure::Unreachable(_))), "{refused:?}");
+    }
+}
+
+#[test]
+fn team_approval_set_records_who_and_when_and_get_prints_them() {
+    let Some(schema) = Schema::create() else { return };
+    let root = tempfile::tempdir().expect("temp dir");
+    let env = Env::for_tests("/home/u").with_var(DIR_VAR, root.path().join("knowledge").to_string_lossy());
+    let backend = crate::config::backend_for(Some(schema.url()), None).expect("backend");
+    let context = Context::new(&env, &backend, Routing::new(Where::Remote, Where::Remote));
+    let run = |words: &[&'static str], actor: Option<&str>| {
+        let args: Vec<Option<&str>> = words.iter().map(|word| Some(*word)).collect();
+
+        approval::approval_as(&context, &args, actor).expect("answers").json
+    };
+
+    let first = run(&["set", "--json", "on"], Some(" Ada "));
+    assert_eq!((&first["approval"], &first["changedBy"]), (&json!(true), &json!("Ada")));
+    let at = first["changedAt"].as_str().expect("a time").to_owned();
+    assert!(at.ends_with('Z') && at.contains('T'), "{at}");
+
+    assert_eq!(run(&["get", "--json"], None), first);
+
+    // Nobody switches it without a name, and the record stays as it was.
+    let nameless = approval::approval_as(&context, &[Some("set"), Some("--json"), Some("off")], None);
+    assert!(
+        matches!(&nameless, Err(Failure::Refused { code: "noName", .. })),
+        "{nameless:?}"
+    );
+    assert_eq!(run(&["get", "--json"], None), first);
+
+    let second = run(&["set", "--json", "off"], Some("Bob"));
+    assert_eq!(
+        (&second["approval"], &second["changedBy"]),
+        (&json!(false), &json!("Bob"))
+    );
+}
+
+#[test]
+fn a_review_of_an_id_naming_a_place_that_is_not_in_use_is_not_found_before_anything_is_opened() {
+    let setup = Setup::new();
+    let context = Context::new(&setup.env, &setup.backend, Routing::new(Where::Remote, Where::Remote));
+
+    for args in [
+        &["go-live", "--json", "local:5", "--expect", "0"][..],
+        &["ask", "--json", "local:5", "--expect", "0"],
+        &[
+            "review",
+            "--json",
+            "local:5",
+            "--expect",
+            "0",
+            "--verdict",
+            "comment",
+            "--body",
+            "x",
+        ],
+        &["comment", "resolve", "--json", "local:5", "1"],
+        &["comment", "delete", "--json", "local:5", "1"],
+    ] {
+        let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
+        let refused = docs_reply(&context, &args, &mut std::io::empty());
+
+        assert!(
+            matches!(&refused, Err(Failure::Refused { code: "notFound", .. })),
+            "{args:?}: {refused:?}"
+        );
+    }
+
+    assert!(!setup.database_exists());
 }

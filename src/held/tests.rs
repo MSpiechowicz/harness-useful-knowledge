@@ -277,3 +277,106 @@ fn the_name_of_the_author_is_kept_and_a_file_with_or_without_it_keeps_its_revisi
 
     assert_eq!(store.list().expect("list").len(), 2);
 }
+
+#[test]
+fn changes_requested_are_part_of_the_revision_and_survive_a_reload() {
+    let (_dir, store) = store();
+    let id = store.hold(proposal("Guide", "text")).expect("held");
+    let claim = store.claim(&id).expect("claim").expect("claimed");
+
+    let mut item = claim.item.clone();
+    let before = item.revision.clone();
+    item.changes_requested = Some(ChangesRequested {
+        comment: "More detail".to_owned(),
+        at: "2026-11-04T10:00:00Z".to_owned(),
+        by: Some("Bob".to_owned()),
+    });
+    item.revision = item.digest();
+    assert_ne!(item.revision, before);
+
+    claim.update(&item).expect("updated");
+
+    let read = store.get(&id).expect("get").expect("still waiting");
+    assert_eq!(read, item);
+    assert_eq!(read.status(), "changesRequested");
+    assert_eq!(store.list().expect("list").len(), 1);
+}
+
+#[test]
+fn a_claim_that_updates_a_proposal_too_large_to_hold_puts_the_old_one_back() {
+    let (_dir, store) = store();
+    let id = store.hold(proposal("Guide", "text")).expect("held");
+    let claim = store.claim(&id).expect("claim").expect("claimed");
+
+    let mut item = claim.item.clone();
+    item.content = "x".repeat(HELD_FILE_MAX + 1);
+
+    assert!(claim.update(&item).is_err());
+    assert_eq!(store.get(&id).expect("get").expect("waiting").content, "text");
+}
+
+/// A proposal with requested changes, held with no session.
+fn asked_for_changes(store: &HeldStore, title: &str) -> String {
+    let mut item = proposal(title, "first draft");
+    item.session = None;
+
+    let id = store.hold(item).expect("held");
+    let claim = store.claim(&id).expect("claim").expect("claimed");
+    let mut asked = claim.item.clone();
+
+    asked.changes_requested = Some(ChangesRequested {
+        comment: "More detail".to_owned(),
+        at: "2026-11-04T10:00:00Z".to_owned(),
+        by: Some("Bob".to_owned()),
+    });
+    asked.revision = asked.digest();
+    claim.update(&asked).expect("updated");
+
+    id
+}
+
+#[test]
+fn a_proposal_that_names_another_without_a_session_does_not_answer_it() {
+    let (_dir, store) = store();
+    let asked = asked_for_changes(&store, "Guide");
+
+    // Neither side names a session: a name is no proof that they are one conversation.
+    let mut other = proposal("Guide", "somebody else's text");
+    other.session = None;
+    let held = store.hold_named(other, Some(&asked)).expect("held");
+
+    assert_ne!(held, asked, "held as a proposal of its own");
+    assert_eq!(store.list().expect("list").len(), 2);
+    assert!(
+        store
+            .get(&asked)
+            .expect("get")
+            .expect("waiting")
+            .changes_requested
+            .is_some(),
+        "the request is still open"
+    );
+}
+
+#[test]
+fn a_proposal_that_names_another_of_the_same_session_answers_it() {
+    let (_dir, store) = store();
+    let id = store.hold(proposal("Guide", "first draft")).expect("held");
+    let claim = store.claim(&id).expect("claim").expect("claimed");
+    let mut asked = claim.item.clone();
+
+    asked.changes_requested = Some(ChangesRequested {
+        comment: "More detail".to_owned(),
+        at: "2026-11-04T10:00:00Z".to_owned(),
+        by: None,
+    });
+    asked.revision = asked.digest();
+    claim.update(&asked).expect("updated");
+
+    let held = store
+        .hold_named(proposal("Guide, again", "second draft"), Some(&id))
+        .expect("held");
+
+    assert_eq!(held, id, "replaced in place");
+    assert_eq!(store.list().expect("list").len(), 1);
+}

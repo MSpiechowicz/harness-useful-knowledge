@@ -2,7 +2,7 @@
 //! counts per repository and overall. The statements are the local file's (see
 //! [`crate::store::sqlite::sql_shared`]).
 
-use super::documents::{by_id, links_of, links_of_many, listed};
+use super::documents::{by_id, links_of, links_of_many, listed, pending_of_many};
 use super::meta;
 use super::sql::{Sql, Value, args, query_row};
 use crate::store::sqlite::sql_shared::{
@@ -34,12 +34,14 @@ pub(super) fn list(db: &mut dyn Sql, columns: Columns, query: &ListQuery) -> Res
 
     let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of_many(db, &ids)?;
+    let mut pending = pending_of_many(db, columns, &ids)?;
 
     let items = docs
         .into_iter()
         .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
             usage,
+            pending: pending.remove(&doc.id),
             doc,
         })
         .collect();
@@ -84,6 +86,17 @@ pub(super) fn get(
         return Ok(None);
     };
 
+    // Agents read live documents only: a draft or a pending version is not there for them.
+    if !detail.drafts && !doc.status.is_live() {
+        return Ok(None);
+    }
+
+    let pending = if detail.drafts {
+        pending_of_many(db, columns, &[id])?.remove(&id)
+    } else {
+        None
+    };
+
     let sections = if detail.sections { Some(sections(db, id)?) } else { None };
 
     let chunk = match detail.chunk {
@@ -97,6 +110,7 @@ pub(super) fn get(
         usage,
         sections,
         chunk,
+        pending,
     }))
 }
 
@@ -154,11 +168,13 @@ fn chunk(db: &mut dyn Sql, id: i64, chunk_id: i64) -> Result<Chunk, StoreError> 
 pub(super) fn repos(db: &mut dyn Sql) -> Result<RepoCounts, StoreError> {
     let global = count(
         db,
-        &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+        &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
     )?;
 
     let rows = db.query(
-        "SELECT repo_key, count(*) AS docs FROM knowledge_doc_links GROUP BY repo_key ORDER BY docs DESC, repo_key",
+        "SELECT l.repo_key, count(*) AS docs FROM knowledge_doc_links l
+         JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL
+         GROUP BY l.repo_key ORDER BY docs DESC, l.repo_key",
         args![],
     )?;
 
@@ -175,7 +191,7 @@ pub(super) fn stats(db: &mut dyn Sql) -> Result<Stats, StoreError> {
 
     let totals = query_row(
         db,
-        "SELECT count(*), coalesce(sum(bytes), 0) FROM knowledge_documents",
+        "SELECT count(*), coalesce(sum(bytes), 0) FROM knowledge_documents WHERE pending_of IS NULL",
         args![],
     )?;
     let (documents, bytes) = match totals {
@@ -196,14 +212,28 @@ pub(super) fn stats(db: &mut dyn Sql) -> Result<Stats, StoreError> {
         bytes,
         global_documents: count(
             db,
-            &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+            &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
         )?,
-        repositories: count(db, "SELECT count(DISTINCT repo_key) FROM knowledge_doc_links")?,
+        repositories: count(
+            db,
+            "SELECT count(DISTINCT l.repo_key) FROM knowledge_doc_links l
+             JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL",
+        )?,
         generation: meta::generation(db)?,
         schema_version: meta::get(db, "schema_version")?
             .and_then(|version| version.parse().ok())
             .unwrap_or(0),
         model_id,
+        drafts: count(db, "SELECT count(*) FROM knowledge_documents WHERE status = 'draft'")?,
+        waiting: count(db, "SELECT count(*) FROM knowledge_documents WHERE status = 'waiting'")?,
+        changes_requested: count(
+            db,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'changesRequested'",
+        )?,
+        pending: count(
+            db,
+            "SELECT count(*) FROM knowledge_documents WHERE pending_of IS NOT NULL",
+        )?,
     })
 }
 

@@ -19,6 +19,7 @@ pub(super) fn everything() -> ListQuery {
         descending: true,
         offset: 0,
         limit: 50,
+        status: crate::store::StatusFilter::All,
     }
 }
 
@@ -376,7 +377,7 @@ fn team_mongo_counts_per_repository_and_overall() {
     );
     assert_eq!((stats.global_documents, stats.repositories), (1, 2));
     assert_eq!(stats.model_id.as_deref(), Some(crate::store::testing::MODEL));
-    assert_eq!(stats.schema_version, 1);
+    assert_eq!(stats.schema_version, 2);
 }
 
 #[test]

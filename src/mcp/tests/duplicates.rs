@@ -258,3 +258,72 @@ fn a_database_that_cannot_be_read_does_not_block_the_proposal() {
     assert!(!is_error, "{text}");
     assert_eq!(world.held_files().len(), 1);
 }
+
+/// Turns the stored documents into drafts (or back), the way a draft import leaves them.
+fn set_status(world: &World, status: &str) {
+    rusqlite::Connection::open(world.knowledge().join(FILE_NAME))
+        .expect("second connection")
+        .execute("UPDATE knowledge_documents SET status = ?1", [status])
+        .expect("set the status");
+}
+
+#[test]
+fn a_draft_is_never_the_similar_document_of_a_proposal_whatever_the_reason() {
+    // Each case matches a live document by one reason (see the tests above). As a draft, the
+    // proposal is held, and a refusal that names the document appears once it is live.
+    let cases: [(&str, &str, &str, &str, &str); 4] = [
+        (
+            "/docs/gateway.md",
+            "sameContent",
+            "Gateway guide",
+            &guide("Gateway guide", "How it works."),
+            "Gateway guide",
+        ),
+        (
+            "/docs/gateway.md",
+            "sharedChunks",
+            "Gateway guide",
+            &guide("Gateway guide", "How it works."),
+            "Gateway guide",
+        ),
+        (
+            "/docs/gateway.md",
+            "title",
+            "Gateway guide",
+            "# Gateway guide\n\nRestart it.",
+            "  GATEWAY   guide",
+        ),
+        (
+            "agent/proposal/runbook.md",
+            "sourceKey",
+            "Old",
+            "# Old\n\nUnrelated old text.",
+            "Runbook",
+        ),
+    ];
+
+    for (key, reason, stored_title, text, proposed_title) in cases {
+        let mut world = World::new();
+        let id = store(&world, key, text, None);
+        let proposed = match reason {
+            "sameContent" => guide("Gateway guide", "How it works."),
+            "sharedChunks" => guide("Gateway guide", "How it works, edited."),
+            "title" => "# Other\n\nSomething else entirely.".to_owned(),
+            _ => "# New\n\nNothing alike.".to_owned(),
+        };
+
+        set_status(&world, "draft");
+        let (reply, is_error) = propose(&mut world, proposed_title, &proposed, json!({}));
+        assert!(!is_error, "{reason}: a draft refused a proposal: {reply}");
+        assert!(reply.starts_with("held:"), "{reason}: {reply}");
+        assert!(
+            !reply.contains("similar") && !reply.contains(stored_title),
+            "{reason}: {reply}"
+        );
+
+        set_status(&world, "live");
+        let (reply, is_error) = propose(&mut world, proposed_title, &proposed, json!({}));
+        assert!(is_error, "{reason}: the control is refused once it is live: {reply}");
+        assert_eq!(reply, refusal(id, stored_title, reason));
+    }
+}

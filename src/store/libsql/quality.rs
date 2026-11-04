@@ -8,9 +8,9 @@ use super::sql::{Sql, Value, args};
 use super::wire::execute_request;
 use crate::store::quality::{TITLE_SCAN_MAX, matching_titles};
 use crate::store::sqlite::sql_quality::{
-    SHARING_SQL, SHOWN_SQL, TITLES_GLOBAL_SQL, TITLES_REPO_SQL, USEFUL_SQL, ids_json, shas_json,
+    SHOWN_SQL, USEFUL_SQL, ids_json, sharing_sql, shas_json, titles_global_sql, titles_repo_sql,
 };
-use crate::store::{Columns, Document, StoreError, TitleScope};
+use crate::store::{Columns, Document, StoreError, TitleScope, Visibility};
 
 /// The documents of `scope` whose title equals `title`, by id.
 pub(super) fn by_title(
@@ -18,10 +18,11 @@ pub(super) fn by_title(
     columns: Columns,
     title: &str,
     scope: &TitleScope,
+    visibility: Visibility,
 ) -> Result<Vec<Document>, StoreError> {
     let rows = match scope {
-        TitleScope::Global => db.query(TITLES_GLOBAL_SQL, args![TITLE_SCAN_MAX])?,
-        TitleScope::Repo(key) => db.query(TITLES_REPO_SQL, args![TITLE_SCAN_MAX, key])?,
+        TitleScope::Global => db.query(&titles_global_sql(visibility), args![TITLE_SCAN_MAX])?,
+        TitleScope::Repo(key) => db.query(&titles_repo_sql(visibility), args![TITLE_SCAN_MAX, key])?,
     };
     let titles = rows
         .iter()
@@ -40,14 +41,18 @@ pub(super) fn by_title(
 }
 
 /// Each document with a chunk whose hash is in `shas`, with how many distinct ones.
-pub(super) fn sharing(db: &mut dyn Sql, shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+pub(super) fn sharing(
+    db: &mut dyn Sql,
+    shas: &[String],
+    visibility: Visibility,
+) -> Result<Vec<(i64, usize)>, StoreError> {
     let wanted = shas_json(shas)?;
 
     if shas.is_empty() {
         return Ok(Vec::new());
     }
 
-    db.query(SHARING_SQL, args![wanted])?
+    db.query(&sharing_sql(visibility), args![wanted])?
         .iter()
         .map(|row| Ok((row.get(0)?, row.get(1)?)))
         .collect()

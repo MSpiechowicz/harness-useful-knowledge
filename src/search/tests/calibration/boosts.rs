@@ -24,6 +24,7 @@ fn from(repo: &str) -> Scope {
             remote: None,
         }),
         include_other_repos: true,
+        drafts: false,
     }
 }
 

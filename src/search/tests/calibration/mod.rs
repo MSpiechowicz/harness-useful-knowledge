@@ -272,6 +272,7 @@ impl Lab {
                 descending: false,
                 offset: 0,
                 limit: 200,
+                status: crate::store::StatusFilter::All,
             })
             .expect("list");
 

@@ -26,7 +26,7 @@ fn team_connecting_creates_the_schema_and_reconnecting_keeps_the_data() {
     let mut again = server.store();
     let found = again.get(id, &Detail::default()).expect("get").expect("document");
     assert_eq!(found.doc.title, "Guide");
-    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("2"));
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
 }
 
@@ -84,7 +84,10 @@ fn team_a_database_from_a_newer_server_is_left_alone() {
     let Some(server) = server() else { return };
     drop(server.store());
     server
-        .execute("UPDATE knowledge_meta SET value = '2' WHERE key = 'schema_version'")
+        .execute(&format!(
+            "UPDATE knowledge_meta SET value = '{}' WHERE key = 'schema_version'",
+            SCHEMA_VERSION + 1
+        ))
         .expect("bump");
 
     let mut newer = server.store();
@@ -109,7 +112,10 @@ fn team_a_client_connected_before_a_newer_server_migrated_stops_writing() {
     insert(&mut early, &Seed::new("Before").chunk("A", "x"));
 
     server
-        .execute("UPDATE knowledge_meta SET value = '2' WHERE key = 'schema_version'")
+        .execute(&format!(
+            "UPDATE knowledge_meta SET value = '{}' WHERE key = 'schema_version'",
+            SCHEMA_VERSION + 1
+        ))
         .expect("bump");
 
     let (doc, chunks, links) = Seed::new("After").chunk("A", "y").parts();

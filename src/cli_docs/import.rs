@@ -1,9 +1,16 @@
 //! `docs import --ndjson` and `docs reindex --json`.
 //!
-//! - `docs import --ndjson < manifest.json` imports the files the manifest names and prints one JSON
+//! - `docs import --ndjson [--draft] [--ask [--note TEXT]] < manifest.json` imports the files the manifest
+//!   names and prints one JSON
 //!   event per line as it goes (see [`crate::import::events`]). The manifest is
 //!   `{"paths": [...], "folders": [...], "links": [{"repo", "globs"}], "replaces": ID, "replacing":
-//!   {"/abs/file.md": ID}, "place": "remote" | "local"}`, all optional, at most 4 MiB. `replaces` is the
+//!   {"/abs/file.md": ID}, "place": "remote" | "local", "draft": bool, "ask": bool, "note": TEXT}`, all
+//!   optional, at most 4 MiB. `--draft`, `--ask` and `--note` are the same as the manifest fields
+//!   (either one sets them). `draft` stores the files as drafts, and a replaced live document as its
+//!   pending version. With team approval on in the remote database every file for the remote database
+//!   is a draft or a pending version anyway. `ask` asks for approval right after the file is written
+//!   (replace and ask again in one step), with `note` in the history. It needs approval to be on and a
+//!   git `user.name`, or the import is refused before the first file. `replaces` is the
 //!   document the one file replaces, `replacing` the document each of several files (all of them
 //!   in `paths`) replaces, each saved in the place of its document (see [`super::replacing`]).
 //!   The documents are written by the git `user.name` (see [`author_of`]). SIGTERM, SIGINT or a closed stdout stop the import between two documents (the
@@ -31,20 +38,31 @@ use crate::import::place::write_place;
 use crate::import::reindex::{self, Which};
 use crate::import::{self, Importer, manifest};
 use crate::limits::{DELETE_IDS_MAX, MANIFEST_MAX};
+use crate::review;
 use crate::store::routed::ids;
-use crate::store::{Author, Link, clean};
+use crate::store::{Author, KnowledgeStore, Link, clean};
 use crate::support::author;
 use crate::tokens::counter_for;
 
 /// `docs import`.
 pub(super) fn import(context: &Context, args: &[Option<&str>], input: &mut dyn Read) -> Reply {
-    let parsed = Args::parse(args, &["--ndjson"], &[]).ok_or(Failure::Usage)?;
+    let parsed = Args::parse(args, &["--ndjson", "--draft", "--ask"], &["--note"]).ok_or(Failure::Usage)?;
 
     if !parsed.positional.is_empty() || !parsed.flag("--ndjson") {
         return Err(Failure::Usage);
     }
 
-    let manifest = read_manifest(input)?;
+    let mut manifest = read_manifest(input)?;
+
+    manifest.draft |= parsed.flag("--draft");
+    manifest.ask |= parsed.flag("--ask");
+
+    if let Some(note) = parsed.value("--note") {
+        manifest.note = Some(note.to_owned());
+    }
+
+    manifest.check_ask().map_err(Failure::Failed)?;
+
     let pdf = WorkerProcess::current_exe().map_err(Failure::Failed)?;
     let stopped = stop_signal();
     let cancel = || stopped.load(Ordering::SeqCst);
@@ -79,20 +97,65 @@ pub(super) fn import_with(
     let links = clean::links(&manifest.links)?;
     let counter = counter_for(context.env);
     let place = import_place(context, manifest, Kind::of(links.len()))?;
+
+    // Refused before anything is written: a team database takes no folder of this computer.
+    for_place(place, &links)?;
     let mut store = context
         .open_place_to_change(place, Access::Create)?
         .ok_or_else(|| Failure::Failed("the database could not be created".to_owned()))?;
 
+    let author = author_of(context, &links);
+    let approval = approval_for(store.as_mut(), place, manifest, author.as_ref())?;
+
     let mut importer = Importer::new(store.as_mut(), counter.as_ref(), pdf, cancel);
     importer.embedder = embedder.as_deref_mut().map(|embedder| embedder as &mut dyn Embedder);
-    importer.author = author_of(context, &links);
+    importer.author = author;
     importer.links = links;
     importer.replaces = manifest.replaces.map(|id| ids::split(id).1);
+    set_review(&mut importer, manifest, approval);
 
     // Ids are written with their place only when two places are in use.
     let tagged = (context.routing.layout() == Layout::Both).then_some(place);
 
     import::run(&mut importer, manifest, &mut Events::new(out).in_place(tagged)).map_err(Failure::Failed)
+}
+
+/// Whether team approval is on for the documents of an import written to `place` (read from the
+/// remote database, never guessed from this computer), refusing an `ask` that has nobody to ask
+/// (`approvalOff`) or nobody to ask as (`noName`).
+pub(super) fn approval_for(
+    store: &mut dyn KnowledgeStore,
+    place: Place,
+    manifest: &import::Manifest,
+    author: Option<&Author>,
+) -> Result<bool, Failure> {
+    let approval = review::approval_in(store, place).map_err(super::review::failure)?;
+
+    if manifest.ask && !approval {
+        return Err(Failure::Refused {
+            code: review::Code::ApprovalOff.as_str(),
+            message: "team approval is off, so there is nobody to ask: import without ask, or switch approval on"
+                .to_owned(),
+        });
+    }
+
+    if manifest.ask && author.is_none() {
+        return Err(Failure::Refused {
+            code: review::Code::NoName.as_str(),
+            message: "asking for approval needs a name: set one with `git config user.name`".to_owned(),
+        });
+    }
+
+    Ok(approval)
+}
+
+/// What the import does with drafts: the manifest's `draft`, `ask` and `note`, and whether
+/// approval is on.
+pub(super) fn set_review(importer: &mut Importer, manifest: &import::Manifest, approval: bool) {
+    importer.draft = manifest.draft;
+    importer.approval = approval;
+    importer.ask = manifest.ask;
+    importer.note.clone_from(&manifest.note);
 }
 
 /// The author of an import the person runs: their git `user.name`, read in the folder of the first
@@ -106,6 +169,17 @@ pub(super) fn author_of(context: &Context, links: &[Link]) -> Option<Author> {
     let dir = root.or_else(|| std::env::current_dir().ok())?;
 
     author::resolve(context.env, &dir).map(|name| Author { name, via: None })
+}
+
+/// Refuses `links` for a document that is saved in `place` when they name a folder on this
+/// computer (a `path:` key) and the place is the team's database: only a `git:` key leaves this
+/// computer. The message names the folder, never its path.
+pub(super) fn for_place(place: Place, links: &[Link]) -> Result<(), Failure> {
+    if place == Place::Remote {
+        clean::refuse_local_paths(links)?;
+    }
+
+    Ok(())
 }
 
 /// Where an import saves: the manifest's `place`, else the place of the document it replaces, else
@@ -395,5 +469,68 @@ mod tests {
 
         assert!(matches!(failure, Failure::Failed(message) if message.contains("repository")));
         assert!(!root.path().join("k").exists());
+    }
+
+    #[test]
+    fn the_draft_flag_stores_a_draft_and_ask_is_refused_while_approval_is_off() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let env = Env::for_tests("/home/u").with_var(DIR_VAR, root.path().join("knowledge").to_string_lossy());
+        let context = Context::new(&env, &Backend::Sqlite, Routing::local());
+        let file = root.path().join("guide.md");
+        std::fs::write(&file, "# Guide\n\nHow the gateway routes requests.").expect("write");
+        let paths = vec![file.to_string_lossy().into_owned()];
+
+        let drafted = import::Manifest {
+            paths: paths.clone(),
+            draft: true,
+            ..import::Manifest::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let report = import_with(&context, &drafted, &NoPdf, None, &|| false, &mut out).expect("imports");
+        let events = lines(&out);
+
+        assert_eq!(report.counts.added, 1);
+        assert_eq!(
+            (events[1]["status"].clone(), events[1]["draft"].clone()),
+            (json!("added"), json!(true))
+        );
+
+        let listed =
+            super::super::docs_reply(&context, &args(&["list", "--json"]), &mut std::io::empty()).expect("list");
+        assert_eq!(listed.json["total"], 1);
+
+        // Nobody can be asked while this computer is the only place: nothing is imported.
+        let asking = import::Manifest {
+            paths,
+            ask: true,
+            ..import::Manifest::default()
+        };
+        let refusal = import_with(&context, &asking, &NoPdf, None, &|| false, &mut Vec::new()).expect_err("refused");
+        assert!(
+            matches!(refusal, Failure::Refused { code: "approvalOff", ref message } if message.contains("approval is off")),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn the_flags_of_the_command_are_read_and_a_note_needs_an_ask() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let env = Env::for_tests("/home/u").with_var(DIR_VAR, root.path().join("knowledge").to_string_lossy());
+        let context = Context::new(&env, &Backend::Sqlite, Routing::local());
+        let docs =
+            |raw: &[&str], manifest: &str| super::super::docs_reply(&context, &args(raw), &mut manifest.as_bytes());
+
+        assert!(matches!(
+            docs(&["import", "--ndjson", "--note", "why"], "{}"),
+            Err(Failure::Failed(message)) if message.contains("note")
+        ));
+        assert!(matches!(
+            docs(&["import", "--ndjson", "--ask"], "{}"),
+            Err(Failure::Refused { code: "approvalOff", message }) if message.contains("approval is off")
+        ));
+        assert_eq!(
+            docs(&["import", "--ndjson", "--draft", "extra"], "{}").expect_err("usage"),
+            Failure::Usage
+        );
     }
 }

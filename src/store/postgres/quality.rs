@@ -1,15 +1,16 @@
 //! The lookups and counters behind duplicate detection and usefulness: titles in a scope, the
-//! documents that share chunks, how often a document was shown or helped, and whether this role
+//! documents that share chunks (both only of the documents the visibility lets through), how often a
+//! live document was shown or helped, and whether this role
 //! may change documents.
 
 use postgres::GenericClient;
 
-use super::documents::by_id;
+use super::documents::{by_id, seen};
 use super::error::{backend, column, count, int};
 use super::{PostgresStore, schema};
 use crate::limits::SHARED_SHAS_MAX;
 use crate::store::quality::{TITLE_SCAN_MAX, matching_titles};
-use crate::store::{Columns, Document, StoreError, TitleScope};
+use crate::store::{Columns, Document, StoreError, TitleScope, Visibility};
 
 /// How long a counter statement may wait for a lock or run: a busy database drops the count.
 const COUNT_STATEMENT_LIMIT: &str = "500ms";
@@ -20,19 +21,25 @@ pub(super) fn by_title(
     columns: Columns,
     title: &str,
     scope: &TitleScope,
+    visibility: Visibility,
 ) -> Result<Vec<Document>, StoreError> {
     let limit = int(TITLE_SCAN_MAX);
+    let seen = seen(visibility);
     let rows = match scope {
         TitleScope::Global => client.query(
-            "SELECT d.id, d.title FROM knowledge_documents d
-             WHERE NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)
-             ORDER BY d.id LIMIT $1",
+            &format!(
+                "SELECT d.id, d.title FROM knowledge_documents d
+                 WHERE {seen} AND NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)
+                 ORDER BY d.id LIMIT $1"
+            ),
             &[&limit],
         ),
         TitleScope::Repo(key) => client.query(
-            "SELECT d.id, d.title FROM knowledge_documents d
-             WHERE EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = $2)
-             ORDER BY d.id LIMIT $1",
+            &format!(
+                "SELECT d.id, d.title FROM knowledge_documents d
+                 WHERE {seen} AND EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = $2)
+                 ORDER BY d.id LIMIT $1"
+            ),
             &[&limit, key],
         ),
     }
@@ -55,7 +62,11 @@ pub(super) fn by_title(
 }
 
 /// Each document with a chunk whose hash is in `shas`, with how many distinct ones.
-pub(super) fn sharing(client: &mut impl GenericClient, shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+pub(super) fn sharing(
+    client: &mut impl GenericClient,
+    shas: &[String],
+    visibility: Visibility,
+) -> Result<Vec<(i64, usize)>, StoreError> {
     if shas.len() > SHARED_SHAS_MAX {
         return Err(StoreError::Invalid(format!(
             "at most {SHARED_SHAS_MAX} chunk hashes at once"
@@ -68,8 +79,12 @@ pub(super) fn sharing(client: &mut impl GenericClient, shas: &[String]) -> Resul
 
     let rows = client
         .query(
-            "SELECT doc_id, count(DISTINCT chunk_sha) FROM knowledge_chunks
-             WHERE chunk_sha = ANY($1) GROUP BY doc_id ORDER BY doc_id",
+            &format!(
+                "SELECT c.doc_id, count(DISTINCT c.chunk_sha) FROM knowledge_chunks c
+                 JOIN knowledge_documents d ON d.id = c.doc_id
+                 WHERE {} AND c.chunk_sha = ANY($1) GROUP BY c.doc_id ORDER BY c.doc_id",
+                seen(visibility)
+            ),
             &[&shas],
         )
         .map_err(backend)?;
@@ -134,7 +149,7 @@ impl PostgresStore {
         self.count(
             "UPDATE knowledge_documents
              SET shown = CASE WHEN shown < 9223372036854775807 THEN shown + 1 ELSE shown END
-             WHERE id = ANY($1::bigint[])",
+             WHERE status = 'live' AND id = ANY($1::bigint[])",
             ids,
             None,
         )
@@ -144,7 +159,7 @@ impl PostgresStore {
         self.count(
             "UPDATE knowledge_documents
              SET useful = CASE WHEN useful < 9223372036854775807 THEN useful + 1 ELSE useful END, last_useful_at = $2
-             WHERE id = ANY($1::bigint[])",
+             WHERE status = 'live' AND id = ANY($1::bigint[])",
             ids,
             Some(at),
         )

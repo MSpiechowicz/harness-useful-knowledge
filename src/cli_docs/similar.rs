@@ -15,14 +15,14 @@ use crate::import::similar::{self, Match};
 use crate::import::walk::{self, Candidate};
 use crate::limits::FILES_PER_IMPORT_MAX;
 use crate::store::routed::ids;
-use crate::store::{Link, TitleScope, clean};
+use crate::store::{Link, TitleScope, Visibility, clean};
 use crate::support::time::rfc3339;
 use crate::tokens::counter_for;
 
 /// `docs similar --json [--repo KEY | --global] PATH...`: `{"similar": [{"path", "match"}]}`, one
 /// entry per file in the order of the paths (a folder gives its files, as an import walks it). A
 /// `match` is `null` or the stored document the file is probably a version of:
-/// `{"id", "title", "place", "reason", "sharedChunks", "chunks", "addedBy", "updatedBy", "updatedAt"}`
+/// `{"id", "title", "place", "status", "reason", "sharedChunks", "chunks", "addedBy", "updatedBy", "updatedAt"}`
 /// (see [`similar::find`] for the `reason`s and [`shown::author`] for the authors). `chunks` counts
 /// the file's distinct chunks, `sharedChunks` how many of them the document has. A file that cannot
 /// be read has `"match": null` and an `"error"`. `--repo KEY` reads the files as a link to that
@@ -72,7 +72,7 @@ pub(super) fn similar(context: &Context, args: &[Option<&str>]) -> Reply {
             (Err(reason), _) => json!({ "path": file.display, "match": null, "error": reason }),
             (Ok(_), None) => json!({ "path": file.display, "match": null }),
             (Ok(probe), Some(store)) => {
-                let found = similar::find(store.as_mut(), &probe)?;
+                let found = similar::find_visible(store.as_mut(), &probe, Visibility::WithDrafts)?;
 
                 json!({ "path": file.display, "match": found.map(|found| matched(context, &found)) })
             }
@@ -126,6 +126,7 @@ fn matched(context: &Context, found: &Match) -> Value {
         "id": ids::json(doc.id),
         "title": doc.title,
         "place": place.as_str(),
+        "status": doc.status.as_str(),
         "reason": found.reason.as_str(),
         "sharedChunks": found.shared,
         "chunks": found.chunks,

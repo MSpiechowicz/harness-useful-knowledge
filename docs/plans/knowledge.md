@@ -46,7 +46,7 @@ Reference: `harness-useful-memory` v2.11.0. Follow-ups: #48 (`harness-code`), #4
 10. Onboarding, Ecosystem, family hooks and inline Install/Update. 6 locales, no semicolons, "Harness family" wording.
 
 ## Non-goals
-DocumentDB, live connectors, code auto-links (#49), OCR, attachments, an agent delete tool, a shared team review queue, and memory's notes, entities, scripts, trust, hooks, routines, push, offline and usefulness features.
+DocumentDB, live connectors, code auto-links (#49), OCR, attachments, an agent delete tool, a shared team review queue (now [knowledge-drafts.md](knowledge-drafts.md)), and memory's notes, entities, scripts, trust, hooks, routines, push, offline and usefulness features.
 
 ## Interfaces (A)
 - **Config:** `<config>/harness-knowledge/config.toml` with `[database] url`, `token`. Env: `HARNESS_KNOWLEDGE_{DIR,CONFIG,DATABASE_URL,DATABASE_TOKEN,MODEL_BASE_URL,SESSION}`. Tables and collections are prefixed `knowledge_`, and the default Mongo database is `harness_knowledge`.

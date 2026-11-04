@@ -78,7 +78,7 @@ fn a_counter_lands_in_the_place_the_id_carries() {
 fn a_title_is_found_in_every_place_that_shows_its_kind_and_the_ids_carry_the_place() {
     let mut both = routed(Where::RemoteLocal, Where::RemoteLocal);
     let mut places: Vec<Place> = both
-        .find_by_title("Shared Title", &TitleScope::Global)
+        .find_by_title("Shared Title", &TitleScope::Global, crate::store::Visibility::Live)
         .expect("find")
         .iter()
         .map(|doc| ids::place_of(doc.id))
@@ -89,7 +89,7 @@ fn a_title_is_found_in_every_place_that_shows_its_kind_and_the_ids_carry_the_pla
     // Global documents are kept on this computer alone: the remote's are not shown.
     let mut local_only = routed(Where::RemoteLocal, Where::Local);
     let found = local_only
-        .find_by_title("shared title", &TitleScope::Global)
+        .find_by_title("shared title", &TitleScope::Global, crate::store::Visibility::Live)
         .expect("find");
     assert_eq!(
         found.iter().map(|doc| ids::place_of(doc.id)).collect::<Vec<_>>(),
@@ -97,7 +97,11 @@ fn a_title_is_found_in_every_place_that_shows_its_kind_and_the_ids_carry_the_pla
     );
 
     let linked = both
-        .find_by_title("local linked", &TitleScope::Repo(REPO.to_owned()))
+        .find_by_title(
+            "local linked",
+            &TitleScope::Repo(REPO.to_owned()),
+            crate::store::Visibility::Live,
+        )
         .expect("find");
     assert_eq!(linked.len(), 1);
     assert_eq!(ids::place_of(linked[0].id), Place::Local);
@@ -107,7 +111,7 @@ fn a_title_is_found_in_every_place_that_shows_its_kind_and_the_ids_carry_the_pla
 fn documents_sharing_chunks_come_from_every_place_with_tagged_ids() {
     let mut routed = routed(Where::RemoteLocal, Where::RemoteLocal);
     let found = routed
-        .docs_sharing_chunks(&["sha-alpha words".to_owned()])
+        .docs_sharing_chunks(&["sha-alpha words".to_owned()], crate::store::Visibility::Live)
         .expect("sharing");
 
     let mut places: Vec<Place> = found.iter().map(|(id, _)| ids::place_of(*id)).collect();

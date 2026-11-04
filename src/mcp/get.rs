@@ -172,6 +172,7 @@ fn chunk_text(store: &mut dyn KnowledgeStore, doc: i64, section: &Section) -> Re
             &Detail {
                 sections: false,
                 chunk: Some(section.chunk_id),
+                drafts: false,
             },
         )?
         .and_then(|detail| detail.chunk)
@@ -199,6 +200,7 @@ fn document(store: &mut dyn KnowledgeStore, visible: &Visible, doc: i64, budget:
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )?
         .ok_or_else(|| Failure::Message(format!("no document {}", doc_ref(doc))))?;
@@ -251,6 +253,7 @@ fn chunk_with_neighbors(
             &Detail {
                 sections: true,
                 chunk: Some(chunk),
+                drafts: false,
             },
         )?
         .ok_or_else(|| Failure::Message(format!("no document {}", doc_ref(doc))))?;

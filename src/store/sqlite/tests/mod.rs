@@ -3,6 +3,7 @@
 
 mod counters;
 mod documents;
+mod drafts;
 mod embeddings;
 mod files;
 mod listing;

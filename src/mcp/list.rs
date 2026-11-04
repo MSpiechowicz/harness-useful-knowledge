@@ -6,7 +6,7 @@ use super::Server;
 use super::reply::{cut, date};
 use super::scope::{NO_PROJECT, repository};
 use crate::search::render::{FRAME, LIST_TAG, block, doc_ref};
-use crate::store::{DocumentRow, KnowledgeStore, ListQuery, RepoFilter, Sort, StoreError, clean};
+use crate::store::{DocumentRow, KnowledgeStore, ListQuery, RepoFilter, Sort, StatusFilter, StoreError, clean};
 
 /// Documents per page.
 const PAGE: usize = 20;
@@ -87,6 +87,7 @@ fn collect(
         format: None,
         text: text.to_owned(),
         useful: None,
+        status: StatusFilter::Live,
         sort: Sort::Updated,
         descending: true,
         offset,

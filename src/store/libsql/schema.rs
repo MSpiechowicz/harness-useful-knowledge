@@ -15,7 +15,7 @@
 
 use super::sql::{Sql, args, query_row};
 use crate::store::StoreError;
-use crate::store::sqlite::sql_shared::{keyword_index, tables};
+use crate::store::sqlite::sql_shared::{keyword_index, review, tables};
 
 /// The schema version this server writes: how many entries [`MIGRATIONS`] has.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -56,8 +56,25 @@ INSERT INTO knowledge_meta (key, value) VALUES ('dims', '384'), ('generation', '
 "
 );
 
+/// Version 2: drafts and their review, the local file's tables (see
+/// [`crate::store::sqlite::sql_shared::review`]). Every document of version 1 stays live. The version
+/// in `knowledge_meta` is written by [`upgrade`].
+const V2: &str = review!();
+
 /// The migrations in order: entry `n` takes a database from version `n` to `n + 1`.
-const MIGRATIONS: [&str; 1] = [V1];
+const MIGRATIONS: [&str; 2] = [V1, V2];
+
+/// Creates the tables of version 1 alone, for the tests of the migration.
+#[cfg(test)]
+pub(super) fn create_v1(db: &mut dyn Sql) -> Result<(), StoreError> {
+    db.batch(V1)?;
+    db.execute(
+        "INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1')",
+        args![],
+    )?;
+
+    Ok(())
+}
 
 /// The version of the database: `None` when it has no knowledge tables yet.
 pub(super) fn version(db: &mut dyn Sql) -> Result<Option<i64>, StoreError> {

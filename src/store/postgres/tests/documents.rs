@@ -32,6 +32,7 @@ fn team_a_document_comes_back_with_its_chunks_links_and_counts() {
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )
         .expect("get")
@@ -61,6 +62,7 @@ fn team_a_chunk_is_read_whole_only_from_its_own_document() {
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )
         .expect("get")
@@ -75,6 +77,7 @@ fn team_a_chunk_is_read_whole_only_from_its_own_document() {
             &Detail {
                 sections: false,
                 chunk: Some(chunk_id),
+                drafts: false,
             },
         )
         .expect("get")
@@ -88,6 +91,7 @@ fn team_a_chunk_is_read_whole_only_from_its_own_document() {
         &Detail {
             sections: false,
             chunk: Some(chunk_id),
+            drafts: false,
         },
     );
     assert!(matches!(wrong, Err(StoreError::NotFound(_))));
@@ -211,19 +215,29 @@ fn team_documents_are_found_by_content_hash_and_by_source() {
     );
 
     let by_source = store
-        .find_by_source_key("/docs/guide.md")
+        .find_by_source_key("/docs/guide.md", crate::store::Visibility::Live)
         .expect("find")
         .expect("found");
     assert_eq!(by_source.id, id);
 
     let by_content = store
-        .find_by_content_sha(&by_source.content_sha256)
+        .find_by_content_sha(&by_source.content_sha256, crate::store::Visibility::Live)
         .expect("find")
         .expect("found");
     assert_eq!(by_content.id, id);
 
-    assert!(store.find_by_source_key("/docs/missing.md").expect("find").is_none());
-    assert!(store.find_by_content_sha("nope").expect("find").is_none());
+    assert!(
+        store
+            .find_by_source_key("/docs/missing.md", crate::store::Visibility::Live)
+            .expect("find")
+            .is_none()
+    );
+    assert!(
+        store
+            .find_by_content_sha("nope", crate::store::Visibility::Live)
+            .expect("find")
+            .is_none()
+    );
 }
 
 #[test]
@@ -292,7 +306,7 @@ fn team_setting_links_replaces_them_and_merges_repeats() {
 }
 
 #[test]
-fn team_renaming_changes_what_the_keyword_index_finds_and_not_the_import_time() {
+fn team_renaming_changes_what_the_keyword_index_finds_and_keeps_who_wrote_it() {
     let Some(db) = database() else { return };
     let mut store = db.open();
     let id = insert(
@@ -301,16 +315,24 @@ fn team_renaming_changes_what_the_keyword_index_finds_and_not_the_import_time() 
     );
     assert_eq!(keyword_ids(&mut store, "alpha").len(), 1, "the title is indexed");
 
-    assert!(store.rename(id, "  Zulu\nhandbook ").expect("rename"));
+    assert!(store.rename(id, "  Zulu\nhandbook ", Some("Zed"), 500).expect("rename"));
 
     assert!(keyword_ids(&mut store, "alpha").is_empty());
     assert_eq!(keyword_ids(&mut store, "zulu").len(), 1);
 
     let doc = store.get(id, &Detail::default()).expect("get").expect("document").doc;
-    assert_eq!((doc.title.as_str(), doc.updated_at), ("Zulu handbook", 100));
+    assert_eq!(
+        (
+            doc.title.as_str(),
+            doc.updated_at,
+            doc.updated_by.map(|author| author.name)
+        ),
+        ("Zulu handbook", 500, None),
+        "a rename is a change of the title and its time, not of who wrote the content"
+    );
 
-    assert!(!store.rename(999_999, "Anything").expect("missing"));
-    assert!(matches!(store.rename(id, " "), Err(StoreError::Invalid(_))));
+    assert!(!store.rename(999_999, "Anything", None, 0).expect("missing"));
+    assert!(matches!(store.rename(id, " ", None, 0), Err(StoreError::Invalid(_))));
 }
 
 #[test]
@@ -371,7 +393,7 @@ fn team_every_write_grows_the_generation_and_reads_do_not() {
     let id = insert(&mut store, &Seed::new("Guide").chunk("A", "text"));
     assert_eq!(store.generation().expect("generation"), 1);
 
-    store.rename(id, "Guide 2").expect("rename");
+    store.rename(id, "Guide 2", None, 0).expect("rename");
     store.set_links(id, &[]).expect("links");
     store.set_meta("model_id", MODEL).expect("meta");
     store.delete(&[id]).expect("delete");
@@ -441,6 +463,7 @@ fn team_text_with_a_nul_character_is_stored_without_it() {
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )
         .expect("get")
@@ -479,6 +502,7 @@ fn team_a_document_of_many_chunks_goes_in_whole_with_its_vectors() {
             &Detail {
                 sections: true,
                 chunk: None,
+                drafts: false,
             },
         )
         .expect("get")

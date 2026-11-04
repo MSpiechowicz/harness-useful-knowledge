@@ -14,12 +14,12 @@ use mongodb::sync::Database;
 
 use super::connection;
 use super::ctx::{Ctx, Fail};
-use super::documents::document;
+use super::documents::{document, seen, seen_chunks};
 use super::schema::{CHUNKS, DOCUMENTS};
 use super::{MongoStore, int, text};
 use crate::limits::SHARED_SHAS_MAX;
 use crate::store::quality::{TITLE_SCAN_MAX, matching_titles};
-use crate::store::{Document, StoreError, TitleScope};
+use crate::store::{Document, StoreError, TitleScope, Visibility};
 
 /// How long a counter write may take before the caller moves on.
 #[cfg(not(test))]
@@ -35,12 +35,18 @@ const COUNT_BUDGET: Duration = Duration::from_millis(1800);
 /// at all is cut off by the heartbeat of the counting client (see [`super::open::bound_counting`]).
 pub(super) const COUNT_SERVER_BUDGET: Duration = Duration::from_millis(1500);
 
-/// The documents of `scope` whose title equals `title`, by id.
-pub(super) fn by_title(ctx: &mut Ctx<'_>, title: &str, scope: &TitleScope) -> Result<Vec<Document>, Fail> {
-    let filter = match scope {
+/// The documents of `scope` that `visibility` lets through and whose title equals `title`, by id.
+pub(super) fn by_title(
+    ctx: &mut Ctx<'_>,
+    title: &str,
+    scope: &TitleScope,
+    visibility: Visibility,
+) -> Result<Vec<Document>, Fail> {
+    let mut filter = match scope {
         TitleScope::Global => doc! { "global": true },
         TitleScope::Repo(key) => doc! { "repo_keys": key },
     };
+    filter.extend(seen(visibility));
     let limit = i64::try_from(TITLE_SCAN_MAX).unwrap_or(i64::MAX);
     let rows = ctx.find(DOCUMENTS, filter, (doc! { "_id": 1 }, 0, limit), doc! { "title": 1 })?;
 
@@ -63,8 +69,9 @@ pub(super) fn by_title(ctx: &mut Ctx<'_>, title: &str, scope: &TitleScope) -> Re
     Ok(rows.iter().map(document).collect::<Result<_, StoreError>>()?)
 }
 
-/// Each document with a chunk whose hash is in `shas`, with how many distinct ones.
-pub(super) fn sharing(ctx: &mut Ctx<'_>, shas: &[String]) -> Result<Vec<(i64, usize)>, Fail> {
+/// Each document `visibility` lets through with a chunk whose hash is in `shas`, with how many
+/// distinct ones (the chunks say which review state they are in).
+pub(super) fn sharing(ctx: &mut Ctx<'_>, shas: &[String], visibility: Visibility) -> Result<Vec<(i64, usize)>, Fail> {
     if shas.len() > SHARED_SHAS_MAX {
         return Err(StoreError::Invalid(format!("at most {SHARED_SHAS_MAX} chunk hashes at once")).into());
     }
@@ -73,10 +80,13 @@ pub(super) fn sharing(ctx: &mut Ctx<'_>, shas: &[String]) -> Result<Vec<(i64, us
         return Ok(Vec::new());
     }
 
+    let mut wanted = doc! { "chunk_sha": { "$in": shas } };
+    wanted.extend(seen_chunks(visibility));
+
     let rows = ctx.aggregate(
         CHUNKS,
         vec![
-            doc! { "$match": { "chunk_sha": { "$in": shas } } },
+            doc! { "$match": wanted },
             doc! { "$group": { "_id": { "doc": "$doc_id", "sha": "$chunk_sha" } } },
             doc! { "$group": { "_id": "$_id.doc", "shared": { "$sum": 1 } } },
             doc! { "$sort": { "_id": 1 } },
@@ -189,9 +199,10 @@ fn update_counters(db: &Database, filter: Row, update: Row) -> Result<(), StoreE
     }
 }
 
-/// Selects the documents `ids` whose counter `field` a `$inc` can still raise: a missing one
+/// Selects the live documents `ids` whose counter `field` a `$inc` can still raise: a missing one
 /// (created at 1), or a number below the largest integer. A hand-edited value of another type, or
-/// one at the end, is skipped instead of failing the whole write.
+/// one at the end, is skipped instead of failing the whole write. A draft or a pending version is
+/// never counted.
 fn countable(ids: &[i64], field: &str) -> Row {
     let mut missing = Row::new();
     missing.insert(field, doc! { "$exists": false });
@@ -199,7 +210,7 @@ fn countable(ids: &[i64], field: &str) -> Row {
     let mut below = Row::new();
     below.insert(field, doc! { "$type": "number", "$lt": i64::MAX });
 
-    doc! { "_id": { "$in": ids }, "$or": [missing, below] }
+    doc! { "_id": { "$in": ids }, "status": "live", "$or": [missing, below] }
 }
 
 impl MongoStore {
@@ -208,7 +219,7 @@ impl MongoStore {
     /// it writes on a thread of its own, which a late write is left running on (a new counter is
     /// dropped meanwhile, in the whole process), so a stalled database never holds up the caller.
     fn count(&mut self, ids: &[i64], field: &str, update: Row) -> Result<(), StoreError> {
-        if self.newer {
+        if self.newer.get() {
             return Err(StoreError::NewerSchema);
         }
 

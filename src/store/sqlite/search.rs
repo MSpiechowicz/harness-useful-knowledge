@@ -17,7 +17,7 @@ use super::documents::decode;
 use super::meta;
 use super::sql_shared::{fts_query, keyword_sql, linked_globs, visible};
 use crate::limits::CANDIDATES_MAX;
-use crate::store::{ChunkHit, DIMS, Scope, StoreError};
+use crate::store::{ChunkHit, DIMS, Scope, Status, StoreError};
 
 /// The scope as its two statement parameters: whether every document is visible, and the
 /// repository whose links are read.
@@ -36,7 +36,7 @@ pub(super) fn keyword_top_k(
     };
 
     let (all, repo) = bindings(scope);
-    let sql = keyword_sql();
+    let sql = keyword_sql(scope.drafts);
 
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(params![fts, all, repo, limit(k)], hit)?;
@@ -62,7 +62,7 @@ pub(super) fn vector_top_k(
         "SELECT c.id, c.embedding
          FROM knowledge_chunks c JOIN knowledge_documents d ON d.id = c.doc_id
          WHERE c.embedding IS NOT NULL AND (?3 IS NULL OR c.model_id = ?3) AND {visible}",
-        visible = visible(1, 2),
+        visible = visible(1, 2, scope.drafts),
     ))?;
 
     let mut rows = scan.query(params![all, repo, model])?;
@@ -82,25 +82,30 @@ pub(super) fn vector_top_k(
 
     scored
         .into_iter()
-        .filter_map(|(score, id)| chunk_hit(conn, id, score, repo).transpose())
+        .filter_map(|(score, id)| chunk_hit(conn, id, score, scope).transpose())
         .collect()
 }
 
-/// The chunk `id` as a hit with `score`; `None` when it is gone since the scan.
-fn chunk_hit(conn: &Connection, id: i64, score: f64, repo: Option<&str>) -> Result<Option<ChunkHit>, StoreError> {
+/// The chunk `id` as a hit with `score`; `None` when it is gone since the scan, or no longer in
+/// what `scope` sees (its document changed since the scan): the read-back applies the same
+/// visibility as the scan, so a row an agent may not see is never returned.
+pub(super) fn chunk_hit(conn: &Connection, id: i64, score: f64, scope: &Scope) -> Result<Option<ChunkHit>, StoreError> {
+    let (all, repo) = bindings(scope);
     let sql = format!(
-        "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text, ?3, d.updated_at, {globs}
+        "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text, ?3, d.updated_at, {globs}, d.status
          FROM knowledge_chunks c JOIN knowledge_documents d ON d.id = c.doc_id
-         WHERE c.id = ?1",
+         WHERE c.id = ?1 AND {visible}",
         globs = linked_globs(2),
+        visible = visible(4, 2, scope.drafts),
     );
 
-    Ok(conn.query_row(&sql, params![id, repo, score], hit).optional()?)
+    Ok(conn.query_row(&sql, params![id, repo, score, all], hit).optional()?)
 }
 
 /// A [`ChunkHit`] from the columns the two statements share.
 fn hit(row: &rusqlite::Row) -> rusqlite::Result<ChunkHit> {
     let globs: Option<String> = row.get(8)?;
+    let status: String = row.get(9)?;
 
     Ok(ChunkHit {
         chunk_id: row.get(0)?,
@@ -112,6 +117,8 @@ fn hit(row: &rusqlite::Row) -> rusqlite::Result<ChunkHit> {
         score: row.get(6)?,
         updated_at: row.get(7)?,
         repo_globs: globs.map(|globs| serde_json::from_str(&globs).unwrap_or_default()),
+        status: Status::parse(&status)
+            .ok_or_else(|| rusqlite::Error::InvalidColumnType(9, "status".to_owned(), rusqlite::types::Type::Text))?,
     })
 }
 

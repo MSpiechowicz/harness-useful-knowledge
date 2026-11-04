@@ -65,6 +65,81 @@ pub fn repo_key(raw: &str) -> Result<&str, StoreError> {
     }
 }
 
+/// Whether `key` names a folder on this computer (`path:`), which no team database may store.
+pub fn is_local_path(key: &str) -> bool {
+    key.starts_with(LOCAL_PATH_PREFIX)
+}
+
+/// The start of a repository key that is a folder on this computer.
+pub const LOCAL_PATH_PREFIX: &str = "path:";
+
+/// The comment of the event a document gets when the folder links it had are taken out of a team
+/// database and nothing else links it: it is a draft then, not a global document.
+pub const FOLDER_LINK_REMOVED: &str = "folder link removed";
+
+/// [`FOLDER_LINK_REMOVED`] for a live document that had a pending update, which went with it.
+pub const FOLDER_LINK_REMOVED_PENDING: &str = "folder link removed, its pending update was dropped";
+
+/// What a writer says on opening a team database that held folders of this computer: `removed`
+/// links were taken out, or `left` could not be (the database is read-only for this user, a writer
+/// will). Never a key.
+pub fn report_local_paths(removed: usize, left: usize) {
+    if removed > 0 {
+        eprintln!("harness-knowledge: removed {removed} link(s) to folders of this computer from the team database");
+    }
+
+    if left > 0 {
+        eprintln!(
+            "harness-knowledge: {left} link(s) to folders of this computer remain in the team database: it is read-only for this user, a teammate who can write will remove them"
+        );
+    }
+}
+
+/// Whether `key` is a source key built from a folder of this computer (`path-` and a hash, see
+/// `import::walk`), which no team database is asked about.
+pub fn is_local_source_key(key: &str) -> bool {
+    key.starts_with(LOCAL_SOURCE_PREFIX)
+}
+
+/// The start of a source key that stands for a folder of this computer.
+pub const LOCAL_SOURCE_PREFIX: &str = "path-";
+
+/// Refuses `links` that name a folder on this computer, for a team database: only a `git:` key
+/// leaves this computer. The message names the folder (the last part of its path) and never the
+/// path itself.
+pub fn refuse_local_paths(links: &[Link]) -> Result<(), StoreError> {
+    let Some(link) = links.iter().find(|link| is_local_path(&link.repo_key)) else {
+        return Ok(());
+    };
+
+    Err(StoreError::LocalPath(local_path_message(&link.repo_key)))
+}
+
+/// Why a team document cannot be linked to the `path:` key `key`, naming only its folder.
+pub fn local_path_message(key: &str) -> String {
+    let rest = key.strip_prefix(LOCAL_PATH_PREFIX).unwrap_or(key);
+    let folder = rest
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .map(line)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "the folder".to_owned());
+
+    format!(
+        "{folder} has no git remote, so a team document cannot be linked to it (only a git: project key leaves this computer)"
+    )
+}
+
+/// [`links`] for a team database: the same checks, and a repository that is a folder on this
+/// computer refused (see [`refuse_local_paths`]), before anything is written.
+pub fn team_links(raw: &[Link]) -> Result<Vec<Link>, StoreError> {
+    let checked = links(raw)?;
+    refuse_local_paths(&checked)?;
+
+    Ok(checked)
+}
+
 /// `links` checked and merged: at most [`LINKS_MAX`] repositories, each with at most
 /// [`GLOBS_MAX`] globs of 1 to [`GLOB_MAX`] characters that compile (see [`glob`]).
 pub fn links(links: &[Link]) -> Result<Vec<Link>, StoreError> {

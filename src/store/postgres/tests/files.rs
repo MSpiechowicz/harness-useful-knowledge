@@ -27,7 +27,10 @@ fn team_opening_creates_the_schema_and_reopening_keeps_the_data() {
             .title,
         "Guide"
     );
-    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(
+        again.meta("schema_version").expect("meta").as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
     assert_eq!(again.generation().expect("generation"), 1);
     assert!(again.pgvector().is_some_and(|version| version.has_hnsw()));
@@ -46,7 +49,11 @@ fn team_reading_and_changing_never_create_the_schema_and_creating_does() {
         db.tables(),
         [
             "knowledge_chunks",
+            "knowledge_doc_comments",
+            "knowledge_doc_events",
+            "knowledge_doc_files",
             "knowledge_doc_links",
+            "knowledge_doc_snapshots",
             "knowledge_documents",
             "knowledge_meta"
         ]
@@ -191,5 +198,5 @@ fn team_servers_starting_together_migrate_once() {
         .expect("count")
         .get(0);
     assert_eq!(rows, 1);
-    assert_eq!(db.tables().len(), 4);
+    assert_eq!(db.tables().len(), 8);
 }

@@ -58,7 +58,15 @@ impl Kinds {
                 None => {
                     let allowed = match &hit.repo_globs {
                         Some(_) => self.repository,
-                        None => match store.get(hit.doc_id, &Detail::default())? {
+                        // The hit was visible to the search that found it, so its document is read
+                        // whatever its state.
+                        None => match store.get(
+                            hit.doc_id,
+                            &Detail {
+                                drafts: true,
+                                ..Detail::default()
+                            },
+                        )? {
                             Some(found) => self.allows(Kind::of(found.links.len())),
                             None => false,
                         },

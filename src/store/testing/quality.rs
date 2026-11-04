@@ -38,6 +38,7 @@ pub fn rows(store: &mut dyn KnowledgeStore) -> Vec<DocumentRow> {
             descending: false,
             offset: 0,
             limit: 50,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list")
         .items
@@ -61,6 +62,7 @@ fn page(
             descending,
             offset,
             limit,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list")
 }
@@ -182,12 +184,15 @@ pub fn authors_contract(store: &mut dyn KnowledgeStore) {
     );
 
     // Relinking and renaming change neither.
-    assert!(store.rename(id, "Guide v2").expect("rename"));
+    assert!(store.rename(id, "Guide v2", None, 0).expect("rename"));
     let stored = read(store, id).doc;
     assert_eq!((stored.added_by, stored.updated_by), (ada.clone(), None));
 
     // The lookups an import makes, and the list, show the same.
-    let found = store.find_by_source_key(&doc.source_key).expect("find").expect("found");
+    let found = store
+        .find_by_source_key(&doc.source_key, crate::store::Visibility::Live)
+        .expect("find")
+        .expect("found");
     assert_eq!(found.added_by, ada);
 
     let listed = rows(store);
@@ -281,7 +286,7 @@ pub fn titles_contract(store: &mut dyn KnowledgeStore) {
 
     let ids = |store: &mut dyn KnowledgeStore, title: &str, scope: &TitleScope| -> Vec<i64> {
         store
-            .find_by_title(title, scope)
+            .find_by_title(title, scope, crate::store::Visibility::Live)
             .expect("find by title")
             .iter()
             .map(|doc: &Document| doc.id)
@@ -314,7 +319,11 @@ pub fn titles_contract(store: &mut dyn KnowledgeStore) {
 
     // The document comes back whole.
     let found = store
-        .find_by_title("setup guide", &TitleScope::Repo(TWO.to_owned()))
+        .find_by_title(
+            "setup guide",
+            &TitleScope::Repo(TWO.to_owned()),
+            crate::store::Visibility::Live,
+        )
         .expect("find");
     assert_eq!(found[0].source_key, "/two");
 }
@@ -340,7 +349,9 @@ pub fn shared_chunks_contract(store: &mut dyn KnowledgeStore) {
     let shared = |store: &mut dyn KnowledgeStore, shas: &[&str]| -> Vec<(i64, usize)> {
         let shas: Vec<String> = shas.iter().map(|sha| (*sha).to_owned()).collect();
 
-        store.docs_sharing_chunks(&shas).expect("docs sharing chunks")
+        store
+            .docs_sharing_chunks(&shas, crate::store::Visibility::Live)
+            .expect("docs sharing chunks")
     };
 
     assert_eq!(shared(store, &["sha-alpha", "sha-beta"]), [(a, 2), (b, 1), (c, 1)]);
@@ -355,7 +366,7 @@ pub fn shared_chunks_contract(store: &mut dyn KnowledgeStore) {
 
     let too_many: Vec<String> = (0..=SHARED_SHAS_MAX).map(|n| format!("sha-{n}")).collect();
     assert!(matches!(
-        store.docs_sharing_chunks(&too_many),
+        store.docs_sharing_chunks(&too_many, crate::store::Visibility::Live),
         Err(StoreError::Invalid(_))
     ));
 }
@@ -379,7 +390,7 @@ pub fn absent_columns_contract(store: &mut dyn KnowledgeStore, id: i64) {
     );
 
     let found = store
-        .find_by_source_key(&detail.doc.source_key)
+        .find_by_source_key(&detail.doc.source_key, crate::store::Visibility::Live)
         .expect("find")
         .expect("found");
     assert_eq!(found.added_by, None);

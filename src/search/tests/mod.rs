@@ -209,7 +209,8 @@ fn a_search_sees_the_global_documents_and_its_own_repositorys() {
             &mut store,
             &Scope {
                 repo: Some(key("git:h/o/a")),
-                include_other_repos: true
+                include_other_repos: true,
+                drafts: false,
             }
         ),
         ["Global", "Repo A", "Repo B"],
@@ -230,6 +231,7 @@ fn the_repository_of_the_search_ranks_first_and_a_matching_glob_ranks_before_it(
     let scope = Scope {
         repo: Some(key("git:h/o/a")),
         include_other_repos: true,
+        drafts: false,
     };
     let mut fake = Fake::answering(axis(0));
 

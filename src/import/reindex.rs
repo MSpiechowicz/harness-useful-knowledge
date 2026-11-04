@@ -50,7 +50,18 @@ pub fn run(
         Which::All => None,
         Which::Ids(ids) => {
             for id in ids {
-                if store.get(*id, &Detail::default())?.is_none() {
+                // The person's command: a draft or a pending version is reindexed too, and stays
+                // what it is (only the vectors of its chunks change).
+                if store
+                    .get(
+                        *id,
+                        &Detail {
+                            drafts: true,
+                            ..Detail::default()
+                        },
+                    )?
+                    .is_none()
+                {
                     done.failed.push((*id, format!("document {id} not found")));
                 }
             }

@@ -35,7 +35,7 @@ fn opening_creates_the_file_and_the_schema_and_reopening_keeps_the_data() {
             .title,
         "Guide"
     );
-    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("2"));
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
 }
 

@@ -11,6 +11,9 @@
 //!   none is dropped. A file is at most [`HELD_FILE_MAX`] bytes.
 //! - Proposing the same text again, with the same title, links and replacement, finds the proposal
 //!   already waiting and returns its id.
+//! - A reviewer may ask for changes ([`ChangesRequested`], with a comment): the proposal waits on, marked, and
+//!   a later proposal of the same session that names it ([`HeldStore::hold_named`]) or has its title
+//!   replaces it in place, keeping its id, so the review goes on where it stopped.
 //! - Approving or rejecting claims the proposal first ([`HeldStore::claim`]): its file is renamed to
 //!   a claim name in the same folder, so two decisions about one proposal cannot both be carried out.
 //! - Proposals and half-written files older than 30 days are swept.
@@ -95,8 +98,24 @@ pub struct HeldItem {
     /// [`Self::digest`], so a file with or without it has the revision it always had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<String>,
+    /// What a reviewer asked to change, once one did. Part of the [`Self::digest`], so a decision
+    /// made on the proposal as it was shown is refused after the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_requested: Option<ChangesRequested>,
     /// The [`Self::digest`] of the content, set when it is held.
     pub revision: String,
+}
+
+/// A reviewer asked for changes to a proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesRequested {
+    /// What to change, one line of at most 500 characters.
+    pub comment: String,
+    /// RFC 3339.
+    pub at: String,
+    /// The git `user.name` of the reviewer, when one was known.
+    pub by: Option<String>,
 }
 
 /// What identifies the document a proposal replaces: its text and the key it was imported under.
@@ -152,7 +171,18 @@ impl HeldItem {
             replaces: proposal.replaces,
             replaced: proposal.replaced,
             added_by: None,
+            changes_requested: None,
             revision: String::new(),
+        }
+    }
+
+    /// The state the proposal is in, as `held list` shows it: `waiting` for the person's decision,
+    /// or `changesRequested` while the agent is asked to rework it.
+    pub fn status(&self) -> &'static str {
+        if self.changes_requested.is_some() {
+            "changesRequested"
+        } else {
+            "waiting"
         }
     }
 
@@ -200,6 +230,24 @@ impl HeldItem {
             .or_else(|| std::env::current_dir().ok())?;
 
         author::resolve(env, &dir)
+    }
+
+    /// True when this proposal, which has requested changes, is the one `new` answers: `named` is
+    /// its id, or (no name) the title is the same. Both need a session and the same one: two
+    /// proposals that name none are not known to come from one conversation.
+    fn is_answered_by(&self, new: &Self, named: Option<&str>) -> bool {
+        if self.changes_requested.is_none() {
+            return false;
+        }
+
+        match named {
+            Some(id) => self.held_id == id && self.session.is_some() && self.session == new.session,
+            None => {
+                self.session.is_some()
+                    && self.session == new.session
+                    && self.title.trim().to_lowercase() == new.title.trim().to_lowercase()
+            }
+        }
     }
 
     /// The same proposal as `other` (a retry): same text, title, format, links and replacement (the

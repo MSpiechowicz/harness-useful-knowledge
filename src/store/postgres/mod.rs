@@ -8,7 +8,10 @@
 //! Every write runs in a transaction that first takes one advisory lock, so writers queue like
 //! they do on the SQLite file and two writers cannot deadlock on the rows they share. The
 //! transaction also re-reads the schema version under the shared migration lock, so a client stops
-//! writing as soon as a newer server migrates the database, not only when it connects. Sessions
+//! writing as soon as a newer server migrates the database, not only when it connects. Every read
+//! re-reads it too (one primary-key lookup in front of the read, see [`PostgresStore::read`]), so a
+//! client connected before a newer server migrated stops reading as well: a version that keeps
+//! drafts apart from live documents must not be read by one that does not know them. Sessions
 //! set a lock, statement and idle-in-transaction timeout, so a stuck client cannot hold the others
 //! for long.
 //!
@@ -33,6 +36,7 @@ mod listing;
 mod meta;
 mod probe;
 mod quality;
+mod review;
 pub mod schema;
 mod search;
 mod session;
@@ -51,12 +55,16 @@ use schema::{READABLE_FROM, SCHEMA_VERSION, SchemaState};
 use vector::Version;
 pub use vector::{Fault, Problem};
 
+use super::review::{
+    COMMENT_BODY_MAX, actor, check_change, check_comments, check_file_size, comment_body, file_name, file_sha,
+};
 use super::upgrade::{Plan, plan};
 use super::{
     Chunk, ChunkHit, ChunkMatches, Columns, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link,
     ListQuery,
 };
-use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
+use super::{Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply};
+use super::{Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility, clean};
 use crate::backend::{Access, OpenError, Opened, Upgrade};
 use crate::config::Secrets;
 use error::{backend, ended};
@@ -141,13 +149,45 @@ impl PostgresStore {
             open_columns(&mut client, access)?
         };
 
-        Ok(Opened::Ready(Some(Self {
+        let mut store = Self {
             settings,
             client,
             newer,
             pgvector,
             columns,
-        })))
+        };
+
+        // A writer takes out what an earlier version let in: a team database keeps no folder of
+        // this computer. A reader, or a role that may not write, leaves it for a writer.
+        if matches!(access, Access::Existing | Access::Create) && !store.newer {
+            store.clean_local_paths();
+        }
+
+        Ok(Opened::Ready(Some(store)))
+    }
+
+    /// Deletes every link to a folder of this computer (a `path:` key): a team database keeps only
+    /// `git:` repositories. Idempotent, and a plain look when there is nothing to delete. The
+    /// number of links deleted.
+    pub fn drop_local_paths(&mut self) -> Result<usize, StoreError> {
+        if self.read(documents::count_local_paths)? == 0 {
+            return Ok(0);
+        }
+
+        self.write_if(|tx| documents::drop_local_paths(tx))
+    }
+
+    /// [`Self::drop_local_paths`] on opening, saying on stderr what it did or could not do (a
+    /// read-only role sees that line on each open, and nothing else changes for it).
+    fn clean_local_paths(&mut self) {
+        match self.drop_local_paths() {
+            Ok(removed) => clean::report_local_paths(removed, 0),
+            Err(_) => {
+                let left = self.read(documents::count_local_paths).unwrap_or(0);
+
+                clean::report_local_paths(0, left);
+            }
+        }
     }
 
     /// True when the database was written by a newer server.
@@ -179,17 +219,34 @@ impl PostgresStore {
     }
 
     /// Runs the read `operation` on a live client, once more after reconnecting when it failed
-    /// because the connection closed meanwhile.
+    /// because the connection closed meanwhile. The schema version is read first, every time: a
+    /// database a newer server migrated meanwhile fails the read with [`StoreError::NewerSchema`]
+    /// (and every later call, see [`Self::ready`]). The client is synchronous, so the check is a
+    /// lookup of its own in front of the read, not a column of it.
     fn read<T>(&mut self, mut operation: impl FnMut(&mut Client) -> Result<T, StoreError>) -> Result<T, StoreError> {
         self.ready()?;
 
-        match operation(&mut self.client) {
+        let mut checked = |client: &mut Client| {
+            if schema::current_version(client)?.is_some_and(|found| found > SCHEMA_VERSION) {
+                return Err(StoreError::NewerSchema);
+            }
+
+            operation(client)
+        };
+
+        let result = match checked(&mut self.client) {
             Err(error) if self.client.is_closed() || ended(&error) => {
                 self.client = session::open(&self.settings)?;
-                operation(&mut self.client)
+                checked(&mut self.client)
             }
             other => other,
+        };
+
+        if matches!(result, Err(StoreError::NewerSchema)) {
+            self.newer = true;
         }
+
+        result
     }
 
     /// Runs `operation` in a write transaction (see [`transact`]). It runs once more after
@@ -197,6 +254,15 @@ impl PostgresStore {
     fn write<T>(
         &mut self,
         mut operation: impl FnMut(&mut Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.write_if(|tx| operation(tx).map(|done| (done, true)))
+    }
+
+    /// [`Self::write`] for an `operation` that says whether it changed anything: a refusal commits
+    /// nothing and does not count as a write (the generation stays).
+    fn write_if<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut Transaction<'_>) -> Result<(T, bool), StoreError>,
     ) -> Result<T, StoreError> {
         self.ready()?;
 
@@ -232,11 +298,11 @@ enum Failure {
 
 /// One write attempt: a transaction that takes [`WRITE_LOCK`] (and [`schema::MIGRATE_LOCK`]
 /// shared), fails with [`StoreError::NewerSchema`] when a newer server migrated the database
-/// meanwhile, runs `operation`, counts the write and commits. A failure drops the transaction,
-/// which rolls it back.
+/// meanwhile, runs `operation`, counts the write (when `operation` changed anything) and commits. A
+/// failure drops the transaction, which rolls it back.
 fn transact<T>(
     client: &mut Client,
-    operation: &mut impl FnMut(&mut Transaction<'_>) -> Result<T, StoreError>,
+    operation: &mut impl FnMut(&mut Transaction<'_>) -> Result<(T, bool), StoreError>,
 ) -> Result<T, Failure> {
     let before = |error: postgres::Error| Failure::BeforeCommit(backend(error));
 
@@ -255,8 +321,12 @@ fn transact<T>(
         return Err(Failure::BeforeCommit(StoreError::NewerSchema));
     }
 
-    let result = operation(&mut tx).map_err(Failure::BeforeCommit)?;
-    meta::bump(&mut tx).map_err(Failure::BeforeCommit)?;
+    let (result, changed) = operation(&mut tx).map_err(Failure::BeforeCommit)?;
+
+    if changed {
+        meta::bump(&mut tx).map_err(Failure::BeforeCommit)?;
+    }
+
     tx.commit().map_err(|error| Failure::AtCommit(backend(error)))?;
 
     Ok(result)
@@ -296,13 +366,27 @@ impl KnowledgeStore for PostgresStore {
         self.write(|tx| meta::set(tx, key, value))
     }
 
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        for (key, _) in entries {
+            meta::check_settable(key)?;
+        }
+
+        self.write(|tx| {
+            for (key, value) in entries {
+                meta::set(tx, key, value)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn generation(&mut self) -> Result<i64, StoreError> {
         self.read(meta::generation)
     }
 
     fn put_document(&mut self, doc: &Document, chunks: &[Chunk], links: &[Link]) -> Result<i64, StoreError> {
         let title = clean::title(&doc.title)?;
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
         clean::chunks(chunks)?;
 
         let columns = self.columns;
@@ -315,16 +399,21 @@ impl KnowledgeStore for PostgresStore {
         })
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
         let columns = self.columns;
 
-        self.read(|client| documents::find(client, columns, "content_sha256", sha))
+        self.read(|client| documents::find(client, columns, "content_sha256", sha, visibility))
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        // A folder of this computer is not asked about here.
+        if clean::is_local_source_key(key) {
+            return Ok(None);
+        }
+
         let columns = self.columns;
 
-        self.read(|client| documents::find(client, columns, "source_key", key))
+        self.read(|client| documents::find(client, columns, "source_key", key, visibility))
     }
 
     fn reusable_embeddings(
@@ -357,14 +446,27 @@ impl KnowledgeStore for PostgresStore {
         self.count_useful(ids, at)
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
+        if scope.is_local_path() {
+            return Ok(Vec::new());
+        }
+
         let columns = self.columns;
 
-        self.read(|client| quality::by_title(client, columns, title, scope))
+        self.read(|client| quality::by_title(client, columns, title, scope, visibility))
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
-        self.read(|client| quality::sharing(client, chunk_shas))
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|client| quality::sharing(client, chunk_shas, visibility))
     }
 
     /// Whether this role has the UPDATE privilege on the documents; `None` when the probe fails.
@@ -373,15 +475,15 @@ impl KnowledgeStore for PostgresStore {
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
 
         self.write(|tx| documents::set_links(tx, id, &links))
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         let title = clean::title(title)?;
 
-        self.write(|tx| documents::rename(tx, id, &title))
+        self.write(|tx| documents::rename(tx, id, &title, by, at))
     }
 
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
@@ -389,6 +491,14 @@ impl KnowledgeStore for PostgresStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+        // A team database holds no link to a folder of this computer, and is not asked for one.
+        if query.filter.is_local_path() {
+            return Ok(DocumentPage {
+                items: Vec::new(),
+                total: 0,
+            });
+        }
+
         let columns = self.columns;
 
         self.read(|client| listing::list(client, columns, query))
@@ -401,13 +511,123 @@ impl KnowledgeStore for PostgresStore {
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         self.read(|client| search::keyword_top_k(client, query, scope, k))
     }
 
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         let pgvector = self.pgvector;
 
         self.read(|client| search::vector_top_k(client, pgvector, vector, scope, k))
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        let columns = self.columns;
+
+        self.read(|client| Ok(documents::pending_of_many(client, columns, &[id])?.remove(&id)))
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        let (by, comment) = check_change(change)?;
+
+        self.write_if(|tx| review::set_review(tx, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        if !change.action.goes_live() {
+            return Err(StoreError::Invalid("only approving or going live promotes".to_owned()));
+        }
+
+        let (by, comment) = check_change(change)?;
+        let columns = self.columns;
+
+        self.write_if(|tx| review::promote(tx, columns, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        self.read(|client| review::history(client, id))
+    }
+
+    fn authorship_of(
+        &mut self,
+        ids: &[i64],
+        per_doc: usize,
+    ) -> Result<HashMap<i64, crate::store::Authorship>, StoreError> {
+        self.read(|client| review::authorship_of(client, ids, per_doc))
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        self.read(|client| review::writers_since_live(client, id))
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|client| review::section_texts(client, id))
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|client| review::asked_sections(client, id, revision))
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        let comments = check_comments(comments)?;
+        let by = actor(by);
+
+        self.write(|tx| review::add_comments(tx, id, by.as_deref(), at, revision, &comments))
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let body = comment_body(body, COMMENT_BODY_MAX)?;
+        let by = actor(by);
+
+        self.write_if(|tx| review::reply_comment(tx, id, parent, by.as_deref(), at, &body))
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let by = actor(by);
+
+        self.write_if(|tx| review::resolve_comment(tx, id, comment, resolved, by.as_deref(), at))
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.write_if(|tx| review::delete_comment(tx, id, comment))
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        self.read(|client| review::comments(client, id))
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        let name = file_name(name)?;
+        check_file_size(bytes)?;
+        let sha256 = file_sha(bytes);
+
+        self.write_if(|tx| review::put_file(tx, id, &name, bytes, &sha256))
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        self.read(|client| review::file(client, id))
     }
 
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {

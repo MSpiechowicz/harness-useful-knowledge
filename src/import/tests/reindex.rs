@@ -16,6 +16,7 @@ fn chunk_ids(db: &mut SqliteStore, id: i64) -> Vec<i64> {
     let detail = Detail {
         sections: true,
         chunk: None,
+        drafts: false,
     };
 
     db.get(id, &detail)

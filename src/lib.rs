@@ -25,6 +25,7 @@
 //! - [`mcp`]: the MCP server (`knowledge_search`, `knowledge_get`, `knowledge_list`, `knowledge_add`).
 //! - [`project`]: which repository a call is about.
 //! - [`recall`]: `recall --hook`, the pointers a prompt gets.
+//! - [`review`]: the policy of drafts and team approval: who may ask, approve, request changes or go live.
 //! - [`search`]: one query through the keyword index and the vectors, fused and ranked, and the
 //!   untrusted-documentation wrapping of what it finds.
 //! - [`store`]: what a backend stores and answers, the local SQLite file, the search fusion and ranking.
@@ -52,6 +53,7 @@ pub mod location;
 pub mod mcp;
 pub mod project;
 pub mod recall;
+pub mod review;
 pub mod search;
 pub mod store;
 pub mod support;

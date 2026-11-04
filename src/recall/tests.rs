@@ -25,7 +25,7 @@ pub(super) fn answering(vector: Vec<f32>) -> Box<Fake> {
     })
 }
 
-fn down() -> Box<Fake> {
+pub(super) fn down() -> Box<Fake> {
     Box::new(Fake {
         answer: Err("the embedder is not reachable (connection refused)".to_owned()),
         asked: Default::default(),

@@ -137,6 +137,7 @@ mod tests {
                 score: 0.0,
                 updated_at: 0,
                 repo_globs: globs.map(|globs| globs.iter().map(|glob| (*glob).to_owned()).collect()),
+                status: crate::store::Status::Live,
             },
             score,
         }

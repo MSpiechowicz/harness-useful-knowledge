@@ -8,7 +8,7 @@ use super::{PLAIN_URL_VAR, TestDb, URL_VAR, WAIT, insert, store};
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 use crate::store::mongo::probe::probe;
-use crate::store::mongo::schema::{CHUNKS, DOCUMENTS, IndexState, KEYWORD_INDEX, META, SCHEMA_VERSION, VECTOR_INDEX};
+use crate::store::mongo::schema::{CHUNKS, IndexState, KEYWORD_INDEX, META, SCHEMA_VERSION, VECTOR_INDEX};
 use crate::store::mongo::{MongoStore, SERVER_SELECTION_TIMEOUT, open_boxed};
 use crate::store::testing::{MODEL, Seed};
 use crate::store::{KnowledgeStore, ListQuery, RepoFilter, Sort, StoreError};
@@ -23,6 +23,7 @@ fn everything() -> ListQuery {
         descending: true,
         offset: 0,
         limit: 50,
+        status: crate::store::StatusFilter::All,
     }
 }
 
@@ -42,7 +43,7 @@ fn team_mongo_opening_creates_the_schema_and_the_indexes_and_reopening_keeps_the
             .title,
         "Guide"
     );
-    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("1"));
+    assert_eq!(again.meta("schema_version").expect("meta").as_deref(), Some("2"));
     assert_eq!(again.meta("dims").expect("meta").as_deref(), Some("384"));
     assert_eq!(again.database_name(), db.name);
     assert!(again.uses_transactions(), "a replica set runs writes in transactions");
@@ -67,7 +68,18 @@ fn team_mongo_opening_creates_the_schema_and_the_indexes_and_reopening_keeps_the
 
     let mut collections = db.raw().list_collection_names().run().expect("collections");
     collections.sort();
-    assert_eq!(collections, [CHUNKS, DOCUMENTS, META]);
+    assert_eq!(
+        collections,
+        [
+            "knowledge_chunks",
+            "knowledge_comments",
+            "knowledge_documents",
+            "knowledge_events",
+            "knowledge_files",
+            "knowledge_meta",
+            "knowledge_snapshots",
+        ]
+    );
     assert!(collections.iter().all(|name| name.starts_with("knowledge_")));
 }
 

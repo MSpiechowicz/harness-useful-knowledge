@@ -18,7 +18,7 @@ use super::documents::vector_text;
 use super::sql::{Row, Sql, Value, args};
 use crate::limits::CANDIDATES_MAX;
 use crate::store::sqlite::sql_shared::{fts_query, keyword_sql, linked_globs, visible};
-use crate::store::{ChunkHit, DIMS, Scope, StoreError};
+use crate::store::{ChunkHit, DIMS, Scope, Status, StoreError};
 
 /// How many nearest chunks of the index a vector search looks at, from the first try to the last.
 const WINDOWS: [usize; 3] = [CANDIDATES_MAX, CANDIDATES_MAX * 4, CANDIDATES_MAX * 16];
@@ -40,7 +40,7 @@ pub(super) fn keyword_top_k(
     };
 
     let (all, repo) = bindings(scope);
-    let rows = db.query(&keyword_sql(), args![fts, all, repo, limit(k)])?;
+    let rows = db.query(&keyword_sql(scope.drafts), args![fts, all, repo, limit(k)])?;
 
     rows.iter().map(hit).collect()
 }
@@ -61,7 +61,10 @@ pub(super) fn vector_top_k(
     let mut rows = Vec::new();
 
     for window in WINDOWS {
-        rows = db.query(&vector_sql(window), args![vector_text(vector), all, repo, limit(k)])?;
+        rows = db.query(
+            &vector_sql(window, scope.drafts),
+            args![vector_text(vector), all, repo, limit(k)],
+        )?;
 
         if rows.len() >= wanted {
             break;
@@ -95,10 +98,10 @@ fn embedded_chunks(db: &mut dyn Sql) -> Result<usize, StoreError> {
 /// The `window` nearest chunks of the index for `?1`, kept when they are in the scope `?2` (all) and `?3`
 /// (repository) and made by the current model (the one in the meta table, when it is set), the
 /// closest `?4` first. Columns as [`keyword_sql`].
-fn vector_sql(window: usize) -> String {
+fn vector_sql(window: usize, drafts: bool) -> String {
     format!(
         "SELECT c.id, c.doc_id, d.title, c.ordinal, c.heading_path, c.text,
-                1 - vector_distance_cos(c.embedding, vector32(?1)) AS similarity, d.updated_at, {globs}
+                1 - vector_distance_cos(c.embedding, vector32(?1)) AS similarity, d.updated_at, {globs}, d.status
          FROM vector_top_k('knowledge_chunks_vec', vector32(?1), {window}) nearest
          JOIN knowledge_chunks c ON c.id = nearest.id
          JOIN knowledge_documents d ON d.id = c.doc_id
@@ -107,7 +110,7 @@ fn vector_sql(window: usize) -> String {
          ORDER BY similarity DESC, c.id
          LIMIT ?4",
         globs = linked_globs(3),
-        visible = visible(2, 3),
+        visible = visible(2, 3, drafts),
     )
 }
 
@@ -125,6 +128,8 @@ fn hit(row: &Row) -> Result<ChunkHit, StoreError> {
         score: row.get(6)?,
         updated_at: row.get(7)?,
         repo_globs: globs.map(|globs| serde_json::from_str(&globs).unwrap_or_default()),
+        status: Status::parse(&row.get::<String>(9)?)
+            .ok_or_else(|| StoreError::Backend("unexpected value in column 9".to_owned()))?,
     })
 }
 
@@ -175,6 +180,7 @@ mod tests {
                         Value::Real(0.9),
                         Value::from(1_usize),
                         Value::Null,
+                        Value::from("live"),
                     ])
                 })
                 .collect())

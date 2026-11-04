@@ -54,6 +54,8 @@ struct Loaded {
     size: u64,
     file_sha: String,
     extracted: Extracted,
+    /// The file as read, kept as the original for Download.
+    bytes: Vec<u8>,
 }
 
 /// A file ready to be stored or compared.
@@ -67,6 +69,8 @@ pub(super) struct Prepared {
     /// The hash of the title and the text: a renamed document is another content.
     pub(super) content_sha: String,
     pub(super) source_key: String,
+    /// The file as read, which an import keeps as the document's original.
+    pub(super) bytes: Vec<u8>,
 }
 
 /// Reads `candidate`: `title` replaces the file's own, and the key the text names for itself is
@@ -124,6 +128,7 @@ pub(super) fn prepare(
         chunked,
         content_sha,
         source_key,
+        bytes: loaded.bytes,
     })
 }
 
@@ -178,6 +183,7 @@ fn load(candidate: &Candidate, pdf: &dyn PdfPages) -> Result<Loaded, Stop> {
         size: bytes.len() as u64,
         file_sha: sha256_hex(&bytes),
         extracted,
+        bytes,
     })
 }
 

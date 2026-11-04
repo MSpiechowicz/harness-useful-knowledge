@@ -9,10 +9,14 @@
 //! A SQLite without FTS5 cannot keep the keyword index: `ok` is false, `capabilities.keyword` too,
 //! `problem` is `no-fts5` with a `message`, and the exit code is 3. The team databases print the
 //! same JSON with their own problem codes, also exit 3.
+//!
+//! A database from an older server that was not upgraded yet is `problem` `not-upgraded` (exit 3)
+//! whatever the backend, with a `message` that says to run `harness-knowledge upgrade`: its search
+//! indexes and tables are those of the older version, so nothing else about it is reported.
 
 use serde_json::{Value, json};
 
-use super::{Context, Done, Failure, Reply};
+use super::{Context, Done, Failure, Reply, upgrade};
 use crate::backend::{self, Access};
 use crate::cli::Args;
 use crate::config::{Backend, Layout, Place};
@@ -134,7 +138,14 @@ fn local(context: &Context) -> Reply {
         });
     }
 
-    let (schema, model_id) = match context.open_place(Place::Local, Access::Read)? {
+    let opened = match context.open_place(Place::Local, Access::Read) {
+        Err(failure) if is_not_upgraded(&failure) => {
+            return Ok(not_upgraded(name, SCHEMA_VERSION, capabilities(false)));
+        }
+        other => other?,
+    };
+
+    let (schema, model_id) = match opened {
         Some(mut store) => {
             let schema = store
                 .meta("schema_version")?
@@ -163,6 +174,28 @@ fn capabilities(keyword: bool) -> Value {
     json!({ "keyword": keyword, "vector": true, "vectorIndex": "ready" })
 }
 
+/// The report of a database from an older server that was not upgraded yet: `problem` is
+/// `not-upgraded`, and the message says to run `harness-knowledge upgrade`. Exit 3.
+fn not_upgraded(name: &str, schema: i64, capabilities: Value) -> Done {
+    Done {
+        json: json!({
+            "ok": false,
+            "backend": name,
+            "schema": schema,
+            "capabilities": capabilities,
+            "model": { "dims": DIMS },
+            "problem": "not-upgraded",
+            "message": upgrade::NOT_UPGRADED_MESSAGE,
+        }),
+        code: 3,
+    }
+}
+
+/// Whether `failure` is a database that was not upgraded yet.
+fn is_not_upgraded(failure: &Failure) -> bool {
+    matches!(failure, Failure::Failed(message) if message.contains(upgrade::NOT_UPGRADED))
+}
+
 /// `check` of a PostgreSQL team database (see [`postgres::probe`], which changes nothing).
 ///
 /// Same JSON as the local file, with `schema` the version stored (or the one a new database gets).
@@ -176,6 +209,15 @@ fn postgres_check(context: &Context, url: &str) -> Result<Checked, Failure> {
     let name = backend::name(context.backend);
 
     match postgres::probe(url) {
+        Ok(found)
+            if found
+                .schema
+                .is_some_and(|version| version < postgres::schema::SCHEMA_VERSION) =>
+        {
+            let capabilities = json!({ "keyword": true, "vector": false, "vectorIndex": "missing" });
+
+            Ok(not_upgraded(name, postgres::schema::SCHEMA_VERSION, capabilities).into())
+        }
         Ok(found) => {
             let mut model = json!({ "dims": DIMS });
 
@@ -270,7 +312,16 @@ fn libsql_check(context: &Context, url: &str, token: Option<&str>) -> Result<Che
         return Ok(problem("no-fts5", message, false, true).into());
     }
 
-    let (schema, model_id) = match context.open_place(Place::Remote, Access::Read)? {
+    let opened = match context.open_place(Place::Remote, Access::Read) {
+        Err(failure) if is_not_upgraded(&failure) => {
+            let capabilities = json!({ "keyword": true, "vector": true, "vectorIndex": "ready" });
+
+            return Ok(not_upgraded(name, libsql::SCHEMA_VERSION, capabilities).into());
+        }
+        other => other?,
+    };
+
+    let (schema, model_id) = match opened {
         Some(mut store) => {
             let schema = store
                 .meta("schema_version")?
@@ -333,6 +384,13 @@ fn mongodb_check(context: &Context, url: &str) -> Result<Checked, Failure> {
             return Ok(Checked { done, unreachable });
         }
     };
+
+    // The search indexes of an older database are missing: say what is behind it.
+    if found.schema.is_some_and(|version| version < MONGO_SCHEMA) {
+        let capabilities = json!({ "keyword": false, "vector": false, "vectorIndex": "missing" });
+
+        return Ok(not_upgraded(name, MONGO_SCHEMA, capabilities).into());
+    }
 
     if let Some(error) = found.problem() {
         let keyword = found.keyword == IndexState::Ready;

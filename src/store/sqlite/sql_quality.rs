@@ -1,18 +1,22 @@
 //! The SQL the local SQLite file and the libSQL server share for the columns added in place to
 //! `knowledge_documents` (the authors and the usefulness counters), and for what reads them.
 //!
-//! A select list always has the same 20 columns, in the order of [`document_columns`]: a column
+//! A select list always has the same 23 columns, in the order of [`document_columns`]: a column
 //! the database lacks is read as NULL, so the row mappers do not change with the schema.
 
 use crate::store::quality::{AUTHOR_NAMES, USAGE_NAMES};
-use crate::store::{Columns, Document, StoreError};
+use crate::store::{Columns, Document, StoreError, Visibility};
 
 /// The columns of a document aliased `d` that every database has, in the order of `Document`'s
 /// fields.
 const BASE_COLUMNS: &str = "d.id, d.title, d.source_name, d.source_key, d.format, d.content_sha256, \
      d.file_sha256, d.bytes, d.chunk_count, d.created_at, d.updated_at, d.origin, d.warnings";
 
-/// The columns a mapper reads: the base ones (0-12), the authors (13-16) and the usage (17-19).
+/// The columns of the review a document has from schema version 2 on (20-22).
+const REVIEW_COLUMNS: &str = "d.status, d.pending_of, d.review_rev";
+
+/// The columns a mapper reads: the base ones (0-12), the authors (13-16), the usage (17-19) and the
+/// review (20-22).
 pub(crate) fn document_columns(columns: Columns) -> String {
     let authors = if columns.authors {
         "d.added_by_name, d.added_by_via, d.updated_by_name, d.updated_by_via"
@@ -25,7 +29,7 @@ pub(crate) fn document_columns(columns: Columns) -> String {
         "NULL, NULL, NULL"
     };
 
-    format!("{BASE_COLUMNS}, {authors}, {usage}")
+    format!("{BASE_COLUMNS}, {authors}, {usage}, {REVIEW_COLUMNS}")
 }
 
 /// The definitions of the added columns: nullable, or with a default, so an older server's inserts
@@ -83,30 +87,54 @@ pub(crate) fn stamp(doc: &Document) -> (&'static str, Option<&str>, Option<&str>
     )
 }
 
-/// Counts a time shown on the documents in the JSON array `?1`. A counter stops at the largest
+/// Counts a time shown on the live documents in the JSON array `?1` (a draft is not counted). A counter stops at the largest
 /// integer (an overflow would turn it into a float, which a reader does not expect).
 pub(crate) const SHOWN_SQL: &str = "UPDATE knowledge_documents
      SET shown = CASE WHEN shown < 9223372036854775807 THEN shown + 1 ELSE shown END
-     WHERE id IN (SELECT value FROM json_each(?1))";
+     WHERE status = 'live' AND id IN (SELECT value FROM json_each(?1))";
 
 /// Counts a time found useful, at `?2`, on the documents in the JSON array `?1` (saturating, like
 /// [`SHOWN_SQL`]).
 pub(crate) const USEFUL_SQL: &str = "UPDATE knowledge_documents
      SET useful = CASE WHEN useful < 9223372036854775807 THEN useful + 1 ELSE useful END, last_useful_at = ?2
-     WHERE id IN (SELECT value FROM json_each(?1))";
+     WHERE status = 'live' AND id IN (SELECT value FROM json_each(?1))";
+
+/// The condition (on a document aliased `d`) that keeps the rows `visibility` lets a lookup see.
+pub(crate) fn seen(visibility: Visibility) -> &'static str {
+    match visibility {
+        Visibility::Live => "d.status = 'live'",
+        Visibility::WithDrafts => "d.pending_of IS NULL",
+    }
+}
 
 /// The ids and titles of the documents linked to no repository, at most `?1`.
-pub(crate) const TITLES_GLOBAL_SQL: &str = "SELECT d.id, d.title FROM knowledge_documents d
-     WHERE NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id) ORDER BY d.id LIMIT ?1";
+pub(crate) fn titles_global_sql(visibility: Visibility) -> String {
+    format!(
+        "SELECT d.id, d.title FROM knowledge_documents d
+         WHERE {} AND NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id) ORDER BY d.id LIMIT ?1",
+        seen(visibility)
+    )
+}
 
 /// The ids and titles of the documents linked to the repository `?2`, at most `?1`.
-pub(crate) const TITLES_REPO_SQL: &str = "SELECT d.id, d.title FROM knowledge_documents d
-     WHERE EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = ?2)
-     ORDER BY d.id LIMIT ?1";
+pub(crate) fn titles_repo_sql(visibility: Visibility) -> String {
+    format!(
+        "SELECT d.id, d.title FROM knowledge_documents d
+         WHERE {} AND EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id AND l.repo_key = ?2)
+         ORDER BY d.id LIMIT ?1",
+        seen(visibility)
+    )
+}
 
 /// Each document with a chunk whose hash is in the JSON array `?1`, with how many distinct ones.
-pub(crate) const SHARING_SQL: &str = "SELECT doc_id, count(DISTINCT chunk_sha) FROM knowledge_chunks
-     WHERE chunk_sha IN (SELECT value FROM json_each(?1)) GROUP BY doc_id ORDER BY doc_id";
+pub(crate) fn sharing_sql(visibility: Visibility) -> String {
+    format!(
+        "SELECT c.doc_id, count(DISTINCT c.chunk_sha) FROM knowledge_chunks c
+         JOIN knowledge_documents d ON d.id = c.doc_id
+         WHERE {} AND c.chunk_sha IN (SELECT value FROM json_each(?1)) GROUP BY c.doc_id ORDER BY c.doc_id",
+        seen(visibility)
+    )
+}
 
 /// The hashes as the JSON array the statements above take; fails over the limit.
 pub(crate) fn shas_json(shas: &[String]) -> Result<String, StoreError> {

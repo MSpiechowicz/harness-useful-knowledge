@@ -75,7 +75,7 @@ fn team_mongo_without_transactions_a_failed_replace_loses_its_hash_so_the_next_i
             .chunk("B", "two"),
     );
     let hash = store
-        .find_by_source_key("/docs/guide.md")
+        .find_by_source_key("/docs/guide.md", crate::store::Visibility::Live)
         .expect("find")
         .expect("found")
         .content_sha256;
@@ -96,11 +96,14 @@ fn team_mongo_without_transactions_a_failed_replace_loses_its_hash_so_the_next_i
 
     assert_eq!(db.count(CHUNKS, doc! { "doc_id": id }), 0);
     assert!(
-        store.find_by_content_sha(&hash).expect("find").is_none(),
+        store
+            .find_by_content_sha(&hash, crate::store::Visibility::Live)
+            .expect("find")
+            .is_none(),
         "the next import sees a change"
     );
     let kept = store
-        .find_by_source_key("/docs/guide.md")
+        .find_by_source_key("/docs/guide.md", crate::store::Visibility::Live)
         .expect("find")
         .expect("the document stays");
     assert_eq!((kept.id, kept.chunk_count, kept.content_sha256.as_str()), (id, 0, ""));

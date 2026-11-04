@@ -19,6 +19,7 @@ fn listed(store: &mut PostgresStore, text: &str) -> Vec<String> {
             descending: false,
             offset: 0,
             limit: 50,
+            status: crate::store::StatusFilter::All,
         })
         .expect("list");
 
@@ -82,7 +83,10 @@ fn team_a_new_database_has_the_phrase_columns_and_their_indexes_from_version_1()
     let mut store = db.open();
     fill(&mut store);
 
-    assert_eq!(store.schema_version().expect("version"), 1);
+    assert_eq!(
+        store.schema_version().expect("version"),
+        crate::store::postgres::schema::SCHEMA_VERSION
+    );
 
     let mut admin = db.admin();
     let columns: Vec<String> = admin

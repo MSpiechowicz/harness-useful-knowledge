@@ -11,8 +11,9 @@ use crate::backend::OpenError;
 use crate::config::Secrets;
 use crate::store::testing::{Seed, insert, store};
 use crate::store::{
-    Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
-    PendingChunk, Reach, RepoCounts, Scope, SqliteStore, Stats, StoreError, TitleScope,
+    Chunk, ChunkHit, ChunkMatches, Comment, Detail, Document, DocumentDetail, DocumentPage, History, KnowledgeStore,
+    Link, ListQuery, NewComment, PendingChunk, PendingVersion, Reach, RepoCounts, ReviewChange, ReviewReply, Scope,
+    SectionText, SqliteStore, Stats, StoreError, StoredFile, TitleScope, Visibility,
 };
 
 /// How long a failed attempt is not repeated in these tests.
@@ -95,6 +96,11 @@ impl KnowledgeStore for Flaky {
         self.inner.set_meta(key, value)
     }
 
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        self.net.check()?;
+        self.inner.set_metas(entries)
+    }
+
     fn generation(&mut self) -> Result<i64, StoreError> {
         self.net.check()?;
         self.inner.generation()
@@ -105,14 +111,14 @@ impl KnowledgeStore for Flaky {
         self.inner.put_document(doc, chunks, links)
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
         self.net.check()?;
-        self.inner.find_by_content_sha(sha)
+        self.inner.find_by_content_sha(sha, visibility)
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
         self.net.check()?;
-        self.inner.find_by_source_key(key)
+        self.inner.find_by_source_key(key, visibility)
     }
 
     fn reusable_embeddings(
@@ -146,14 +152,23 @@ impl KnowledgeStore for Flaky {
         self.inner.record_useful(ids, at)
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
         self.net.check()?;
-        self.inner.find_by_title(title, scope)
+        self.inner.find_by_title(title, scope, visibility)
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
         self.net.check()?;
-        self.inner.docs_sharing_chunks(chunk_shas)
+        self.inner.docs_sharing_chunks(chunk_shas, visibility)
     }
 
     fn remote_writable(&mut self) -> Option<bool> {
@@ -166,9 +181,9 @@ impl KnowledgeStore for Flaky {
         self.inner.set_links(id, links)
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         self.net.check()?;
-        self.inner.rename(id, title)
+        self.inner.rename(id, title, by, at)
     }
 
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
@@ -199,6 +214,102 @@ impl KnowledgeStore for Flaky {
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
         self.net.check()?;
         self.inner.matching_chunks(doc_id, text, limit)
+    }
+
+    fn remote_meta(&mut self, key: &str) -> Result<Option<String>, StoreError> {
+        self.net.check()?;
+        self.inner.remote_meta(key)
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        self.net.check()?;
+        self.inner.pending_of(id)
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        self.net.check()?;
+        self.inner.set_review(id, expect, change)
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        self.net.check()?;
+        self.inner.promote(id, expect, change)
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        self.net.check()?;
+        self.inner.history(id)
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        self.net.check()?;
+        self.inner.writers_since_live(id)
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.net.check()?;
+        self.inner.section_texts(id)
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.net.check()?;
+        self.inner.asked_sections(id, revision)
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        self.net.check()?;
+        self.inner.add_comments(id, by, at, revision, comments)
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.net.check()?;
+        self.inner.reply_comment(id, parent, by, at, body)
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        self.net.check()?;
+        self.inner.resolve_comment(id, comment, resolved, by, at)
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.net.check()?;
+        self.inner.delete_comment(id, comment)
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        self.net.check()?;
+        self.inner.comments(id)
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        self.net.check()?;
+        self.inner.put_file(id, name, bytes)
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        self.net.check()?;
+        self.inner.file(id)
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

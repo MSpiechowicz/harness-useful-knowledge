@@ -72,6 +72,8 @@ fn features_list_what_this_build_can_do() {
         "docs-useful",
         "docs-similar",
         "docs-authors",
+        "docs-drafts",
+        "docs-approval",
     ] {
         assert!(features.contains(&feature), "{feature} in {features:?}");
     }

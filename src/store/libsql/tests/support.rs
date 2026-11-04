@@ -17,6 +17,11 @@ const RESET: &str = "
 PRAGMA foreign_keys = OFF;
 DROP TABLE IF EXISTS knowledge_chunks_fts;
 DROP INDEX IF EXISTS knowledge_chunks_vec;
+DROP TABLE IF EXISTS knowledge_doc_snapshots;
+DROP TABLE IF EXISTS knowledge_doc_file_parts;
+DROP TABLE IF EXISTS knowledge_doc_files;
+DROP TABLE IF EXISTS knowledge_doc_comments;
+DROP TABLE IF EXISTS knowledge_doc_events;
 DROP TABLE IF EXISTS knowledge_chunks;
 DROP TABLE IF EXISTS knowledge_doc_links;
 DROP TABLE IF EXISTS knowledge_documents;

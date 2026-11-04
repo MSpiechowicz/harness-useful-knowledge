@@ -172,7 +172,7 @@ fn a_write_meant_for_the_remote_is_refused_and_never_lands_on_this_computer() {
             .put_document(&doc, &chunks, std::slice::from_ref(&link))
             .map(drop),
     );
-    write_refused(routed.rename(1, "Renamed").map(drop));
+    write_refused(routed.rename(1, "Renamed", None, 0).map(drop));
     write_refused(routed.set_links(1, &[]).map(drop));
     write_refused(routed.delete(&[1]).map(drop));
     write_refused(routed.set_meta("model_id", "x"));
@@ -181,7 +181,7 @@ fn a_write_meant_for_the_remote_is_refused_and_never_lands_on_this_computer() {
 
     // Writes to this computer go on.
     let local = ids::tag(Place::Local, 1);
-    assert!(routed.rename(local, "Mine").expect("local rename"));
+    assert!(routed.rename(local, "Mine", None, 0).expect("local rename"));
 }
 
 #[test]
@@ -337,7 +337,7 @@ fn a_write_tries_the_remote_even_while_its_cooldown_runs_and_goes_on_once_it_ans
     assert_eq!(machine.net.dials(), 1);
 
     // Still down: the write tries again, the cooldown notwithstanding, and is refused.
-    let refused = routed.rename(1, "Renamed remote").expect_err("down");
+    let refused = routed.rename(1, "Renamed remote", None, 0).expect_err("down");
     assert!(
         matches!(&refused, StoreError::Unreachable(message) if message == REMOTE_DOWN_WRITE),
         "{refused:?}"
@@ -348,7 +348,7 @@ fn a_write_tries_the_remote_even_while_its_cooldown_runs_and_goes_on_once_it_ans
     machine.net.set(true);
     assert_eq!(all_titles(&mut routed), LOCAL_ONLY, "reads honour the cooldown");
 
-    assert!(routed.rename(1, "Renamed remote").expect("renamed"));
+    assert!(routed.rename(1, "Renamed remote", None, 0).expect("renamed"));
     assert!(!routed.offline(), "the answer ends the fallback");
     assert!(all_titles(&mut routed).contains(&"Renamed remote".to_owned()));
     assert_eq!(machine.net.dials(), 3);

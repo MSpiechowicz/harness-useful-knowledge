@@ -11,6 +11,7 @@ harness-useful-skills and harness-useful-desktop (`feat/knowledge-quality`).
 - `knowledge_add` with a similar document and neither `replaces` nor `distinct: true` is refused, nothing is queued.
 - No schema version bump in any backend: columns are added in place (memory's `ensure_extensions` pattern),
   so older servers keep reading the database and read-only roles read without the new fields.
+  Exception: schema v2 of [knowledge-drafts.md](knowledge-drafts.md) (D10) is a deliberate bump.
 - Usefulness stays out of ranking.
 
 ## Contracts

@@ -25,6 +25,7 @@ pub mod postgres;
 pub mod quality;
 pub mod rank;
 pub mod reach;
+pub mod review;
 pub mod routed;
 pub mod sqlite;
 #[cfg(test)]
@@ -38,6 +39,10 @@ use serde::{Deserialize, Serialize};
 pub use error::StoreError;
 pub use quality::{Author, Columns, DocUsage, TitleScope, UsefulFilter};
 pub use reach::Reach;
+pub use review::{
+    Authorship, Comment, EventKind, History, NewComment, PendingVersion, Piece, QuoteKind, QuoteLine, ReviewAction,
+    ReviewChange, ReviewEvent, ReviewReply, Reviewed, SectionText, Side, Status, StatusFilter, StoredFile, Visibility,
+};
 pub use routed::{Kinds, Part, RoutedStore};
 pub use sqlite::SqliteStore;
 
@@ -104,6 +109,15 @@ pub struct Document {
     pub added_by: Option<Author>,
     /// Who stored the latest import of the content.
     pub updated_by: Option<Author>,
+    /// Live for a document agents see (see [`review`]). Ignored when a stored document is put
+    /// again: a row changes state through [`KnowledgeStore::set_review`] and
+    /// [`KnowledgeStore::promote`] only, and a change of content sends a waiting row back to draft.
+    pub status: Status,
+    /// The live document this row is a pending version of; `None` for every other row. Set when a
+    /// pending version is first stored, never changed after.
+    pub pending_of: Option<i64>,
+    /// Raised by every content change and transition; set by the store, ignored on input.
+    pub review_rev: i64,
 }
 
 /// A document's link to one repository, and the paths in it the document is about.
@@ -162,6 +176,9 @@ pub struct Section {
 pub struct Scope {
     pub repo: Option<ProjectKey>,
     pub include_other_repos: bool,
+    /// Whether drafts are seen too (the person's own searches). Agents never see them: every
+    /// constructor but [`Scope::with_drafts`] leaves this off. A pending version is never seen.
+    pub drafts: bool,
 }
 
 impl Scope {
@@ -170,6 +187,7 @@ impl Scope {
         Self {
             repo,
             include_other_repos: false,
+            drafts: false,
         }
     }
 
@@ -178,7 +196,30 @@ impl Scope {
         Self {
             repo: None,
             include_other_repos: true,
+            drafts: false,
         }
+    }
+
+    /// The same scope, also seeing drafts (live documents and the rows that are not a pending
+    /// version).
+    #[must_use]
+    pub fn with_drafts(mut self) -> Self {
+        self.drafts = true;
+        self
+    }
+
+    /// The scope as a team database is asked it. A repository that is a folder of this computer
+    /// (`path:`) never leaves it, and a team database holds no link to one, so such a scope reads
+    /// there as no repository: the global documents. Any other scope is unchanged.
+    pub fn for_team(&self) -> std::borrow::Cow<'_, Scope> {
+        if self.repo.as_ref().is_some_and(|repo| clean::is_local_path(&repo.key)) {
+            return std::borrow::Cow::Owned(Scope {
+                repo: None,
+                ..self.clone()
+            });
+        }
+
+        std::borrow::Cow::Borrowed(self)
     }
 
     /// True when documents of every repository are visible.
@@ -211,6 +252,8 @@ pub struct ChunkHit {
     pub updated_at: i64,
     /// The globs of the document's link to the scope's repository: `None` when it is not linked.
     pub repo_globs: Option<Vec<String>>,
+    /// The state of the document; always live for an agent's search.
+    pub status: Status,
 }
 
 /// Which documents `docs list` shows by repository.
@@ -223,6 +266,14 @@ pub enum RepoFilter {
     Repo(String),
     /// Documents linked to at least one repository.
     Linked,
+}
+
+impl RepoFilter {
+    /// Whether this asks for the documents of a folder of this computer (`path:`), which a team
+    /// database never holds and is never asked for.
+    pub fn is_local_path(&self) -> bool {
+        matches!(self, Self::Repo(key) if clean::is_local_path(key))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +312,9 @@ pub struct ListQuery {
     pub text: String,
     /// Keeps the documents agents found useful, or never useful; `None` keeps all.
     pub useful: Option<UsefulFilter>,
+    /// Keeps the rows in these states (see [`StatusFilter`]). No default: an agent's list asks for
+    /// [`StatusFilter::Live`].
+    pub status: StatusFilter,
     pub sort: Sort,
     pub descending: bool,
     pub offset: usize,
@@ -274,6 +328,8 @@ pub struct DocumentRow {
     pub links: Vec<Link>,
     /// `None` when the database has no counter columns.
     pub usage: Option<DocUsage>,
+    /// The pending version of a live document.
+    pub pending: Option<PendingVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +345,9 @@ pub struct Detail {
     pub sections: bool,
     /// The id of a chunk of the document to read whole.
     pub chunk: Option<i64>,
+    /// Whether a document that is not live is read too (the person's own reads, a pending version
+    /// included). Off for agents: the document is then `None`.
+    pub drafts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -301,6 +360,8 @@ pub struct DocumentDetail {
     pub sections: Option<Vec<Section>>,
     /// The chunk asked for, with its text and no vector.
     pub chunk: Option<Chunk>,
+    /// The pending version of a live document; only read when the detail asks for `drafts`.
+    pub pending: Option<PendingVersion>,
 }
 
 /// A chunk of a document that matches a text, with the text to cut a snippet from.
@@ -353,6 +414,14 @@ pub struct Stats {
     pub schema_version: i64,
     /// The model that embedded the chunks, once one has.
     pub model_id: Option<String>,
+    /// Rows in state draft, pending versions included.
+    pub drafts: usize,
+    /// Rows in state waiting, pending versions included: what the team waits to approve.
+    pub waiting: usize,
+    /// Rows in state `changesRequested`, pending versions included.
+    pub changes_requested: usize,
+    /// Rows that are a pending version of a live document. `documents` does not count them.
+    pub pending: usize,
 }
 
 /// A knowledge backend. Writes and reads take `&mut self`; one store serves one process.
@@ -364,6 +433,10 @@ pub trait KnowledgeStore: Send {
     /// the store's own and refused.
     fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError>;
 
+    /// Sets several meta keys in one transaction (all or none) and bumps the generation. Keys as
+    /// [`KnowledgeStore::set_meta`].
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError>;
+
     /// The write counter: it grows on every write, so a process holding results can tell they are
     /// stale.
     fn generation(&mut self) -> Result<i64, StoreError>;
@@ -372,13 +445,20 @@ pub trait KnowledgeStore: Send {
     /// with id 0 is inserted, one with an id replaces that document (its chunks and links are
     /// replaced, `created_at` is kept; a missing id is [`StoreError::NotFound`]). The ids of the
     /// chunks are given by the store, and `chunk_count` is the length of `chunks`.
+    ///
+    /// An insert is stored in the state `doc.status` names (a pending version names the live
+    /// document in `doc.pending_of`, which must be live and have none yet). A replace raises the
+    /// revision, sends a waiting row back to draft and drops the stored original file. A row that is
+    /// not live records `drafted`, `updateDrafted` or `edited` in its history.
     fn put_document(&mut self, doc: &Document, chunks: &[Chunk], links: &[Link]) -> Result<i64, StoreError>;
 
-    /// A document with this content hash (the oldest), for finding an unchanged import.
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError>;
+    /// A document with this content hash (the oldest), for finding an unchanged import. A pending
+    /// version is never found, and a draft only with [`Visibility::WithDrafts`].
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError>;
 
-    /// A document imported from this source (the oldest), for updating it.
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError>;
+    /// A document imported from this source (the oldest), for updating it. Visibility as
+    /// [`KnowledgeStore::find_by_content_sha`].
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError>;
 
     /// The embeddings stored for chunks with these hashes and this model, by hash, so an import
     /// does not embed text it already embedded.
@@ -413,11 +493,22 @@ pub trait KnowledgeStore: Send {
     /// The documents of `scope` whose title equals `title` once both are normalised (see
     /// [`quality::normalise_title`]), by id. Scans the titles of the scope, at most
     /// [`quality::TITLE_SCAN_MAX`], so it needs no index.
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError>;
+    /// A pending version is never found, and a draft only with [`Visibility::WithDrafts`].
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError>;
 
     /// For each document with a chunk whose hash is in `chunk_shas` (at most
     /// [`crate::limits::SHARED_SHAS_MAX`]), the number of distinct hashes of them it has, by id.
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError>;
+    /// Visibility as [`KnowledgeStore::find_by_content_sha`].
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError>;
 
     /// Whether the database this store writes to lets this user change documents: `None` when
     /// that is not known (a failed probe, a handle opened to read, a server that cannot tell).
@@ -425,11 +516,22 @@ pub trait KnowledgeStore: Send {
         None
     }
 
+    /// The value of a meta key of the shared (remote) database: a routed store reads it from the
+    /// remote alone and never falls back to this computer's file (`None` with no remote, an error
+    /// while the remote cannot be reached). A store that is one place reads its own.
+    fn remote_meta(&mut self, key: &str) -> Result<Option<String>, StoreError> {
+        self.meta(key)
+    }
+
     /// Replaces the links of a document; false when there is no such document.
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError>;
 
-    /// Retitles a document; false when there is no such document.
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError>;
+    /// Retitles a document, in one transaction; false when there is no such document. A row that
+    /// is not live takes it as a change of its content: its revision grows, a waiting row is a
+    /// draft again and an `edited` event (comment `renamed`, by `by`, at `at` unix seconds) is
+    /// recorded. A live document is retitled directly, and so is its pending version (as that same
+    /// change), so a promote keeps the new title and the reviewer sees the rename.
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError>;
 
     /// Deletes documents with their chunks, links and index entries; how many existed.
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError>;
@@ -456,6 +558,120 @@ pub trait KnowledgeStore: Send {
     /// (see [`ListQuery::text`]), by position, at most `limit`; none for a text with no word or a
     /// document that does not exist.
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError>;
+
+    /// The pending version of live document `id`; `None` when it has none (or `id` is not a live
+    /// document).
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError>;
+
+    /// Applies `change` to document `id` if its revision is still `expect`: in one transaction the
+    /// row takes the new state, its revision grows by one, the event is recorded and (for
+    /// [`ReviewAction::Ask`]) the sections are kept as asked. A row in the wrong state, or at
+    /// another revision, is left alone and answered as such. An action that makes a pending version
+    /// live goes through [`KnowledgeStore::promote`] (this fails with [`StoreError::Invalid`]).
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError>;
+
+    /// Makes pending version `id` live, if its revision is still `expect` and `change` is an action
+    /// that goes live ([`ReviewAction::Approve`] or [`ReviewAction::GoLive`], allowed from the
+    /// row's state), in one transaction: the live chunks are replaced by the pending ones with their
+    /// embeddings, the live row takes the title, source, format, hashes, bytes, warnings, origin,
+    /// `updated_at` and `updated_by` of the pending row and keeps its id, links, `created_at`,
+    /// `added_by` and counters. The events, comments and original file move to the live row and the
+    /// pending row is deleted. The live row's revision becomes the larger of the two, plus one.
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError>;
+
+    /// The history of document `id`, newest first; `None` when there is no such document.
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError>;
+
+    /// The writers and the latest asker of many documents at once, for a list that names the people
+    /// of the rows waiting for approval (see [`review::Authorship`]): at most `per_doc` writers each
+    /// (the first ones). A document whose history could not be read may be left out, one with no such
+    /// events has none. Backends read them in a small constant number of queries.
+    fn authorship_of(&mut self, ids: &[i64], per_doc: usize) -> Result<HashMap<i64, review::Authorship>, StoreError> {
+        let mut found = HashMap::new();
+
+        for &id in ids {
+            let Ok(mut writers) = self.writers_since_live(id) else {
+                continue;
+            };
+            let Ok(history) = self.history(id) else { continue };
+
+            writers.truncate(per_doc);
+            found.insert(
+                id,
+                review::Authorship {
+                    writers,
+                    asker: history.as_ref().and_then(review::latest_asker),
+                },
+            );
+        }
+
+        Ok(found)
+    }
+
+    /// The distinct names on the `drafted`, `edited` and `updateDrafted` events of document `id`
+    /// since it was last made live (after its newest `approved` or `wentLive` event), oldest
+    /// first. It looks at every event, not only the newest [`review::HISTORY_MAX`], so a writer
+    /// cannot push their own events out of sight. Events without a name are left out, and so is a
+    /// document that does not exist (no names).
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError>;
+
+    /// The sections of document `id` as they are stored now; `None` when there is no such document.
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError>;
+
+    /// The sections of document `id` as they were when it was asked at `revision` (the revision
+    /// after the transition); `None` when none were kept.
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError>;
+
+    /// Adds the comments of one review to document `id`, written by `by` at `at` (unix seconds),
+    /// and returns their ids. They share a review number and carry `revision`, the one that was
+    /// reviewed (not the document's current one, which a change may have moved on), and they do not
+    /// change the document. Fails with [`StoreError::NotFound`] for an unknown document.
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError>;
+
+    /// Adds a reply to the comment `parent` of document `id`: its id, or `None` when `parent` is
+    /// not a comment of the document that can be answered (a reply cannot).
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError>;
+
+    /// Marks the comment `comment` of document `id` resolved by `by`, or open again; false when it
+    /// is not a comment of the document that can be resolved (a reply cannot).
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Deletes the comment `comment` of document `id` and, when it starts a thread, its replies,
+    /// in one step. The ids deleted, the comment first; `None` when `comment` is not a comment of
+    /// the document. A reply deletes only itself. The history of the document is not touched.
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError>;
+
+    /// Every comment of document `id`, in the order they were written.
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError>;
+
+    /// Keeps `bytes` as the original file `name` of document `id` (replacing the one it has);
+    /// false when there is no such document. Fails over [`crate::limits::FILE_BYTES_MAX`]
+    /// ([`crate::limits::PDF_BYTES_MAX`] for a PDF).
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError>;
+
+    /// The original file of document `id`, when it has one.
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError>;
 
     /// The stores a routed store reads, with the kinds of document each may show: `None` for a
     /// store that is one place. A search runs its pipeline in each and fuses the results.

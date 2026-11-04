@@ -239,6 +239,7 @@ fn a_counter_or_a_name_another_type_was_put_in_reads_instead_of_failing_the_row(
             descending: false,
             offset: 0,
             limit: 10,
+            status: crate::store::StatusFilter::All,
         })
         .expect("the listing reads");
     assert_eq!(listed.items.len(), 1);

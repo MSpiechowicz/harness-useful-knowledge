@@ -10,6 +10,7 @@
 
 mod access;
 mod documents;
+mod drafts;
 mod embeddings;
 mod listing;
 mod quality;

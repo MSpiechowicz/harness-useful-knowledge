@@ -115,6 +115,7 @@ impl Client {
             base: None,
             closed: false,
             budget: None,
+            guard: None,
         }
     }
 
@@ -275,6 +276,9 @@ pub(super) struct Stream<'c> {
     /// The most a request may take instead of the client's: for a statement that may be lost (a
     /// counter), which the server may still apply later.
     pub(super) budget: Option<Duration>,
+    /// The newest schema version this client reads: a one-shot stream sends the database's version
+    /// along with its first request and fails with [`StoreError::NewerSchema`] when it is newer.
+    pub(super) guard: Option<i64>,
 }
 
 impl Stream<'_> {
@@ -303,6 +307,13 @@ impl Stream<'_> {
     fn attempt(&mut self, mut requests: Vec<serde_json::Value>) -> Result<Vec<Outcome>, Failed> {
         if self.closed {
             return Err(Failed::local(ended()));
+        }
+
+        // A one-shot stream asks for the schema version first, in the same request.
+        let guard = self.guard.filter(|_| !self.keep);
+
+        if guard.is_some() {
+            requests.insert(0, execute_request(VERSION_SQL, &[], true));
         }
 
         let count = requests.len();
@@ -337,6 +348,17 @@ impl Stream<'_> {
         }
 
         results.truncate(count);
+
+        if let Some(newest) = guard {
+            let version = results.remove(0);
+
+            if is_newer(version, newest) {
+                return Err(Failed::local(StoreError::NewerSchema));
+            }
+
+            self.guard = None;
+        }
+
         Ok(results)
     }
 
@@ -438,6 +460,22 @@ impl Sql for Stream<'_> {
     fn batch(&mut self, sql: &str) -> Result<(), StoreError> {
         let outcome = self.send(vec![json!({ "type": "sequence", "sql": sql })])?.remove(0);
         outcome.into_result().map(drop)
+    }
+}
+
+/// The statement that reads the schema version of the database.
+const VERSION_SQL: &str = "SELECT CAST(value AS INTEGER) FROM knowledge_meta WHERE key = 'schema_version'";
+
+/// True when the outcome of [`VERSION_SQL`] says the database is newer than `newest`. A statement
+/// that failed or answered nothing says nothing: the read it came with fails on its own.
+fn is_newer(outcome: Outcome, newest: i64) -> bool {
+    let Ok(Response::Execute { result }) = outcome.into_result() else {
+        return false;
+    };
+
+    match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
+        Some(Cell::Integer { value }) => value.parse::<i64>().is_ok_and(|version| version > newest),
+        _ => false,
     }
 }
 

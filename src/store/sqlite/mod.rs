@@ -16,9 +16,11 @@ mod documents;
 mod listing;
 mod meta;
 mod quality;
+mod review;
 pub mod schema;
 mod search;
 pub(crate) mod sql_quality;
+pub(crate) mod sql_review;
 pub(crate) mod sql_shared;
 #[cfg(test)]
 mod tests;
@@ -30,9 +32,14 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
-use super::PendingChunk;
+use super::Visibility;
+use super::review::{
+    COMMENT_BODY_MAX, NewComment, actor, check_change, check_comments, check_file_size, comment_body, file_name,
+    file_sha,
+};
 use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
 use super::{Columns, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
+use super::{Comment, History, PendingChunk, PendingVersion, ReviewChange, ReviewReply, SectionText, StoredFile};
 use schema::SchemaState;
 
 /// How long a statement waits for another process's lock.
@@ -218,8 +225,10 @@ impl SqliteStore {
         })
     }
 
+    /// The connection for a read. The file's version is read again each time (a header read), so
+    /// a server that was running when a newer one migrated the file stops reading from it.
     fn conn(&self) -> Result<&Connection, StoreError> {
-        if self.newer {
+        if self.newer || schema::user_version(&self.conn)? > schema::SCHEMA_VERSION {
             return Err(StoreError::NewerSchema);
         }
 
@@ -229,13 +238,32 @@ impl SqliteStore {
     /// Runs `op` in a write transaction that takes the write lock first, committed when `op`
     /// succeeds and rolled back when it fails. The generation grows with every committed write.
     fn write<T>(&mut self, op: impl FnOnce(&rusqlite::Transaction) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.write_if(|tx| op(tx).map(|done| (done, true)))
+    }
+
+    /// [`Self::write`] for an `op` that says whether it changed anything: a refusal commits nothing
+    /// and does not count as a write.
+    fn write_if<T>(
+        &mut self,
+        op: impl FnOnce(&rusqlite::Transaction) -> Result<(T, bool), StoreError>,
+    ) -> Result<T, StoreError> {
         if self.newer {
             return Err(StoreError::NewerSchema);
         }
 
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let done = op(&tx)?;
-        meta::bump(&tx)?;
+
+        // The version is read again under the lock: another server may have migrated the file.
+        if schema::user_version(&tx)? > schema::SCHEMA_VERSION {
+            return Err(StoreError::NewerSchema);
+        }
+
+        let (done, changed) = op(&tx)?;
+
+        if changed {
+            meta::bump(&tx)?;
+        }
+
         tx.commit()?;
 
         Ok(done)
@@ -250,6 +278,20 @@ impl KnowledgeStore for SqliteStore {
     fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
         meta::check_settable(key)?;
         self.write(|tx| meta::set(tx, key, value))
+    }
+
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        for (key, _) in entries {
+            meta::check_settable(key)?;
+        }
+
+        self.write(|tx| {
+            for (key, value) in entries {
+                meta::set(tx, key, value)?;
+            }
+
+            Ok(())
+        })
     }
 
     fn generation(&mut self) -> Result<i64, StoreError> {
@@ -271,12 +313,12 @@ impl KnowledgeStore for SqliteStore {
         })
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        documents::find(self.conn()?, self.columns, "content_sha256", sha)
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        documents::find(self.conn()?, self.columns, "content_sha256", sha, visibility)
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        documents::find(self.conn()?, self.columns, "source_key", key)
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        documents::find(self.conn()?, self.columns, "source_key", key, visibility)
     }
 
     fn reusable_embeddings(
@@ -305,12 +347,21 @@ impl KnowledgeStore for SqliteStore {
         self.count_useful(ids, at)
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
-        quality::by_title(self.conn()?, self.columns, title, scope)
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
+        quality::by_title(self.conn()?, self.columns, title, scope, visibility)
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
-        quality::sharing(self.conn()?, chunk_shas)
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
+        quality::sharing(self.conn()?, chunk_shas, visibility)
     }
 
     /// True for a file opened for writing: this computer's file is the person's own. A handle
@@ -325,10 +376,10 @@ impl KnowledgeStore for SqliteStore {
         self.write(|tx| documents::set_links(tx, id, &links))
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         let title = clean::title(title)?;
 
-        self.write(|tx| documents::rename(tx, id, &title))
+        self.write(|tx| documents::rename(tx, id, &title, by, at))
     }
 
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
@@ -353,6 +404,104 @@ impl KnowledgeStore for SqliteStore {
 
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
         listing::matching_chunks(self.conn()?, doc_id, text, limit)
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        Ok(documents::pending_of_many(self.conn()?, self.columns, &[id])?.remove(&id))
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        let (by, comment) = check_change(change)?;
+
+        self.write_if(|tx| review::set_review(tx, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        if !change.action.goes_live() {
+            return Err(StoreError::Invalid("only approving or going live promotes".to_owned()));
+        }
+
+        let (by, comment) = check_change(change)?;
+        let columns = self.columns;
+
+        self.write_if(|tx| review::promote(tx, columns, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        review::history(self.conn()?, id)
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        review::writers_since_live(self.conn()?, id)
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        review::section_texts(self.conn()?, id)
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        review::asked_sections(self.conn()?, id, revision)
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        let comments = check_comments(comments)?;
+        let by = actor(by);
+
+        self.write(|tx| review::add_comments(tx, id, by.as_deref(), at, revision, &comments))
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let body = comment_body(body, COMMENT_BODY_MAX)?;
+        let by = actor(by);
+
+        self.write_if(|tx| review::reply_comment(tx, id, parent, by.as_deref(), at, &body))
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let by = actor(by);
+
+        self.write_if(|tx| review::resolve_comment(tx, id, comment, resolved, by.as_deref(), at))
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.write_if(|tx| review::delete_comment(tx, id, comment))
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        review::comments(self.conn()?, id)
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        let name = file_name(name)?;
+        check_file_size(bytes)?;
+        let sha256 = file_sha(bytes);
+
+        self.write_if(|tx| review::put_file(tx, id, &name, bytes, &sha256))
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        review::file(self.conn()?, id)
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

@@ -34,6 +34,7 @@ mod listing;
 mod meta;
 mod probe;
 mod quality;
+mod review;
 mod schema;
 mod search;
 mod sql;
@@ -56,8 +57,13 @@ pub use schema::SCHEMA_VERSION;
 use crate::backend::{Access, OpenError};
 use crate::config::Secrets;
 
+use super::Visibility;
+use super::review::{
+    COMMENT_BODY_MAX, actor, check_change, check_comments, check_file_size, comment_body, file_name, file_sha,
+};
 use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
 use super::{Columns, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
+use super::{Comment, History, NewComment, PendingVersion, ReviewChange, ReviewReply, SectionText, StoredFile};
 
 /// How long a write keeps asking for a lock the server reports busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -172,7 +178,37 @@ impl LibsqlStore {
             store.columns = store.open_columns(mode)?;
         }
 
+        // A writer takes out what an earlier version let in: a team database keeps no folder of
+        // this computer. A token that may not write leaves it for a writer.
+        if store.writable && !store.newer {
+            store.clean_local_paths();
+        }
+
         Ok(Some(store))
+    }
+
+    /// Deletes every link to a folder of this computer (a `path:` key): a team database keeps only
+    /// `git:` repositories. Idempotent, and a plain look when there is nothing to delete. The
+    /// number of links deleted.
+    pub fn drop_local_paths(&mut self) -> Result<usize, StoreError> {
+        if self.read(documents::count_local_paths)? == 0 {
+            return Ok(0);
+        }
+
+        self.write_if(|db| documents::drop_local_paths(db))
+    }
+
+    /// [`Self::drop_local_paths`] on opening, saying on stderr what it did or could not do (a
+    /// read-only token sees that line on each open, and nothing else changes for it).
+    fn clean_local_paths(&mut self) {
+        match self.drop_local_paths() {
+            Ok(removed) => clean::report_local_paths(removed, 0),
+            Err(_) => {
+                let left = self.read(documents::count_local_paths).unwrap_or(0);
+
+                clean::report_local_paths(0, left);
+            }
+        }
     }
 
     /// Brings the database to [`SCHEMA_VERSION`] under the write lock (another client may have
@@ -196,16 +232,34 @@ impl LibsqlStore {
         Ok(())
     }
 
-    /// Runs `op` on a one-shot stream: every statement is its own request.
+    /// Runs `op` on a one-shot stream: every statement is its own request. The server's schema
+    /// version rides in the first request and is checked before its answer is used, so a server
+    /// that was connected when a newer one migrated the database stops reading from it.
     fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
         self.check_version()?;
-        op(&mut self.client.single())
+
+        let mut stream = self.client.single();
+        stream.guard = Some(SCHEMA_VERSION);
+
+        let read = op(&mut stream);
+
+        if matches!(read, Err(StoreError::NewerSchema)) {
+            self.newer = true;
+        }
+
+        read
     }
 
     /// Runs `op` in a write transaction that takes the write lock first, committed when `op`
     /// succeeds and rolled back when it fails. The server's schema version is re-read under the
     /// lock, and the generation grows with every committed write.
     fn write<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.write_if(|db| op(db).map(|done| (done, true)))
+    }
+
+    /// [`Self::write`] for an `op` that says whether it changed anything: a refusal commits nothing
+    /// and does not count as a write.
+    fn write_if<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<(T, bool), StoreError>) -> Result<T, StoreError> {
         self.check_version()?;
 
         if !self.writable {
@@ -219,8 +273,11 @@ impl LibsqlStore {
                 return Err(StoreError::NewerSchema);
             }
 
-            let done = op(db)?;
-            meta::bump(db)?;
+            let (done, changed) = op(db)?;
+
+            if changed {
+                meta::bump(db)?;
+            }
 
             Ok(done)
         });
@@ -261,13 +318,27 @@ impl KnowledgeStore for LibsqlStore {
         self.write(|db| meta::set(db, key, value))
     }
 
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        for (key, _) in entries {
+            super::sqlite::sql_shared::check_settable(key)?;
+        }
+
+        self.write(|db| {
+            for (key, value) in entries {
+                meta::set(db, key, value)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn generation(&mut self) -> Result<i64, StoreError> {
         self.read(meta::generation)
     }
 
     fn put_document(&mut self, doc: &Document, chunks: &[super::Chunk], links: &[Link]) -> Result<i64, StoreError> {
         let title = clean::title(&doc.title)?;
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
         clean::chunks(chunks)?;
 
         let columns = self.columns;
@@ -280,16 +351,21 @@ impl KnowledgeStore for LibsqlStore {
         })
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
         let columns = self.columns;
 
-        self.read(|db| documents::find(db, columns, "content_sha256", sha))
+        self.read(|db| documents::find(db, columns, "content_sha256", sha, visibility))
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        // A folder of this computer is not asked about here.
+        if clean::is_local_source_key(key) {
+            return Ok(None);
+        }
+
         let columns = self.columns;
 
-        self.read(|db| documents::find(db, columns, "source_key", key))
+        self.read(|db| documents::find(db, columns, "source_key", key, visibility))
     }
 
     fn reusable_embeddings(
@@ -318,14 +394,27 @@ impl KnowledgeStore for LibsqlStore {
         self.count_useful(ids, at)
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
+        if scope.is_local_path() {
+            return Ok(Vec::new());
+        }
+
         let columns = self.columns;
 
-        self.read(|db| quality::by_title(db, columns, title, scope))
+        self.read(|db| quality::by_title(db, columns, title, scope, visibility))
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
-        self.read(|db| quality::sharing(db, chunk_shas))
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|db| quality::sharing(db, chunk_shas, visibility))
     }
 
     /// True for a database opened for writing, as far as this store can tell: a token that may
@@ -335,15 +424,15 @@ impl KnowledgeStore for LibsqlStore {
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
 
         self.write(|db| documents::set_links(db, id, &links))
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         let title = clean::title(title)?;
 
-        self.write(|db| documents::rename(db, id, &title))
+        self.write(|db| documents::rename(db, id, &title, by, at))
     }
 
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
@@ -351,6 +440,14 @@ impl KnowledgeStore for LibsqlStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+        // A team database holds no link to a folder of this computer, and is not asked for one.
+        if query.filter.is_local_path() {
+            return Ok(DocumentPage {
+                items: Vec::new(),
+                total: 0,
+            });
+        }
+
         let columns = self.columns;
 
         self.read(|db| listing::list(db, columns, query))
@@ -363,15 +460,125 @@ impl KnowledgeStore for LibsqlStore {
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         self.read(|db| search::keyword_top_k(db, query, scope, k))
     }
 
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         self.read(|db| search::vector_top_k(db, vector, scope, k))
     }
 
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
         self.read(|db| listing::matching_chunks(db, doc_id, text, limit))
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        let columns = self.columns;
+
+        self.read(|db| Ok(documents::pending_of_many(db, columns, &[id])?.remove(&id)))
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        let (by, comment) = check_change(change)?;
+
+        self.write_if(|db| review::set_review(db, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        if !change.action.goes_live() {
+            return Err(StoreError::Invalid("only approving or going live promotes".to_owned()));
+        }
+
+        let (by, comment) = check_change(change)?;
+        let columns = self.columns;
+
+        self.write_if(|db| review::promote(db, columns, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        self.read(|db| review::history(db, id))
+    }
+
+    fn authorship_of(
+        &mut self,
+        ids: &[i64],
+        per_doc: usize,
+    ) -> Result<HashMap<i64, crate::store::Authorship>, StoreError> {
+        self.read(|db| review::authorship_of(db, ids, per_doc))
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        self.read(|db| review::writers_since_live(db, id))
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|db| review::section_texts(db, id))
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|db| review::asked_sections(db, id, revision))
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        let comments = check_comments(comments)?;
+        let by = actor(by);
+
+        self.write(|db| review::add_comments(db, id, by.as_deref(), at, revision, &comments))
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let body = comment_body(body, COMMENT_BODY_MAX)?;
+        let by = actor(by);
+
+        self.write_if(|db| review::reply_comment(db, id, parent, by.as_deref(), at, &body))
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let by = actor(by);
+
+        self.write_if(|db| review::resolve_comment(db, id, comment, resolved, by.as_deref(), at))
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.write_if(|db| review::delete_comment(db, id, comment))
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        self.read(|db| review::comments(db, id))
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        let name = file_name(name)?;
+        check_file_size(bytes)?;
+        let sha256 = file_sha(bytes);
+
+        self.write_if(|db| review::put_file(db, id, &name, bytes, &sha256))
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        self.read(|db| review::file(db, id))
     }
 
     fn repos(&mut self) -> Result<RepoCounts, StoreError> {

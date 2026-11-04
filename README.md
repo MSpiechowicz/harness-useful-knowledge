@@ -24,7 +24,9 @@ that holds both the keyword and the vector index. Document text is treated as un
 as instructions.
 
 Agents do not write knowledge on their own. `knowledge_add` sends a proposal to a review queue, and
-only a person approving it in Harness Desktop (or with `held approve`) makes it searchable.
+only a person approving it in Harness Desktop (or with `held approve`) makes it searchable. With
+team approval on, the approved proposal is a draft first and a teammate must approve it again, see
+[Drafts and team approval](#drafts-and-team-approval).
 
 ## Install
 
@@ -88,10 +90,104 @@ memory and CPU limits.
 | `knowledge_search` | Hybrid search, as pointers (title, section, snippet) or whole chunks |
 | `knowledge_get` | The text of a document or chunk, with neighbouring chunks |
 | `knowledge_list` | The documents of this repository and the global ones |
-| `knowledge_add` | Sends a document to review, never writes the database |
+| `knowledge_add` | Sends a document to review, never writes the database. `revises` names the held proposal (`held:7`) a person asked to change, and replaces it |
 
-The reading tools take `project_path`, so results follow the repository the agent works in. Pass
+The reading tools see live documents only, never a draft or a pending update. They take `project_path`, so results follow the repository the agent works in. Pass
 `scope: "all"` to read documents linked only to other repositories.
+
+## Drafts and team approval
+
+A document is in one state:
+
+| State | Meaning |
+| --- | --- |
+| `live` | Searchable by agents |
+| `draft` | Written, not asked for approval yet |
+| `waiting` | Asked for approval, a teammate has to answer |
+| `changesRequested` | A reviewer sent it back with a comment |
+| pending update | A separate draft or waiting version of a live document. It carries the live document's id as `pendingOf`, and the live text stays in force until the update goes live |
+
+Agents never see a document that is not live, in search, `knowledge_get`, `knowledge_list`, recall
+or the duplicate check. People see every state with `docs list|get|similar` and `search --json`.
+
+Team approval is one switch stored in the remote database, so it holds for everyone on it:
+
+```sh
+harness-knowledge approval get --json   # {"approval": true, "place": "remote", "writable": true, "changedBy": "Ada", "changedAt": "2026-11-04T10:00:00Z"}
+harness-knowledge approval set --json on    # needs a git user.name: it records who switched it and when
+```
+
+The local file is always off. With approval on, every import to the remote database is a draft, and a
+replace of a live document writes its pending update. A draft goes live when someone other than its
+authors approves it. An author is everyone who drafted or edited that version (a rename counts) since
+it was last live, and whoever asked for its approval. Only the authors can take the ask back. A change
+to a draft or waiting document sets it back to draft, so an approval always covers exactly what was
+asked. The identity is the git `user.name` (trimmed, compared without case). It stops honest mistakes,
+not impersonation, because anyone can set a name. Asking needs a name. Rename and links of live documents stay direct. Deleting a live document deletes its pending
+update.
+
+Every transition takes the revision you saw (`--expect REV`) and refuses with `{"error": CODE,
+"message"}` and exit 1 when it changed. Codes: `notFound`, `changed`, `wrongState`, `approvalOn`,
+`approvalOff`, `selfApproval`, `notAuthor`, `noName`, `readOnly`, `commentRequired`, `sinceUnavailable`, `refused`,
+`localPath`, `unreachable`.
+
+```sh
+harness-knowledge docs ask --json 12 --expect 3                       # draft or changesRequested -> waiting
+harness-knowledge docs request-changes --json 12 --expect 4 --comment "Add the retry limits"
+harness-knowledge docs approve --json 12 --expect 4                   # waiting -> live (a pending update replaces the live text)
+harness-knowledge docs go-live --json 12 --expect 3                   # approval off: draft or waiting -> live
+harness-knowledge docs take-back --json 12 --expect 4                  # waiting -> draft, by its author or asker
+harness-knowledge docs review --json 12 --expect 4 --verdict requestChanges --body "See comments" --comments comments.json
+harness-knowledge docs history --json 12                              # who did what and when, newest first
+harness-knowledge docs comments --json 12
+harness-knowledge docs comment reply --json 12 COMMENT_ID --body "Done"
+harness-knowledge docs comment resolve --json 12 COMMENT_ID          # or unresolve
+harness-knowledge docs comment delete --json 12 COMMENT_ID           # your own comment, a thread with its replies
+harness-knowledge docs compare --json 12 [--since 3]                  # sections of a draft against the live text
+harness-knowledge docs download --json 12 --to ./original.md [--live]
+```
+
+`docs review` submits one review: an overall body plus line comments from a JSON file,
+`[{"section", "side": "old"|"new", "from", "to", "body"}]`. The verdict `approve` is the same as
+`docs approve`, `requestChanges` needs a comment, `comment` changes no state, and the author cannot
+approve or request changes. `docs comment delete` prints `{"deleted": [ID, ...]}` (the comment and, for a
+thread, its replies). Only the one who wrote a comment can delete it (`notAuthor` otherwise), in any state
+of the document. `docs download` writes the imported file, or the stored text when no
+original was kept (`"original": false`).
+
+Other commands:
+
+```sh
+harness-knowledge docs import --ndjson --draft < manifest.json            # store as a draft (or a pending update)
+harness-knowledge docs import --ndjson --ask --note "ready" < manifest.json  # write and ask in one step, needs approval on
+harness-knowledge docs list --json --status waiting                       # all|live|draft|waiting|changesRequested|pending
+harness-knowledge held request-changes --json ID --expect REV --comment "Shorter please"
+harness-knowledge held reject --json ID --comment "Duplicate of 12"
+harness-knowledge upgrade --json                                          # {"upgraded": bool, "waiting": bool}
+```
+
+`--draft`, `--ask` and `--note` are also the manifest fields `draft`, `ask` and `note`. A manifest with `replacing` or `replaces` plus `--ask` replaces a file and asks again in one step. `docs list --status
+draft|waiting|changesRequested` also keeps live documents whose pending update is in that state.
+`stats --json` counts `drafts`, `waiting` and `pending` per place, and reports `approval`. A held
+proposal that was sent back is replaced when the agent calls `knowledge_add` again in the same
+session with the same title or with `revises`.
+
+Team databases never store a local folder path. A project without a git remote is keyed `path:/folder`;
+linking a team document to it (`docs links set`, `docs import`, `held approve` into the team database) is
+refused as `localPath`, and only a `git:` project key leaves this computer. This computer's own database
+keeps such links. A writer that opens a team database removes `path:` links an earlier version left there (a document left with no link becomes a draft, never a global one). Searches and lists scoped to such a project never send the folder to the team database either.
+
+### Upgrading to 2.0.0
+
+Drafts need schema version 2 in every backend. An older `harness-knowledge` refuses a database that
+was upgraded, so everyone on a team database updates together and restarts their harnesses afterwards.
+Run `harness-knowledge upgrade` or let Harness Desktop do it. A role that cannot write cannot upgrade
+and waits for a teammate. Known limits:
+
+- libSQL cannot tell a read-only token, so the actions stay enabled and fail with the server's error.
+- The MongoDB upgrade briefly needs 4 search indexes, and a cluster capped at 3 (for example Atlas
+  M0) may fail.
+- PostgreSQL does one extra version lookup per read.
 
 ## Vector search
 
@@ -161,8 +257,9 @@ each place under `places`.
 harness-knowledge docs import --ndjson < manifest.json   # {"paths":[],"folders":[],"links":[]}
 harness-knowledge docs list --json --query billing
 harness-knowledge search --json --query "how are refunds retried" --project .
-harness-knowledge held list --json
+harness-knowledge held list --json [--sort created|addedBy]
 harness-knowledge held approve --json <id>
+harness-knowledge docs list --json --status draft
 echo "how do we deploy?" | harness-knowledge recall --hook --project .
 ```
 

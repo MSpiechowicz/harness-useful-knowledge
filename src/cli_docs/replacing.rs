@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use super::import::author_of;
+use super::import::{approval_for, author_of, set_review};
 use super::{Context, Failure};
 use crate::backend::Access;
 use crate::config::{Kind, Layout, Place};
@@ -24,6 +24,8 @@ struct Turn<'a> {
     place: Place,
     store: Box<dyn KnowledgeStore>,
     files: Vec<(&'a Candidate, Option<i64>)>,
+    /// Team approval is on for this place.
+    approval: bool,
 }
 
 /// Runs the import of `manifest`, see the module docs. Everything that can be refused (a place
@@ -47,9 +49,11 @@ pub(super) fn import_each_place(
         let replaced = replacing.get(&manifest::canonical(&candidate.path)).copied();
         let place = write_place(context.routing, manifest.place, replaced, kind).map_err(Failure::Failed)?;
 
+        super::import::for_place(place, &links)?;
         wanted.push((place, candidate, replaced.map(|id| ids::split(id).1)));
     }
 
+    let author = author_of(context, &links);
     let mut turns = Vec::new();
 
     for place in context.routing.places() {
@@ -63,14 +67,21 @@ pub(super) fn import_each_place(
             continue;
         }
 
-        let store = context
+        let mut store = context
             .open_place_to_change(place, Access::Create)?
             .ok_or_else(|| Failure::Failed("the database could not be created".to_owned()))?;
 
-        turns.push(Turn { place, store, files });
+        // Everything that can be refused is before the first file, a place's approval included.
+        let approval = approval_for(store.as_mut(), place, manifest, author.as_ref())?;
+
+        turns.push(Turn {
+            place,
+            store,
+            files,
+            approval,
+        });
     }
 
-    let author = author_of(context, &links);
     // Ids are written with their place only when two places are in use.
     let both = context.routing.layout() == Layout::Both;
     let mut events = Events::new(out);
@@ -83,6 +94,7 @@ pub(super) fn import_each_place(
         importer.embedder = embedder.as_deref_mut().map(|embedder| embedder as &mut dyn Embedder);
         importer.links.clone_from(&links);
         importer.author.clone_from(&author);
+        set_review(&mut importer, manifest, turn.approval);
 
         for (candidate, replaces) in &turn.files {
             if !progress.file(&mut importer, candidate, *replaces, &mut events) {

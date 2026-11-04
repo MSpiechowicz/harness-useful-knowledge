@@ -50,7 +50,13 @@ pub(super) fn matches(context: &Context, args: &[Option<&str>]) -> Reply {
         return Err(not_found(id));
     };
 
-    if store.get(id, &Detail::default())?.is_none() {
+    // The person's own read: a draft and a pending version can be searched too.
+    let detail = Detail {
+        drafts: true,
+        ..Detail::default()
+    };
+
+    if store.get(id, &detail)?.is_none() {
         return Err(not_found(id));
     }
 

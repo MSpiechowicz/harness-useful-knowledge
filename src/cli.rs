@@ -227,6 +227,15 @@ pub fn unreachable(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Prints a refusal of a review command as `{"error": CODE, "message"}` on stdout and the message on
+/// stderr; exit 1. `code` is one of [`crate::review::Code::as_str`]. Harness Desktop matches on the
+/// code. `message` must carry no credentials.
+pub fn refused(code: &str, message: &str) -> ExitCode {
+    println!("{}", serde_json::json!({ "error": code, "message": message }));
+    eprintln!("harness-knowledge: {message}");
+    ExitCode::FAILURE
+}
+
 /// Prints a command this build does not support as `{"error": "unsupported", "message"}` on stdout
 /// and the message on stderr; exit 2.
 pub fn unsupported(message: &str) -> ExitCode {

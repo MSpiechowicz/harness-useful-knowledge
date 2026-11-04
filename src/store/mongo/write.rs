@@ -21,6 +21,15 @@ impl MongoStore {
     /// Runs `op` as one write that counts in the generation: in a transaction when the deployment
     /// has them, retried from the start on transient errors and write conflicts.
     pub(super) fn write<T>(&mut self, mut op: impl FnMut(&mut Ctx<'_>) -> Result<T, Fail>) -> Result<T, StoreError> {
+        self.write_if(|ctx| op(ctx).map(|done| (done, true)))
+    }
+
+    /// [`Self::write`] for an `op` that says whether it changed anything: a refusal changes nothing
+    /// and does not count as a write.
+    pub(super) fn write_if<T>(
+        &mut self,
+        mut op: impl FnMut(&mut Ctx<'_>) -> Result<(T, bool), Fail>,
+    ) -> Result<T, StoreError> {
         if self.read_only {
             return Err(StoreError::Backend(
                 "the database was opened for reading only".to_owned(),
@@ -30,8 +39,12 @@ impl MongoStore {
         self.check_version()?;
 
         let mut counted = |ctx: &mut Ctx<'_>| {
-            let done = op(ctx)?;
-            ctx.bump_generation()?;
+            let (done, changed) = op(ctx)?;
+
+            if changed {
+                ctx.bump_generation()?;
+            }
+
             Ok(done)
         };
 

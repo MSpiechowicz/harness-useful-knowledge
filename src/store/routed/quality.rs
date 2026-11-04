@@ -4,15 +4,21 @@
 use super::rows::tag_document;
 use super::{RoutedStore, ids};
 use crate::config::{Kind, Place};
-use crate::store::{Document, KnowledgeStore, StoreError, TitleScope};
+use crate::store::{Document, KnowledgeStore, StoreError, TitleScope, Visibility};
 
 impl RoutedStore {
     /// The first document the places find with `find`, remote first, tagged with its place.
     pub(super) fn first_found(
         &mut self,
+        local_only: bool,
         find: impl Fn(&mut dyn KnowledgeStore) -> Result<Option<Document>, StoreError>,
     ) -> Result<Option<Document>, StoreError> {
         for place in self.present()? {
+            // What stands for a folder of this computer is never asked of the team's database.
+            if local_only && place == Place::Remote {
+                continue;
+            }
+
             let Some(store) = self.store(place) else { continue };
 
             if let Some(mut doc) = find(store)? {
@@ -71,7 +77,12 @@ impl RoutedStore {
     }
 
     /// The documents of `scope` titled `title` in every place that shows documents of that kind.
-    pub(super) fn titled(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
+    pub(super) fn titled(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
         let kind = match scope {
             TitleScope::Repo(_) => Kind::Repository,
             TitleScope::Global => Kind::Global,
@@ -83,8 +94,13 @@ impl RoutedStore {
                 continue;
             }
 
+            // The team's database holds no link to a folder of this computer and is never asked for one.
+            if place == Place::Remote && scope.is_local_path() {
+                continue;
+            }
+
             let Some(store) = self.store(place) else { continue };
-            let found = store.find_by_title(title, scope);
+            let found = store.find_by_title(title, scope, visibility);
 
             if let Some(docs) = self.read(place, found)? {
                 for mut doc in docs {
@@ -98,12 +114,12 @@ impl RoutedStore {
     }
 
     /// The documents of every place with chunks among `shas`, ids tagged with their place.
-    pub(super) fn sharing(&mut self, shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+    pub(super) fn sharing(&mut self, shas: &[String], visibility: Visibility) -> Result<Vec<(i64, usize)>, StoreError> {
         let mut all = Vec::new();
 
         for place in self.present()? {
             let Some(store) = self.store(place) else { continue };
-            let found = store.docs_sharing_chunks(shas);
+            let found = store.docs_sharing_chunks(shas, visibility);
 
             if let Some(shared) = self.read(place, found)? {
                 all.extend(shared.into_iter().map(|(id, count)| (ids::tag(place, id), count)));

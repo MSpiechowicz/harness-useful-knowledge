@@ -19,7 +19,7 @@ pub use embedder::{AutoEmbedder, QueryEmbedder, SocketEmbedder};
 pub use render::Pointer;
 
 use crate::store::fuse::{Scored, fuse};
-use crate::store::routed::{ids, merge_found};
+use crate::store::routed::{ids, merge_found, scope_in};
 use crate::store::{Kinds, KnowledgeStore, Part, Scope, StoreError, rank};
 
 /// How many candidates each list asks the store for.
@@ -157,7 +157,14 @@ fn run_parts(
         }
 
         let embedder = cached.as_mut().map(|cached| cached as &mut dyn QueryEmbedder);
-        let mut found = run_in(part.store, embedder, query, tuning, part.kinds)?;
+
+        // The team's database is never asked for a folder of this computer.
+        let scope = scope_in(part.place, query.scope);
+        let asked = Query {
+            scope: &scope,
+            ..query.clone()
+        };
+        let mut found = run_in(part.store, embedder, &asked, tuning, part.kinds)?;
 
         // From here on the ids say which place the chunk is in.
         for scored in &mut found.hits {

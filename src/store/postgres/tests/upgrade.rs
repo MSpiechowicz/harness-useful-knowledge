@@ -1,6 +1,7 @@
 //! The machinery of a schema upgrade: it is not bound by the limits of an ordinary session, and an
 //! open that is told to defer leaves a database that needs one alone. There is no migration after
-//! version 1 yet, so these add one of their own to [`schema::migrations`].
+//! version 2 yet, so these add one of their own to [`schema::migrations`] (a version 3 that only the
+//! tests know), and the upgrade from version 1 to version 2 itself is in `drafts`.
 
 use super::support::{database, insert};
 use crate::backend::{Access, Opened, Upgrade};
@@ -8,7 +9,7 @@ use crate::store::postgres::schema::{self, MIGRATE_LOCK, SchemaState};
 use crate::store::postgres::{CONNECT_TIMEOUT, PostgresStore};
 use crate::store::testing::Seed;
 
-/// The migrations of version 1 and one more that takes `slow` to run.
+/// The migrations of the schema and one more that takes `slow` to run.
 fn steps(slow: &str) -> Vec<String> {
     let mut steps = schema::migrations();
     steps.push(format!("{slow}; ALTER TABLE knowledge_chunks ADD COLUMN extra TEXT;"));
@@ -32,7 +33,10 @@ fn team_a_migration_outlasts_the_statement_timeout_of_the_session() {
     let state = schema::migrate_with(&mut session, &steps("SELECT pg_sleep(1.5)")).expect("the migration completes");
 
     assert_eq!(state, SchemaState::Current);
-    assert_eq!(schema::stored_version(&mut session).expect("version"), Some(2));
+    assert_eq!(
+        schema::stored_version(&mut session).expect("version"),
+        Some(schema::SCHEMA_VERSION + 1)
+    );
 
     let extra: i64 = session
         .query_one(

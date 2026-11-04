@@ -356,6 +356,7 @@ fn bad_arguments_are_usage_errors() {
 }
 
 mod author;
+mod changes;
 mod keys;
 mod replaces;
 
@@ -429,6 +430,48 @@ fn an_approval_goes_where_place_says_and_the_routing_allows() {
 }
 
 #[test]
+fn a_proposal_linked_to_a_folder_of_this_computer_is_not_approved_into_the_team_database() {
+    use crate::config::Where;
+
+    let world = World::new();
+    let remote = unreachable_remote();
+    let both = Routing::new(Where::RemoteLocal, Where::RemoteLocal);
+    let approve = |held: &str, extra: &[&str]| {
+        let mut args = vec!["approve", "--json", held];
+        args.extend_from_slice(extra);
+        let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
+
+        reply(&world.env, &remote, both, &args)
+    };
+    let id = world.propose(
+        "Ledger notes",
+        TEXT,
+        vec![link("path:/home/secret-owner/projects/ledger")],
+        None,
+    );
+
+    // Refused before the team's database is opened, and the proposal stays held to be rejected.
+    let Reply::Refused(Code::LocalPath, message) = approve(&id, &["--place", "remote"]) else {
+        panic!("refused");
+    };
+    assert_eq!(
+        message,
+        "ledger has no git remote, so a team document cannot be linked to it (only a git: project key leaves this computer)"
+    );
+    assert!(!message.contains("secret-owner"), "{message}");
+    assert_eq!(Code::LocalPath.as_str(), "localPath");
+    assert_eq!(world.held().count(), 1);
+    assert!(!world.database_exists());
+
+    // This computer takes it.
+    let Reply::Done(done) = approve(&id, &["--place", "local"]) else {
+        panic!("approved");
+    };
+    assert_eq!(done["approved"]["status"], "added");
+    assert_eq!(world.held().count(), 0);
+}
+
+#[test]
 fn without_a_remote_database_only_this_computer_can_be_chosen() {
     let world = World::new();
     let held = world.propose("Runbook", TEXT, Vec::new(), None);
@@ -485,3 +528,4 @@ fn an_approval_to_a_remote_that_cannot_be_reached_is_refused_and_recorded_like_a
         "the failure goes to the cooldown that every other command shares"
     );
 }
+mod sort;

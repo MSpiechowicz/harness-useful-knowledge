@@ -3,14 +3,16 @@
 //! Desktop and the person at the terminal.
 //!
 //! It prints a JSON array, best first, and `[]` (exit 0) when nothing matches or there is no
-//! database: a read never creates it. An item is `{"docId", "chunkId", "id", "title", "section",
-//! "score", "snippet", "block"}` for `--mode pointers` (the default) and `"text"` instead of
+//! database: a read never creates it. An item is `{"docId", "chunkId", "id", "title", "status",
+//! "section", "score", "snippet", "block"}` for `--mode pointers` (the default) and `"text"` instead of
 //! `"snippet"` for `--mode chunks`. `id` is what `knowledge_get` takes (`12:340`, `local:12:340` for a document on this computer when both places are in use, where `docId` and `chunkId` are the string `local:12`). The `snippet`
 //! and the `text` are the document's own words: whatever shows them to an agent must wrap them as
 //! untrusted, and `block` is that wrapping, ready to use. `--project` names the repository the
 //! search is for (else the working folder's), `--path` (repeatable) the repository-relative files
 //! being worked on, `--limit` is 1 to 20 (8 when not given), `--scope all` sees the documents of
-//! every repository (default `repo`: the global ones and this repository's).
+//! every repository (default `repo`: the global ones and this repository's). This is the person's
+//! search, so it finds drafts too: `status` says `live`, `draft`, `waiting` or `changesRequested`
+//! (agents never see anything but live documents, and a pending version is never a hit of its own).
 //!
 //! The embedder process answers the query's vector. Without it the model is loaded in this process
 //! when it is installed, else the search is keyword-only and says so on stderr.
@@ -234,10 +236,10 @@ pub fn answer(
         });
     };
 
-    let scope = Scope {
-        repo,
-        include_other_repos: options.everything,
-    };
+    // The person's own search: drafts are found too, each hit says its status. (Agents never see
+    // them, see `crate::mcp`.)
+    let mut scope = Scope::from_repo(repo).with_drafts();
+    scope.include_other_repos = options.everything;
     let query = Query {
         text: &options.query,
         scope: &scope,
@@ -264,6 +266,7 @@ pub fn answer(
                 "chunkId": ids::json(pointer.chunk_id),
                 "id": chunk_ref(pointer.doc_id, pointer.chunk_id),
                 "title": pointer.title,
+                "status": scored.hit.status.as_str(),
                 "section": pointer.section,
                 "score": pointer.score.round() as i64,
             });

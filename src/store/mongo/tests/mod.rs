@@ -17,6 +17,7 @@
 
 mod capability;
 mod documents;
+mod drafts;
 mod embeddings;
 mod listing;
 mod ordered;
@@ -28,6 +29,7 @@ mod upgrade;
 mod url;
 
 use std::cell::Cell;
+use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
@@ -59,7 +61,7 @@ pub(super) struct TestDb {
     pub name: String,
     client: Client,
     /// Shares the test server with the other tests, unless this test holds it [`alone`].
-    _shared: Option<RwLockReadGuard<'static, ()>>,
+    _shared: Option<(RwLockReadGuard<'static, ()>, File)>,
 }
 
 /// The test server: shared by the tests, held alone by one that stops the whole server (`fsync` lock).
@@ -69,13 +71,39 @@ thread_local! {
     static ALONE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Holds the test server alone until the guard is dropped: the other tests wait, so a test that locks the whole
+/// The file the processes of a test run (`nextest` runs every test in its own) lock to share the
+/// test server, or to hold it alone.
+fn server_lock() -> File {
+    let path = std::env::temp_dir().join("harness-knowledge-test-mongo-server.lock");
+
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("the lock file of the test server")
+}
+
+/// What a test that holds the test server alone keeps until it ends.
+pub(super) struct Alone {
+    _threads: RwLockWriteGuard<'static, ()>,
+    _processes: File,
+}
+
+/// Holds the test server alone until the guard is dropped: the other tests wait (those of this
+/// process by a lock, those of other processes by a lock on a file), so a test that locks the whole
 /// server for writes does not slow theirs. Call it before [`store`].
-pub(super) fn alone() -> RwLockWriteGuard<'static, ()> {
-    let guard = SERVER.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+pub(super) fn alone() -> Alone {
+    let threads = SERVER.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let processes = server_lock();
+    processes.lock().expect("hold the test server alone");
     ALONE.with(|alone| alone.set(true));
 
-    guard
+    Alone {
+        _threads: threads,
+        _processes: processes,
+    }
 }
 
 impl TestDb {
@@ -98,7 +126,13 @@ impl TestDb {
 
         let client = Client::with_uri_str(&base).expect("test server client");
 
-        let shared = (!ALONE.with(Cell::get)).then(|| SERVER.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let shared = (!ALONE.with(Cell::get)).then(|| {
+            let threads = SERVER.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let processes = server_lock();
+            processes.lock_shared().expect("share the test server");
+
+            (threads, processes)
+        });
 
         Some(Self {
             url: with_database(&base, &name),
@@ -212,6 +246,7 @@ pub(super) fn sections(store: &mut MongoStore, id: i64) -> Vec<Section> {
     let detail = Detail {
         sections: true,
         chunk: None,
+        drafts: false,
     };
 
     store

@@ -43,6 +43,11 @@ pub(super) struct AddArgs {
     /// True to add the document although a similar one exists (see [`super::duplicate`]).
     #[serde(default)]
     distinct: bool,
+    /// The proposal this one answers, as `knowledge_add` named it (`held:<id>`, or the bare id): the
+    /// user asked for changes to it, and it is replaced in the review queue (see
+    /// [`crate::held::HeldStore::hold_named`]). A proposal that is not waiting for changes is not
+    /// replaced.
+    revises: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +59,10 @@ struct LinkArg {
 
 /// Said to the agent when the proposal is held.
 const SENT: &str = "Sent to review in Harness Desktop → Knowledge.";
+
+/// Said to the agent when `revises` did not replace a proposal and this one was held as a new one.
+const SENT_NEW: &str = "Held as a new proposal, because revises did not name one of yours that is waiting for changes. \
+                        Sent to review in Harness Desktop → Knowledge.";
 
 /// The formats an agent may name, with the extension a text of that format is imported under.
 const FORMATS: [(&str, &str); 6] = [
@@ -117,6 +126,8 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
         }
     }
 
+    let revises = args.revises.as_deref().map(revised_id).transpose()?;
+
     let mut item = HeldItem::new(
         Source {
             client: server.client.clone().unwrap_or_else(|| "unknown".to_owned()),
@@ -141,7 +152,10 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
 
     item.added_by = HeldItem::author_name(&server.env, item.project_path.as_deref());
 
-    match held.hold(item) {
+    match held.hold_named(item, revises) {
+        // A named proposal is replaced under its own id: another id says it was not (it is of another
+        // session, is not waiting for changes, or is gone). Nothing of it is told.
+        Ok(id) if revises.is_some_and(|named| named != id) => Ok(format!("held:{id}\n{SENT_NEW}")),
         Ok(id) => Ok(format!("held:{id}\n{SENT}")),
         Err(HoldError::Limit) => Err(
             "the review queue is full or this document is too large. Ask the user to review the waiting proposals in \
@@ -149,6 +163,18 @@ pub(super) fn add(server: &mut Server, args: AddArgs) -> Result<String, String> 
                 .to_owned(),
         ),
         Err(HoldError::Failed(reason)) => Err(format!("the proposal could not be held: {reason}")),
+    }
+}
+
+/// The held id `revises` names: `held:<id>` as `knowledge_add` answered, or the bare id.
+fn revised_id(revises: &str) -> Result<&str, String> {
+    let id = revises.trim();
+    let id = id.strip_prefix("held:").unwrap_or(id);
+
+    if crate::held::is_held_id(id) {
+        Ok(id)
+    } else {
+        Err("revises names a proposal as held:<id>, as knowledge_add answered".to_owned())
     }
 }
 

@@ -6,9 +6,20 @@
 //! # Layout
 //!
 //! The database is the one in the URL path (`harness_knowledge` when the URL names none) and holds
-//! three collections, `knowledge_meta`, `knowledge_documents` and `knowledge_chunks`, and two
-//! search indexes on the chunks. See [`schema`] for the fields and the indexes. Ids are `i64`
-//! like the trait's, taken from counters in the meta collection with `$inc`.
+//! seven collections (`knowledge_meta`, `knowledge_documents`, `knowledge_chunks` and, for the
+//! review of drafts, `knowledge_events`, `knowledge_comments`, `knowledge_files` and
+//! `knowledge_snapshots`), and two search indexes on the chunks. See [`schema`] for the fields and
+//! the indexes. Ids are `i64` like the trait's, taken from counters in the meta collection with
+//! `$inc`.
+//!
+//! # Drafts
+//!
+//! A document is live or in one of the states of a review (see [`crate::store::review`]), and a
+//! live document may have a pending version, a row of its own. Agents see live documents only: the
+//! chunks carry `review` (`live`, `draft` or `pending`), the search filters on it inside the index
+//! and checks it again on what comes back, and every other agent read filters on the document's
+//! `status`. The person's own reads opt in to drafts (a pending version is never a row of a list or
+//! a search).
 //!
 //! # Writes
 //!
@@ -22,7 +33,9 @@
 //! # Reads
 //!
 //! A read never creates anything: [`MongoStore::connect_read_only`] answers `None` for a database
-//! nobody wrote to yet. The list, the lookups and the counts are strongly consistent. Both search
+//! nobody wrote to yet. The schema version is read again before a read once the last look is
+//! [`SCHEMA_RECHECK`] old, so a server that was running when a newer one upgraded the database stops
+//! reading from it. The list, the lookups and the counts are strongly consistent. Both search
 //! indexes are eventually consistent (a chunk is searchable about a second after its write), and
 //! a search on an index that is still being built fails with a message that says so.
 //!
@@ -45,6 +58,7 @@ mod migrate;
 mod open;
 pub mod probe;
 mod quality;
+mod review;
 pub mod schema;
 mod search;
 mod terms;
@@ -55,7 +69,7 @@ mod write;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mongodb::bson::{Bson, Document as Row};
 use mongodb::error::Error;
@@ -69,16 +83,23 @@ use crate::backend::{Access, Opened, Upgrade};
 use ctx::{Ctx, Fail};
 use schema::IndexState;
 
+use super::review::{
+    COMMENT_BODY_MAX, actor, check_change, check_comments, check_file_size, comment_body, file_name, file_sha,
+};
 use super::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
 };
-use super::{PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
+use super::{Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply};
+use super::{Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility, clean};
 
 /// The database used when the URL path names none.
 pub const DEFAULT_DATABASE: &str = "harness_knowledge";
 
 /// How long the driver looks for a usable server when the URL does not say.
 pub const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the schema version a store read stays good: a read after that reads it again.
+pub const SCHEMA_RECHECK: Duration = Duration::from_secs(5);
 
 /// How much of the database a connection may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +120,11 @@ pub struct MongoStore {
     db: Database,
     client: Client,
     transactions: bool,
-    newer: bool,
+    /// The database was written by a newer server (also learned after connecting).
+    newer: Cell<bool>,
+    /// When the schema version was last read, and how long that stays good.
+    checked: Cell<Instant>,
+    schema_recheck: Duration,
     /// Opened with [`MongoStore::connect_read_only`]: writes are refused.
     read_only: bool,
     /// Both search indexes answered queries once, so they are not asked about again.
@@ -113,7 +138,7 @@ impl std::fmt::Debug for MongoStore {
         f.debug_struct("MongoStore")
             .field("database", &self.db.name())
             .field("transactions", &self.transactions)
-            .field("newer", &self.newer)
+            .field("newer", &self.newer.get())
             .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
@@ -190,20 +215,54 @@ impl MongoStore {
             Plan::Migrate { .. } => schema::migrate(&db).map_err(failed)?,
         };
 
-        Ok(Opened::Ready(Some(Self {
+        let mut store = Self {
             db,
             client,
             transactions,
-            newer,
+            newer: Cell::new(newer),
+            checked: Cell::new(Instant::now()),
+            schema_recheck: SCHEMA_RECHECK,
             read_only: matches!(mode, Mode::ReadOnly | Mode::Counters),
             searchable: false,
             counting: quality::counting_gate(),
-        })))
+        };
+
+        // A writer takes out what an earlier version let in: a team database keeps no folder of
+        // this computer. A user that may not write leaves it for a writer.
+        if matches!(mode, Mode::Existing | Mode::Create) && !newer {
+            store.clean_local_paths();
+        }
+
+        Ok(Opened::Ready(Some(store)))
+    }
+
+    /// Takes every link to a folder of this computer (a `path:` key) out of the documents and their
+    /// chunks: a team database keeps only `git:` repositories. Idempotent, and a plain look when
+    /// there is nothing to take out. The number of links taken out.
+    pub fn drop_local_paths(&mut self) -> Result<usize, StoreError> {
+        if self.read(documents::count_local_paths)? == 0 {
+            return Ok(0);
+        }
+
+        self.write_if(documents::drop_local_paths)
+    }
+
+    /// [`Self::drop_local_paths`] on opening, saying on stderr what it did or could not do (a user
+    /// who may not write sees that line on each open, and nothing else changes for them).
+    fn clean_local_paths(&mut self) {
+        match self.drop_local_paths() {
+            Ok(removed) => clean::report_local_paths(removed, 0),
+            Err(_) => {
+                let left = self.read(documents::count_local_paths).unwrap_or(0);
+
+                clean::report_local_paths(0, left);
+            }
+        }
     }
 
     /// True when the database was written by a newer server.
     pub fn is_newer(&self) -> bool {
-        self.newer
+        self.newer.get()
     }
 
     /// True when writes run in transactions.
@@ -219,28 +278,35 @@ impl MongoStore {
     /// Waits until both search indexes answer queries, at most `wait`, and returns the state each
     /// ended in. An import that wants its documents searchable at once can use it.
     pub fn wait_for_indexes(&self, wait: Duration) -> Result<(IndexState, IndexState), StoreError> {
-        schema::wait_for_indexes(&self.db, wait).map_err(|error| connection::backend(&error))
+        schema::wait_for_indexes(&self.db, wait, !self.read_only).map_err(|error| connection::backend(&error))
     }
 
-    /// A context for reads, outside any transaction.
+    /// A context for reads, outside any transaction. The schema version is read again when the
+    /// last look is [`SCHEMA_RECHECK`] old, so a database that a newer server upgraded since is
+    /// refused (a read of what the older code does not understand could show a draft as live).
     fn reader(&self) -> Result<Ctx<'_>, StoreError> {
-        if self.newer {
+        if self.newer.get() {
             return Err(StoreError::NewerSchema);
+        }
+
+        if self.checked.get().elapsed() >= self.schema_recheck {
+            self.check_version()?;
         }
 
         Ok(Ctx::new(&self.db, None))
     }
 
     /// Fails once the stored schema is newer than this server, also when it changed after connect.
-    fn check_version(&mut self) -> Result<(), StoreError> {
-        if self.newer {
+    fn check_version(&self) -> Result<(), StoreError> {
+        if self.newer.get() {
             return Err(StoreError::NewerSchema);
         }
 
         let version = schema::version(&self.db).map_err(|error| connection::backend(&error))?;
+        self.checked.set(Instant::now());
 
         if version > schema::SCHEMA_VERSION {
-            self.newer = true;
+            self.newer.set(true);
             return Err(StoreError::NewerSchema);
         }
 
@@ -289,13 +355,27 @@ impl KnowledgeStore for MongoStore {
         self.write(|ctx| meta::set(ctx, key, value))
     }
 
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        for (key, _) in entries {
+            meta::check_settable(key)?;
+        }
+
+        self.write(|ctx| {
+            for (key, value) in entries {
+                meta::set(ctx, key, value)?;
+            }
+
+            Ok(())
+        })
+    }
+
     fn generation(&mut self) -> Result<i64, StoreError> {
         self.read(meta::generation)
     }
 
     fn put_document(&mut self, doc: &Document, chunks: &[Chunk], links: &[Link]) -> Result<i64, StoreError> {
         let title = clean::title(&doc.title)?;
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
         clean::chunks(chunks)?;
 
         // A new document's id is taken once, so a retry of the write is the same write.
@@ -318,12 +398,17 @@ impl KnowledgeStore for MongoStore {
         stored
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|ctx| documents::find(ctx, "content_sha256", sha))
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        self.read(|ctx| documents::find(ctx, "content_sha256", sha, visibility))
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        self.read(|ctx| documents::find(ctx, "source_key", key))
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        // A folder of this computer is not asked about here.
+        if clean::is_local_source_key(key) {
+            return Ok(None);
+        }
+
+        self.read(|ctx| documents::find(ctx, "source_key", key, visibility))
     }
 
     fn reusable_embeddings(
@@ -352,12 +437,25 @@ impl KnowledgeStore for MongoStore {
         self.count_useful(ids, at)
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
-        self.read(|ctx| quality::by_title(ctx, title, scope))
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
+        if scope.is_local_path() {
+            return Ok(Vec::new());
+        }
+
+        self.read(|ctx| quality::by_title(ctx, title, scope, visibility))
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
-        self.read(|ctx| quality::sharing(ctx, chunk_shas))
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.read(|ctx| quality::sharing(ctx, chunk_shas, visibility))
     }
 
     /// Whether the connected user holds the `update` privilege on the documents, as the server
@@ -367,15 +465,15 @@ impl KnowledgeStore for MongoStore {
     }
 
     fn set_links(&mut self, id: i64, links: &[Link]) -> Result<bool, StoreError> {
-        let links = clean::links(links)?;
+        let links = clean::team_links(links)?;
 
         self.write(|ctx| documents::set_links(ctx, id, &links))
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         let title = clean::title(title)?;
 
-        self.write(|ctx| documents::rename(ctx, id, &title))
+        self.write(|ctx| documents::rename(ctx, id, &title, by, at))
     }
 
     fn delete(&mut self, ids: &[i64]) -> Result<usize, StoreError> {
@@ -383,6 +481,14 @@ impl KnowledgeStore for MongoStore {
     }
 
     fn list(&mut self, query: &ListQuery) -> Result<DocumentPage, StoreError> {
+        // A team database holds no link to a folder of this computer, and is not asked for one.
+        if query.filter.is_local_path() {
+            return Ok(DocumentPage {
+                items: Vec::new(),
+                total: 0,
+            });
+        }
+
         self.read(|ctx| listing::list(ctx, query))
     }
 
@@ -391,12 +497,14 @@ impl KnowledgeStore for MongoStore {
     }
 
     fn keyword_top_k(&mut self, query: &str, scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         self.reader()?;
         self.check_searchable()?;
         self.read(|ctx| search::keyword_top_k(ctx, query, scope, k))
     }
 
     fn vector_top_k(&mut self, vector: &[f32], scope: &Scope, k: usize) -> Result<Vec<ChunkHit>, StoreError> {
+        let scope = &*scope.for_team();
         self.reader()?;
         search::check_vector(vector)?;
         self.check_searchable()?;
@@ -405,6 +513,111 @@ impl KnowledgeStore for MongoStore {
         let model = self.meta("model_id")?;
 
         self.read(|ctx| search::vector_top_k(ctx, vector, scope, model.as_deref(), k))
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        self.read(|ctx| Ok(documents::pending_of_many(ctx, &[id])?.remove(&id)))
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        let (by, comment) = check_change(change)?;
+
+        self.write_if(|ctx| review::set_review(ctx, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        if !change.action.goes_live() {
+            return Err(StoreError::Invalid("only approving or going live promotes".to_owned()));
+        }
+
+        let (by, comment) = check_change(change)?;
+
+        self.write_if(|ctx| review::promote(ctx, id, expect, change, (by.as_deref(), comment.as_deref())))
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        self.read(|ctx| review::history(ctx, id))
+    }
+
+    fn authorship_of(
+        &mut self,
+        ids: &[i64],
+        per_doc: usize,
+    ) -> Result<HashMap<i64, crate::store::Authorship>, StoreError> {
+        self.read(|ctx| review::authorship_of(ctx, ids, per_doc))
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        self.read(|ctx| review::writers_since_live(ctx, id))
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|ctx| review::section_texts(ctx, id))
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        self.read(|ctx| review::asked_sections(ctx, id, revision))
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        let comments = check_comments(comments)?;
+        let by = actor(by);
+
+        self.write(|ctx| review::add_comments(ctx, id, by.as_deref(), at, revision, &comments))
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let body = comment_body(body, COMMENT_BODY_MAX)?;
+        let by = actor(by);
+
+        self.write_if(|ctx| review::reply_comment(ctx, id, parent, by.as_deref(), at, &body))
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let by = actor(by);
+
+        self.write_if(|ctx| review::resolve_comment(ctx, id, comment, resolved, by.as_deref(), at))
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.write_if(|ctx| review::delete_comment(ctx, id, comment))
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        self.read(|ctx| review::comments(ctx, id))
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        let name = file_name(name)?;
+        check_file_size(bytes)?;
+        let sha256 = file_sha(bytes);
+
+        self.write_if(|ctx| review::put_file(ctx, id, &name, bytes, &sha256))
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        self.read(|ctx| review::file(ctx, id))
     }
 
     fn matching_chunks(&mut self, doc_id: i64, text: &str, limit: usize) -> Result<ChunkMatches, StoreError> {
@@ -440,6 +653,16 @@ fn int(row: &Row, key: &str) -> i64 {
         Some(Bson::Int32(value)) => i64::from(*value),
         Some(Bson::Double(value)) => *value as i64,
         _ => 0,
+    }
+}
+
+/// An integer field, `None` when missing, null or not a number.
+fn opt_int(row: &Row, key: &str) -> Option<i64> {
+    match row.get(key) {
+        Some(Bson::Int64(value)) => Some(*value),
+        Some(Bson::Int32(value)) => Some(i64::from(*value)),
+        Some(Bson::Double(value)) => Some(*value as i64),
+        _ => None,
     }
 }
 

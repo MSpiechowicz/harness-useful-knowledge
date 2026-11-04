@@ -428,7 +428,7 @@ fn stats_and_check_describe_the_database() {
         ),
         (json!(2), json!(3), json!(1400), json!(1), json!(1))
     );
-    assert_eq!(stats["schema"], json!(1));
+    assert_eq!(stats["schema"], json!(2));
     assert_eq!(stats["generation"], json!(2));
 
     let check = fixture.run(&["check", "--json"], "").expect("check");
@@ -436,7 +436,7 @@ fn stats_and_check_describe_the_database() {
     let local = json!({
         "ok": true,
         "backend": "sqlite",
-        "schema": 1,
+        "schema": 2,
         "capabilities": { "keyword": true, "vector": true, "vectorIndex": "ready" },
         "model": { "dims": 384 },
     });

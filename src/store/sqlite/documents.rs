@@ -7,10 +7,13 @@ use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::schema::EMBEDDING_BYTES;
-use super::sql_quality::{document_columns, stamp};
+use super::sql_quality::{document_columns, seen, stamp};
+use super::sql_review::{EVENT_SQL, FILE_DROP_SQL, ROW_SQL, pending_versions_sql};
 use crate::chunk::passage;
 use crate::limits::{DELETE_IDS_MAX, EMBED_BATCH_MAX};
-use crate::store::{Author, Chunk, Columns, DocUsage, Document, Link, Origin, PendingChunk, StoreError};
+use crate::store::review::{RENAMED_COMMENT, actor};
+use crate::store::{Author, Chunk, Columns, DocUsage, Document, EventKind, Link, Origin, PendingChunk, PendingVersion};
+use crate::store::{Status, StoreError, Visibility};
 
 /// A [`Document`] from a row of [`document_columns`].
 pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
@@ -34,6 +37,14 @@ pub(super) fn document(row: &Row) -> rusqlite::Result<Document> {
         warnings: serde_json::from_str(&warnings).unwrap_or_default(),
         added_by: Author::stored(tolerant_text(row, 13)?, tolerant_text(row, 14)?),
         updated_by: Author::stored(tolerant_text(row, 15)?, tolerant_text(row, 16)?),
+        status: {
+            let status: String = row.get(20)?;
+
+            Status::parse(&status)
+                .ok_or_else(|| rusqlite::Error::InvalidColumnType(20, "status".to_owned(), Type::Text))?
+        },
+        pending_of: row.get(21)?,
+        review_rev: row.get(22)?,
     })
 }
 
@@ -95,8 +106,56 @@ pub(super) fn stamp_authors(tx: &Transaction, columns: Columns, id: i64, doc: &D
     Ok(())
 }
 
+/// The state of a row: status, the live document it is pending for, revision and format.
+pub(super) struct RowState {
+    pub status: Status,
+    pub pending_of: Option<i64>,
+    pub review_rev: i64,
+    pub format: String,
+}
+
+/// The review columns of document `id`; `None` when there is no such document.
+pub(super) fn row_state(conn: &Connection, id: i64) -> Result<Option<RowState>, StoreError> {
+    let found = conn
+        .query_row(ROW_SQL, [id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .optional()?;
+
+    found
+        .map(|(status, pending_of, review_rev, format)| {
+            Ok(RowState {
+                status: Status::parse(&status)
+                    .ok_or_else(|| StoreError::Backend("unexpected value in column status".to_owned()))?,
+                pending_of,
+                review_rev,
+                format,
+            })
+        })
+        .transpose()
+}
+
+/// Records an event of document `id`.
+pub(super) fn record(
+    tx: &Transaction,
+    id: i64,
+    kind: EventKind,
+    by: Option<&str>,
+    comment: Option<&str>,
+    at: i64,
+) -> Result<(), StoreError> {
+    tx.execute(EVENT_SQL, params![id, kind.as_str(), by, comment, at])?;
+
+    Ok(())
+}
+
 /// Stores `doc` (whose cleaned title is `title`) with `chunks` and `links`: inserted for id 0,
-/// else replacing that document's chunks and links.
+/// else replacing that document's chunks and links. A row that is not live records the event.
 pub(super) fn put(
     tx: &Transaction,
     doc: &Document,
@@ -106,12 +165,15 @@ pub(super) fn put(
 ) -> Result<i64, StoreError> {
     let warnings = serde_json::to_string(&doc.warnings).unwrap_or_else(|_| "[]".to_owned());
     let chunk_count = i64::try_from(chunks.len()).unwrap_or(i64::MAX);
+    let by = actor(doc.updated_by.as_ref().map(|author| author.name.as_str()));
 
     let id = if doc.id == 0 {
-        tx.query_row(
+        check_new_row(tx, doc)?;
+
+        let id: i64 = tx.query_row(
             "INSERT INTO knowledge_documents (title, source_name, source_key, format, content_sha256, file_sha256,
-                 bytes, chunk_count, origin, warnings, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) RETURNING id",
+                 bytes, chunk_count, origin, warnings, created_at, updated_at, status, pending_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) RETURNING id",
             params![
                 title,
                 doc.source_name,
@@ -125,18 +187,40 @@ pub(super) fn put(
                 warnings,
                 doc.created_at,
                 doc.updated_at,
+                doc.status.as_str(),
+                doc.pending_of,
             ],
             |row| row.get(0),
-        )?
+        )?;
+
+        if !doc.status.is_live() {
+            let kind = if doc.pending_of.is_some() {
+                EventKind::UpdateDrafted
+            } else {
+                EventKind::Drafted
+            };
+
+            record(tx, id, kind, by.as_deref(), None, doc.updated_at)?;
+        }
+
+        id
     } else {
+        let Some(stored) = row_state(tx, doc.id)? else {
+            return Err(not_found(doc.id));
+        };
+
         // The old chunks go first, so the retitle trigger has no chunks to rewrite.
         tx.execute("DELETE FROM knowledge_chunks WHERE doc_id = ?1", [doc.id])?;
         tx.execute("DELETE FROM knowledge_doc_links WHERE doc_id = ?1", [doc.id])?;
+        tx.execute(FILE_DROP_SQL, [doc.id])?;
 
-        let changed = tx.execute(
+        // A change of content is a new revision, and what was waiting for approval is no longer
+        // what was asked: it is a draft again.
+        tx.execute(
             "UPDATE knowledge_documents SET title = ?2, source_name = ?3, source_key = ?4, format = ?5,
                  content_sha256 = ?6, file_sha256 = ?7, bytes = ?8, chunk_count = ?9, origin = ?10,
-                 warnings = ?11, updated_at = ?12
+                 warnings = ?11, updated_at = ?12, review_rev = review_rev + 1,
+                 status = CASE WHEN status = 'waiting' THEN 'draft' ELSE status END
              WHERE id = ?1",
             params![
                 doc.id,
@@ -154,8 +238,8 @@ pub(super) fn put(
             ],
         )?;
 
-        if changed == 0 {
-            return Err(not_found(doc.id));
+        if !stored.status.is_live() {
+            record(tx, doc.id, EventKind::Edited, by.as_deref(), None, doc.updated_at)?;
         }
 
         doc.id
@@ -165,6 +249,75 @@ pub(super) fn put(
     insert_links(tx, id, links)?;
 
     Ok(id)
+}
+
+/// Refuses a new row that cannot be stored: a pending version needs a live document without one.
+fn check_new_row(tx: &Transaction, doc: &Document) -> Result<(), StoreError> {
+    let Some(live) = doc.pending_of else {
+        return Ok(());
+    };
+
+    if doc.status.is_live() {
+        return Err(StoreError::Invalid("a pending version is never live".to_owned()));
+    }
+
+    match row_state(tx, live)? {
+        None => return Err(not_found(live)),
+        Some(target) if !target.status.is_live() => {
+            return Err(StoreError::Invalid(format!("document {live} is not live")));
+        }
+        Some(_) => {}
+    }
+
+    let taken: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM knowledge_documents WHERE pending_of = ?1",
+            [live],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if taken.is_some() {
+        return Err(StoreError::Invalid(format!(
+            "document {live} already has a pending version"
+        )));
+    }
+
+    Ok(())
+}
+
+/// The pending versions of the live documents `ids`, by live id.
+pub(super) fn pending_of_many(
+    conn: &Connection,
+    columns: Columns,
+    ids: &[i64],
+) -> Result<HashMap<i64, PendingVersion>, StoreError> {
+    let wanted = serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_owned());
+    let mut statement = conn.prepare(&pending_versions_sql(columns))?;
+    let rows = statement.query_map([wanted], document)?;
+
+    let mut found = HashMap::new();
+
+    for row in rows {
+        let doc = row?;
+
+        if let Some(live) = doc.pending_of {
+            found.insert(live, pending_version(&doc));
+        }
+    }
+
+    Ok(found)
+}
+
+/// The summary of a pending row.
+pub(super) fn pending_version(doc: &Document) -> PendingVersion {
+    PendingVersion {
+        id: doc.id,
+        status: doc.status,
+        review_rev: doc.review_rev,
+        updated_by: doc.updated_by.clone(),
+        updated_at: doc.updated_at,
+    }
 }
 
 fn insert_chunks(tx: &Transaction, doc_id: i64, title: &str, chunks: &[Chunk]) -> Result<(), StoreError> {
@@ -217,14 +370,70 @@ pub(super) fn set_links(tx: &Transaction, id: i64, links: &[Link]) -> Result<boo
 }
 
 /// Retitles document `id` (to the cleaned `title`); false when there is none. The chunks follow
-/// through the retitle trigger, so the keyword index finds the new title.
-pub(super) fn rename(tx: &Transaction, id: i64, title: &str) -> Result<bool, StoreError> {
+/// through the retitle trigger, so the keyword index finds the new title. A row that is not live
+/// takes it as a change (see [`retitle`]), and so does the pending version of a live one.
+pub(super) fn rename(tx: &Transaction, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
+    let Some(state) = row_state(tx, id)? else {
+        return Ok(false);
+    };
+
+    retitle(tx, id, &state, title, by, at)?;
+
+    if state.status.is_live() {
+        let pending: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM knowledge_documents WHERE pending_of = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(pending) = pending
+            && let Some(state) = row_state(tx, pending)?
+        {
+            retitle(tx, pending, &state, title, by, at)?;
+        }
+    }
+
+    Ok(true)
+}
+
+/// Gives the row `id`, in `state`, the title. A live row is only retitled. A row that is not live
+/// has a new revision, a waiting one is a draft again (what was asked is no longer what is there)
+/// and the `edited` event says what changed. Nothing when the title already is `title`.
+fn retitle(
+    tx: &Transaction,
+    id: i64,
+    state: &RowState,
+    title: &str,
+    by: Option<&str>,
+    at: i64,
+) -> Result<(), StoreError> {
+    // The renamer goes on the `edited` event, not on the row: who wrote the content stays as it was.
+    let renamer = actor(by);
+
+    if state.status.is_live() {
+        tx.execute(
+            "UPDATE knowledge_documents SET title = ?2, updated_at = ?3
+             WHERE id = ?1 AND title <> ?2",
+            params![id, title, at],
+        )?;
+
+        return Ok(());
+    }
+
     let changed = tx.execute(
-        "UPDATE knowledge_documents SET title = ?2 WHERE id = ?1",
-        params![id, title],
+        "UPDATE knowledge_documents SET title = ?2, review_rev = review_rev + 1,
+             status = CASE WHEN status = 'waiting' THEN 'draft' ELSE status END, updated_at = ?3
+         WHERE id = ?1 AND title <> ?2",
+        params![id, title, at],
     )?;
 
-    Ok(changed > 0)
+    if changed > 0 {
+        record(tx, id, EventKind::Edited, renamer.as_deref(), Some(RENAMED_COMMENT), at)?;
+    }
+
+    Ok(())
 }
 
 /// Deletes the documents; the chunks, links and index entries go with them.
@@ -244,16 +453,19 @@ pub(super) fn delete(tx: &Transaction, ids: &[i64]) -> Result<usize, StoreError>
     Ok(deleted)
 }
 
-/// The oldest document whose `column` (`content_sha256` or `source_key`) is `value`.
+/// The oldest document `visibility` lets through whose `column` (`content_sha256` or `source_key`)
+/// is `value`.
 pub(super) fn find(
     conn: &Connection,
     columns: Columns,
     column: &str,
     value: &str,
+    visibility: Visibility,
 ) -> Result<Option<Document>, StoreError> {
     let sql = format!(
-        "SELECT {} FROM knowledge_documents d WHERE d.{column} = ?1 ORDER BY d.id LIMIT 1",
-        document_columns(columns)
+        "SELECT {} FROM knowledge_documents d WHERE d.{column} = ?1 AND {} ORDER BY d.id LIMIT 1",
+        document_columns(columns),
+        seen(visibility)
     );
 
     Ok(conn.query_row(&sql, [value], document).optional()?)

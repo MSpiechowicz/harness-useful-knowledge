@@ -77,6 +77,45 @@ fn a_command_that_needs_the_unreachable_remote_fails_with_the_unreachable_code()
         );
     }
 
+    // The review commands never answer from this computer instead.
+    for args in [
+        &["docs", "ask", "--json", "5", "--expect", "0"][..],
+        &["docs", "approve", "--json", "5", "--expect", "0"],
+        &["docs", "go-live", "--json", "5", "--expect", "0"],
+        &[
+            "docs",
+            "request-changes",
+            "--json",
+            "5",
+            "--expect",
+            "0",
+            "--comment",
+            "No",
+        ],
+        &[
+            "docs",
+            "review",
+            "--json",
+            "5",
+            "--expect",
+            "0",
+            "--verdict",
+            "comment",
+            "--body",
+            "Hi",
+        ],
+        &["docs", "history", "--json", "5"],
+        &["docs", "comments", "--json", "5"],
+        &["docs", "comment", "reply", "--json", "5", "1", "--body", "Hi"],
+        &["docs", "compare", "--json", "5"],
+        &["docs", "download", "--json", "5", "--to", "/tmp/never-written.md"],
+        &["approval", "get", "--json"],
+        &["approval", "set", "--json", "on"],
+        &["upgrade", "--json"],
+    ] {
+        assert_unreachable(&run(root.path(), "remote+local", args), &args.join(" "));
+    }
+
     // With the remote alone nothing can answer instead, and it is the same condition.
     assert_unreachable(&run(root.path(), "remote", &["docs", "list", "--json"]), "remote only");
 }

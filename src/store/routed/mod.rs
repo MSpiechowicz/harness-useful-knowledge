@@ -38,10 +38,11 @@ use crate::backend::OpenError;
 use crate::config::{Kind, Place, Routing};
 use crate::limits::LIST_PAGE_MAX;
 use crate::store::{
-    Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, DocumentRow, KnowledgeStore, Link,
-    ListQuery, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope,
+    Chunk, ChunkHit, ChunkMatches, Comment, Detail, Document, DocumentDetail, DocumentPage, DocumentRow, History,
+    KnowledgeStore, Link, ListQuery, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply,
+    Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility,
 };
-use rows::{interleave, tag_detail, tag_document, tagged_hits};
+use rows::{interleave, tag_detail, tag_reply, tag_row, tagged_hits};
 
 /// The line that says a search, a list or a read comes from this computer alone, for the MCP replies
 /// and the stderr of `search`.
@@ -124,6 +125,14 @@ impl RoutedStore {
         })
     }
 
+    /// The kind of the live document `live` (a pending version takes it).
+    fn kind_of(&mut self, live: i64) -> Result<Kind, StoreError> {
+        match self.get(live, &Detail::default())? {
+            Some(found) => Ok(Kind::of(found.links.len())),
+            None => Err(not_found(live)),
+        }
+    }
+
     /// The error of a write the routing does not allow.
     fn refuse(&self, kind: Kind, place: Place) -> Result<(), StoreError> {
         self.routing.check_write(kind, place).map_err(StoreError::Invalid)
@@ -138,11 +147,37 @@ impl KnowledgeStore for RoutedStore {
         }
     }
 
+    /// The remote database's value, never this computer's: no remote has none, and a remote that
+    /// cannot be reached is an error, so a caller never takes this computer's answer for the team's.
+    fn remote_meta(&mut self, key: &str) -> Result<Option<String>, StoreError> {
+        self.ready()?;
+
+        if self.remote.is_down() {
+            return Err(StoreError::Unreachable(REMOTE_DOWN.to_owned()));
+        }
+
+        let Some(store) = self.remote.store() else {
+            return Ok(None);
+        };
+        let found = store.meta(key);
+
+        self.answer(Place::Remote, found)
+    }
+
     fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
         self.writable(Place::Remote)?;
 
         match self.primary()? {
             Some(store) => store.set_meta(key, value),
+            None => Err(StoreError::Invalid("there is no database to write to".to_owned())),
+        }
+    }
+
+    fn set_metas(&mut self, entries: &[(&str, &str)]) -> Result<(), StoreError> {
+        self.writable(Place::Remote)?;
+
+        match self.primary()? {
+            Some(store) => store.set_metas(entries),
             None => Err(StoreError::Invalid("there is no database to write to".to_owned())),
         }
     }
@@ -160,10 +195,16 @@ impl KnowledgeStore for RoutedStore {
     }
 
     fn put_document(&mut self, doc: &Document, chunks: &[Chunk], links: &[Link]) -> Result<i64, StoreError> {
-        let kind = Kind::of(links.len());
-        let (place, inner) = match doc.id {
-            0 => (self.routing.default_place(kind), 0),
-            id => {
+        // A pending version is kept where its live document is, and is of the kind of that document
+        // (it has no links of its own).
+        let kind = match doc.pending_of {
+            Some(live) => self.kind_of(live)?,
+            None => Kind::of(links.len()),
+        };
+        let (place, inner) = match (doc.id, doc.pending_of) {
+            (0, Some(live)) => (ids::place_of(live), 0),
+            (0, None) => (self.routing.default_place(kind), 0),
+            (id, _) => {
                 let (place, inner) = ids::split(id);
                 (place.unwrap_or(Place::Remote), inner)
             }
@@ -177,18 +218,21 @@ impl KnowledgeStore for RoutedStore {
             .ok_or_else(|| StoreError::NotFound(format!("document {} not found", ids::show(doc.id))))?;
         let doc = Document {
             id: inner,
+            pending_of: doc.pending_of.map(|live| ids::split(live).1),
             ..doc.clone()
         };
 
         store.put_document(&doc, chunks, links).map(|id| ids::tag(place, id))
     }
 
-    fn find_by_content_sha(&mut self, sha: &str) -> Result<Option<Document>, StoreError> {
-        self.first_found(|store| store.find_by_content_sha(sha))
+    fn find_by_content_sha(&mut self, sha: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        self.first_found(false, |store| store.find_by_content_sha(sha, visibility))
     }
 
-    fn find_by_source_key(&mut self, key: &str) -> Result<Option<Document>, StoreError> {
-        self.first_found(|store| store.find_by_source_key(key))
+    fn find_by_source_key(&mut self, key: &str, visibility: Visibility) -> Result<Option<Document>, StoreError> {
+        self.first_found(crate::store::clean::is_local_source_key(key), |store| {
+            store.find_by_source_key(key, visibility)
+        })
     }
 
     /// Counted in the place each id carries, see [`RoutedStore::count`].
@@ -200,12 +244,21 @@ impl KnowledgeStore for RoutedStore {
         self.count(doc_ids, |store, own| store.record_useful(own, at))
     }
 
-    fn find_by_title(&mut self, title: &str, scope: &TitleScope) -> Result<Vec<Document>, StoreError> {
-        self.titled(title, scope)
+    fn find_by_title(
+        &mut self,
+        title: &str,
+        scope: &TitleScope,
+        visibility: Visibility,
+    ) -> Result<Vec<Document>, StoreError> {
+        self.titled(title, scope, visibility)
     }
 
-    fn docs_sharing_chunks(&mut self, chunk_shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
-        self.sharing(chunk_shas)
+    fn docs_sharing_chunks(
+        &mut self,
+        chunk_shas: &[String],
+        visibility: Visibility,
+    ) -> Result<Vec<(i64, usize)>, StoreError> {
+        self.sharing(chunk_shas, visibility)
     }
 
     fn remote_writable(&mut self) -> Option<bool> {
@@ -255,12 +308,12 @@ impl KnowledgeStore for RoutedStore {
         }
     }
 
-    fn rename(&mut self, id: i64, title: &str) -> Result<bool, StoreError> {
+    fn rename(&mut self, id: i64, title: &str, by: Option<&str>, at: i64) -> Result<bool, StoreError> {
         self.writable(ids::place_of(id))?;
 
         match self.resolve(id)? {
             Some((place, inner)) => match self.store(place) {
-                Some(store) => store.rename(inner, title),
+                Some(store) => store.rename(inner, title, by, at),
                 None => Ok(false),
             },
             None => Ok(false),
@@ -313,6 +366,11 @@ impl KnowledgeStore for RoutedStore {
                 continue;
             }
 
+            // The team's database holds no link to a folder of this computer and is never asked for one.
+            if place == Place::Remote && query.filter.is_local_path() {
+                continue;
+            }
+
             let Some(filter) = merge::filter_for(&query.filter, self.kinds(place)) else {
                 continue;
             };
@@ -329,7 +387,7 @@ impl KnowledgeStore for RoutedStore {
             total += page.total;
 
             for mut row in page.items {
-                tag_document(place, &mut row.doc);
+                tag_row(place, &mut row);
                 rows.push(row);
             }
         }
@@ -354,6 +412,7 @@ impl KnowledgeStore for RoutedStore {
         let inner_detail = Detail {
             sections: detail.sections,
             chunk: detail.chunk.map(|chunk| ids::split(chunk).1),
+            drafts: detail.drafts,
         };
 
         let Some(store) = self.store(place) else {
@@ -385,7 +444,7 @@ impl KnowledgeStore for RoutedStore {
             let Some(store) = self.store(place) else { continue };
 
             let found = store
-                .keyword_top_k(query, scope, k)
+                .keyword_top_k(query, &scope_in(place, scope), k)
                 .and_then(|found| kinds.keep(store, found));
 
             if let Some(hits) = self.read(place, found)? {
@@ -407,7 +466,7 @@ impl KnowledgeStore for RoutedStore {
             let Some(store) = self.store(place) else { continue };
 
             let found = store
-                .vector_top_k(vector, scope, k)
+                .vector_top_k(vector, &scope_in(place, scope), k)
                 .and_then(|found| kinds.keep(store, found));
 
             if let Some(hits) = self.read(place, found)? {
@@ -434,6 +493,256 @@ impl KnowledgeStore for RoutedStore {
         }
 
         Ok(found)
+    }
+
+    fn pending_of(&mut self, id: i64) -> Result<Option<PendingVersion>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+        let found = store.pending_of(inner);
+        let mut found = self.answer(place, found)?;
+
+        if let Some(pending) = &mut found {
+            pending.id = ids::tag(place, pending.id);
+        }
+
+        Ok(found)
+    }
+
+    fn set_review(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(ReviewReply::NotFound);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(ReviewReply::NotFound);
+        };
+
+        store
+            .set_review(inner, expect, change)
+            .map(|reply| tag_reply(place, reply))
+    }
+
+    fn promote(&mut self, id: i64, expect: i64, change: &ReviewChange) -> Result<ReviewReply, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(ReviewReply::NotFound);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(ReviewReply::NotFound);
+        };
+
+        store
+            .promote(inner, expect, change)
+            .map(|reply| tag_reply(place, reply))
+    }
+
+    fn history(&mut self, id: i64) -> Result<Option<History>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+        let found = store.history(inner);
+
+        self.answer(place, found)
+    }
+
+    fn authorship_of(
+        &mut self,
+        ids: &[i64],
+        per_doc: usize,
+    ) -> Result<HashMap<i64, crate::store::Authorship>, StoreError> {
+        let mut found = HashMap::new();
+
+        for place in [Place::Remote, Place::Local] {
+            let own: Vec<i64> = ids
+                .iter()
+                .filter(|id| ids::place_of(**id) == place)
+                .map(|id| ids::split(*id).1)
+                .collect();
+
+            if own.is_empty() {
+                continue;
+            }
+
+            let Some(store) = self.store(place) else { continue };
+            let asked = store.authorship_of(&own, per_doc);
+
+            if let Some(people) = self.read(place, asked)? {
+                found.extend(
+                    people
+                        .into_iter()
+                        .map(|(id, authorship)| (ids::tag(place, id), authorship)),
+                );
+            }
+        }
+
+        Ok(found)
+    }
+
+    fn writers_since_live(&mut self, id: i64) -> Result<Vec<String>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(Vec::new());
+        };
+        let found = store.writers_since_live(inner);
+
+        self.answer(place, found)
+    }
+
+    fn section_texts(&mut self, id: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+        let found = store.section_texts(inner);
+
+        self.answer(place, found)
+    }
+
+    fn asked_sections(&mut self, id: i64, revision: i64) -> Result<Option<Vec<SectionText>>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+        let found = store.asked_sections(inner, revision);
+
+        self.answer(place, found)
+    }
+
+    fn add_comments(
+        &mut self,
+        id: i64,
+        by: Option<&str>,
+        at: i64,
+        revision: i64,
+        comments: &[NewComment],
+    ) -> Result<Vec<i64>, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Err(not_found(id));
+        };
+        let Some(store) = self.store(place) else {
+            return Err(not_found(id));
+        };
+
+        store
+            .add_comments(inner, by, at, revision, comments)
+            .map(|added| added.into_iter().map(|comment| ids::tag(place, comment)).collect())
+    }
+
+    fn reply_comment(
+        &mut self,
+        id: i64,
+        parent: i64,
+        by: Option<&str>,
+        at: i64,
+        body: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Err(not_found(id));
+        };
+        let Some(store) = self.store(place) else {
+            return Err(not_found(id));
+        };
+
+        store
+            .reply_comment(inner, ids::split(parent).1, by, at, body)
+            .map(|reply| reply.map(|comment| ids::tag(place, comment)))
+    }
+
+    fn resolve_comment(
+        &mut self,
+        id: i64,
+        comment: i64,
+        resolved: bool,
+        by: Option<&str>,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(false);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(false);
+        };
+
+        store.resolve_comment(inner, ids::split(comment).1, resolved, by, at)
+    }
+
+    fn delete_comment(&mut self, id: i64, comment: i64) -> Result<Option<Vec<i64>>, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+
+        store
+            .delete_comment(inner, ids::split(comment).1)
+            .map(|deleted| deleted.map(|found| found.into_iter().map(|each| ids::tag(place, each)).collect()))
+    }
+
+    fn comments(&mut self, id: i64) -> Result<Vec<Comment>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(Vec::new());
+        };
+        let found = store.comments(inner);
+        let mut found = self.answer(place, found)?;
+
+        for comment in &mut found {
+            comment.id = ids::tag(place, comment.id);
+            comment.parent_id = comment.parent_id.map(|parent| ids::tag(place, parent));
+        }
+
+        Ok(found)
+    }
+
+    fn put_file(&mut self, id: i64, name: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        self.writable(ids::place_of(id))?;
+
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(false);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(false);
+        };
+
+        store.put_file(inner, name, bytes)
+    }
+
+    fn file(&mut self, id: i64) -> Result<Option<StoredFile>, StoreError> {
+        let Some((place, inner)) = self.resolve(id)? else {
+            return Ok(None);
+        };
+        let Some(store) = self.store(place) else {
+            return Ok(None);
+        };
+        let found = store.file(inner);
+
+        self.answer(place, found)
     }
 
     fn routed_parts(&mut self) -> Option<Vec<Part<'_>>> {
@@ -478,6 +787,19 @@ impl KnowledgeStore for RoutedStore {
     fn remote_lost(&mut self, error: &StoreError) -> bool {
         self.remote.lost(error)
     }
+}
+
+/// `scope` as the store of `place` is asked it: the team's database never gets a folder of this
+/// computer (see [`Scope::for_team`]).
+pub(crate) fn scope_in(place: Place, scope: &Scope) -> std::borrow::Cow<'_, Scope> {
+    match place {
+        Place::Remote => scope.for_team(),
+        Place::Local => std::borrow::Cow::Borrowed(scope),
+    }
+}
+
+fn not_found(id: i64) -> StoreError {
+    StoreError::NotFound(format!("document {} not found", ids::show(id)))
 }
 
 #[cfg(test)]

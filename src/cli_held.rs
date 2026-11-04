@@ -1,8 +1,10 @@
 //! The review queue commands for Harness Desktop and the person at the terminal: what agents
 //! proposed with `knowledge_add` ([`crate::held`]). None is reachable through MCP.
 //!
-//! - `held list --json` prints `{"held": [...]}`: the waiting proposals (camelCase, as written,
-//!   without their text, with a `preview` of its start), newest first.
+//! - `held list --json [--sort created|addedBy]` prints `{"held": [...]}`: the waiting proposals
+//!   (camelCase, as written, without their text, with a `preview` of its start), newest first
+//!   (`created`, the default) or by the person they are written for (`addedBy`: names A to Z with
+//!   case ignored, proposals with no name last, each group newest first).
 //! - `held get --json ID` prints `{"held": {...}}`: one proposal with its whole text.
 //! - `held approve --json ID [--expect REVISION] [--place remote|local]` imports the proposal as a document (origin
 //!   `agentApproved`, embedded when the embedder runs, else its chunks wait for `docs reindex`) and
@@ -17,14 +19,27 @@
 //!   document on this computer when both places are in use.
 //!   A proposal that replaces a document is approved only while that document is the one it was
 //!   made about (its text hash and key as held), otherwise it is `refused` and nothing is overwritten.
-//! - `held reject --json ID [--expect REVISION]` removes it, printing `{"rejected": "<heldId>"}`.
+//!   While team approval is on in the remote database a proposal that goes there is stored as a draft
+//!   (`status` `added` with `"draft": true`) or, when it replaces a live document, as that document's
+//!   pending version (`status` `pending`): nothing an agent can read changes until a teammate approves
+//!   it (see [`crate::review`]). `"draft"` is in every approval of a new, updated or pending document.
+//! - `held reject --json ID [--expect REVISION] [--comment TEXT]` removes it, printing
+//!   `{"rejected": "<heldId>"}` and, when a reason was given, `"comment"` (one line, at most 500
+//!   characters).
+//! - `held request-changes --json ID [--expect REVISION] --comment TEXT` marks the proposal
+//!   `changesRequested` with the comment (required, one line, at most 500 characters) and prints
+//!   `{"held": {...}}` like `held get`. It keeps waiting. Every item of `held list|get` has a
+//!   `status` (`waiting` or `changesRequested`) and, after a request, `changesRequested`:
+//!   `{"comment", "at", "by"}` (`by` is the reviewer's git `user.name`, or null). A later proposal
+//!   of the same session that names it, or has its title, replaces it and clears the request
+//!   (see [`crate::held::HeldStore::hold_named`]).
 //!
 //! Approving and rejecting claim the proposal first (see [`crate::held`]), so two decisions about one
 //! proposal cannot both be carried out, and an approval that fails puts it back. A refusal prints
 //! `{"error": CODE, "message"}` on stdout and the message as the last line of stderr, exit 1:
 //! `notFound` (no such proposal, or another decision took it), `changed` (not the expected
-//! revision) or `refused` (the import failed, the message says why). Other failures and usage
-//! errors as in [`crate::cli`].
+//! revision), `commentRequired` (a request for changes without a comment) or `refused` (the import
+//! failed, the message says why). Other failures and usage errors as in [`crate::cli`].
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -35,19 +50,21 @@ use crate::backend::{self, Access, Attempt, OpenError};
 use crate::cli::{self, Args};
 use crate::config::{Backend, Kind, Layout, Place, Routing};
 use crate::extract::pdf::PdfPages;
+use crate::held::ChangesRequested;
 use crate::held::{Claim, HeldItem, HeldStore};
 use crate::import::events::Status;
 use crate::import::place::write_place;
 use crate::import::walk::Candidate;
 use crate::import::{Importer, Outcome, embed};
+use crate::review;
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
 use crate::store::{Author, Detail, KnowledgeStore, Origin, clean};
-use crate::support::{Env, author};
+use crate::support::{Env, author, time};
 use crate::tokens::counter_for;
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "held list --json | held get --json ID | held approve --json ID [--expect REVISION] [--place remote|local] | held \
-     reject --json ID [--expect REVISION]";
+pub const USAGE: &str = "held list --json [--sort created|addedBy] | held get --json ID | held approve --json ID [--expect REVISION] [--place remote|local] | held \
+     reject --json ID [--expect REVISION] [--comment TEXT] | held request-changes --json ID [--expect REVISION] --comment TEXT";
 
 /// Characters of the start of a proposal's text that `held list` shows.
 const PREVIEW_CHARS: usize = 300;
@@ -57,7 +74,10 @@ const PREVIEW_CHARS: usize = 300;
 pub enum Code {
     NotFound,
     Changed,
+    CommentRequired,
     Refused,
+    /// The proposal is linked to a folder of this computer and the team's database takes none.
+    LocalPath,
 }
 
 impl Code {
@@ -65,7 +85,9 @@ impl Code {
         match self {
             Self::NotFound => "notFound",
             Self::Changed => "changed",
+            Self::CommentRequired => "commentRequired",
             Self::Refused => "refused",
+            Self::LocalPath => "localPath",
         }
     }
 }
@@ -122,24 +144,34 @@ pub fn reply(env: &Env, backend: &Backend, routing: Routing, args: &[Option<&str
         [Some("get"), rest @ ..] => get(&held, rest),
         [Some("approve"), rest @ ..] => approve(env, backend, routing, &held, rest),
         [Some("reject"), rest @ ..] => reject(&held, rest),
+        [Some("request-changes"), rest @ ..] => request_changes(env, &held, rest),
         _ => Reply::Usage,
     }
 }
 
-/// What a decision names: the id, the `--expect` revision and, for an approval, the `--place`.
+/// What a decision names: the id, the `--expect` revision and, for an approval, the `--place`, for
+/// a rejection or a request for changes the `--comment`.
 struct Decision<'a> {
     id: &'a str,
     expect: Option<&'a str>,
     place: Option<Place>,
+    comment: Option<&'a str>,
+}
+
+/// Which decision is parsed: it decides the options it takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Way {
+    Approve,
+    Reject,
+    RequestChanges,
 }
 
 /// The decision in `args`; `None` for a usage error. `--place` is only for an approval and is
-/// `remote` or `local`.
-fn decision<'a>(args: &'a [Option<&'a str>], approval: bool) -> Option<Decision<'a>> {
-    let valued: &[&str] = if approval {
-        &["--expect", "--place"]
-    } else {
-        &["--expect"]
+/// `remote` or `local`, `--comment` only for a rejection or a request for changes.
+fn decision<'a>(args: &'a [Option<&'a str>], kind: Way) -> Option<Decision<'a>> {
+    let valued: &[&str] = match kind {
+        Way::Approve => &["--expect", "--place"],
+        Way::Reject | Way::RequestChanges => &["--expect", "--comment"],
     };
     let parsed = Args::parse(args, &["--json"], valued)?;
 
@@ -156,11 +188,12 @@ fn decision<'a>(args: &'a [Option<&'a str>], approval: bool) -> Option<Decision<
         id: parsed.positional[0],
         expect: parsed.value("--expect"),
         place,
+        comment: parsed.value("--comment"),
     })
 }
 
 fn list(held: &HeldStore, args: &[Option<&str>]) -> Reply {
-    let Some(parsed) = Args::parse(args, &["--json"], &[]) else {
+    let Some(parsed) = Args::parse(args, &["--json"], &["--sort"]) else {
         return Reply::Usage;
     };
 
@@ -168,10 +201,37 @@ fn list(held: &HeldStore, args: &[Option<&str>]) -> Reply {
         return Reply::Usage;
     }
 
+    let by_author = match parsed.value("--sort") {
+        None | Some("created") => false,
+        Some("addedBy") => true,
+        Some(_) => return Reply::Usage,
+    };
+
     match held.list() {
-        Ok(items) => Reply::Done(json!({ "held": items.iter().map(summary).collect::<Vec<_>>() })),
+        Ok(mut items) => {
+            if by_author {
+                sort_by_author(&mut items);
+            }
+
+            Reply::Done(json!({ "held": items.iter().map(summary).collect::<Vec<_>>() }))
+        }
         Err(message) => Reply::Failed(message),
     }
+}
+
+/// `items` (newest first) ordered by the name they are written for: trimmed and case-folded, a
+/// proposal whose name is missing or not fit to show (see [`public`]) after all the others. The sort
+/// is stable, so each group stays newest first.
+fn sort_by_author(items: &mut [HeldItem]) {
+    items.sort_by_cached_key(|item| {
+        let name = item
+            .added_by
+            .as_deref()
+            .and_then(author::clean)
+            .map(|name| name.to_lowercase());
+
+        (name.is_none(), name)
+    });
 }
 
 /// `item` as JSON, its `addedBy` cleaned, its `replaces` written as people and clients read ids (`12` or `local:12`),
@@ -181,6 +241,15 @@ fn public(item: &HeldItem) -> Value {
 
     if let (Value::Object(fields), Some(id)) = (&mut value, item.replaces) {
         fields.insert("replaces".to_owned(), crate::store::routed::ids::json(id));
+    }
+
+    if let Value::Object(fields) = &mut value {
+        fields.insert("status".to_owned(), json!(item.status()));
+
+        // The comment of the request is read at the top level, beside the `changesRequested` it is in.
+        if let Some(requested) = &item.changes_requested {
+            fields.insert("comment".to_owned(), json!(requested.comment));
+        }
     }
 
     // The held file is plain text anybody with access to the folder may have edited: the name is
@@ -234,16 +303,73 @@ fn not_found() -> Reply {
 }
 
 fn reject(held: &HeldStore, args: &[Option<&str>]) -> Reply {
-    let Some(Decision { id, expect, .. }) = decision(args, false) else {
+    let Some(Decision {
+        id, expect, comment, ..
+    }) = decision(args, Way::Reject)
+    else {
         return Reply::Usage;
+    };
+
+    let comment = match comment.map(|text| crate::store::review::event_comment(Some(text))) {
+        Some(Ok(comment)) => comment,
+        Some(Err(error)) => return Reply::Refused(Code::Refused, error.to_string()),
+        None => None,
     };
 
     match claim(held, id, expect) {
         Ok(claim) => match claim.finish() {
-            Ok(()) => Reply::Done(json!({ "rejected": id })),
+            Ok(()) => {
+                let mut rejected = json!({ "rejected": id });
+
+                if let Some(comment) = comment {
+                    rejected["comment"] = json!(comment);
+                }
+
+                Reply::Done(rejected)
+            }
             Err(message) => Reply::Failed(message),
         },
         Err(reply) => reply,
+    }
+}
+
+/// `held request-changes`: the proposal keeps waiting, marked with what to change.
+fn request_changes(env: &Env, held: &HeldStore, args: &[Option<&str>]) -> Reply {
+    let Some(Decision {
+        id, expect, comment, ..
+    }) = decision(args, Way::RequestChanges)
+    else {
+        return Reply::Usage;
+    };
+
+    let Some(comment) = comment else {
+        return Reply::Usage;
+    };
+
+    let comment = match crate::store::review::event_comment(Some(comment)) {
+        Ok(Some(comment)) => comment,
+        Ok(None) => {
+            return Reply::Refused(Code::CommentRequired, "requesting changes needs a comment".to_owned());
+        }
+        Err(error) => return Reply::Refused(Code::Refused, error.to_string()),
+    };
+
+    let claim = match claim(held, id, expect) {
+        Ok(claim) => claim,
+        Err(reply) => return reply,
+    };
+
+    let mut item = claim.item.clone();
+    item.changes_requested = Some(ChangesRequested {
+        comment,
+        at: time::rfc3339(crate::held::now()),
+        by: std::env::current_dir().ok().and_then(|dir| review::actor_of(env, &dir)),
+    });
+    item.revision = item.digest();
+
+    match claim.update(&item) {
+        Ok(()) => Reply::Done(json!({ "held": public(&item) })),
+        Err(message) => Reply::Failed(message),
     }
 }
 
@@ -297,6 +423,17 @@ fn open_to_change(
     }
 }
 
+/// The reply to a team approval that could not be read.
+fn review_failure(error: review::Error) -> Reply {
+    match error {
+        review::Error::Refused(refusal) if refusal.code == review::Code::Unreachable => {
+            Reply::Unreachable(REMOTE_DOWN_WRITE.to_owned())
+        }
+        review::Error::Refused(refusal) => Reply::Refused(Code::Refused, refusal.message),
+        review::Error::Store(error) => Reply::Failed(error.to_string()),
+    }
+}
+
 /// A PDF reader that is never used: a proposal is text.
 struct NoPdf;
 
@@ -307,7 +444,7 @@ impl PdfPages for NoPdf {
 }
 
 fn approve(env: &Env, backend: &Backend, routing: Routing, held: &HeldStore, args: &[Option<&str>]) -> Reply {
-    let Some(Decision { id, expect, place }) = decision(args, true) else {
+    let Some(Decision { id, expect, place, .. }) = decision(args, Way::Approve) else {
         return Reply::Usage;
     };
 
@@ -345,6 +482,14 @@ fn import(
     let kind = Kind::of(links.len());
     let place = write_place(routing, place, item.replaces, kind).map_err(&refused)?;
 
+    // Not approved, and it stays held: the user can reject it. A team database takes no folder of
+    // this computer.
+    if place == Place::Remote
+        && let Err(error) = clean::refuse_local_paths(&links)
+    {
+        return Err(Reply::Refused(Code::LocalPath, error.to_string()));
+    }
+
     // The text goes through a file of the format's extension, the way an imported file does.
     let folder =
         tempfile::tempdir().map_err(|error| Reply::Failed(format!("no temporary folder ({})", error.kind())))?;
@@ -371,6 +516,9 @@ fn import(
         check_replaced(store.as_mut(), item, ids::split(id).1)?;
     }
 
+    // With team approval on, a proposal for the team's database is a draft or a pending version.
+    let approval = review::approval_in(store.as_mut(), place).map_err(review_failure)?;
+
     let counter = counter_for(env);
     let never = || false;
     let mut embedder = embed::default_embedder(env);
@@ -385,16 +533,18 @@ fn import(
     importer.origin = Origin::AgentApproved;
     importer.trust_extracted_key = false;
     importer.title = Some(item.title.clone());
+    importer.approval = approval;
 
     let Outcome::Finished { event, .. } = importer.import(&candidate) else {
         return Err(refused("the import was cancelled".to_owned()));
     };
 
     match event.status {
-        Status::Added | Status::Updated | Status::Unchanged => Ok(json!({
+        Status::Added | Status::Updated | Status::Pending | Status::Unchanged => Ok(json!({
             "heldId": item.held_id,
             "docId": doc_id(event.doc_id, place, routing),
             "status": event.status.as_str(),
+            "draft": event.draft,
             "title": item.title,
             "chunks": event.chunks,
             "embedding": event.embedding,
@@ -435,6 +585,8 @@ fn check_replaced(store: &mut dyn KnowledgeStore, item: &HeldItem, id: i64) -> R
         )
     };
 
+    // A proposal names a live document (agents see no other), so only a live one is replaced. With
+    // team approval on, the import then writes or updates that document's pending version.
     let found = store
         .get(id, &Detail::default())
         .map_err(|error| Reply::Failed(error.to_string()))?;

@@ -41,6 +41,7 @@ fn a_cancel_between_documents_leaves_only_whole_documents() {
         let outline = Detail {
             sections: true,
             chunk: None,
+            drafts: false,
         };
         let sections = db
             .get(row.doc.id, &outline)

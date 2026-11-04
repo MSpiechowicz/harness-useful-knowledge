@@ -4,15 +4,15 @@
 use mongodb::bson::{Bson, Document as Row, doc};
 
 use super::ctx::{Ctx, Fail};
-use super::documents::{document, links, usage};
+use super::documents::{document, links, pending_of_many, usage};
 use super::schema::{CHUNKS, DOCUMENTS};
-use super::{int, terms, text};
+use super::{int, opt_int, terms, text};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
 use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, StoreError, UsefulFilter};
+use crate::store::{Section, Sort, Stats, Status, StatusFilter, StoreError, UsefulFilter};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage, Fail> {
@@ -45,16 +45,28 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
         ctx.find(DOCUMENTS, filter, (sort, skip, limit), Row::new())?
     };
 
-    let items = rows
+    let docs = rows
         .iter()
-        .map(|row| {
-            Ok(DocumentRow {
-                doc: document(row)?,
-                links: links(row),
-                usage: usage(row),
-            })
+        .map(|row| Ok((document(row)?, links(row), usage(row))))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+    // The pending version of a live document is shown on its row.
+    let ids: Vec<i64> = docs
+        .iter()
+        .filter(|(doc, _, _)| doc.status.is_live())
+        .map(|(doc, _, _)| doc.id)
+        .collect();
+    let mut pending = pending_of_many(ctx, &ids)?;
+
+    let items = docs
+        .into_iter()
+        .map(|(doc, links, usage)| DocumentRow {
+            pending: pending.remove(&doc.id),
+            doc,
+            links,
+            usage,
         })
-        .collect::<Result<_, StoreError>>()?;
+        .collect();
 
     Ok(DocumentPage {
         items,
@@ -100,9 +112,41 @@ fn useful_match(filter: Option<UsefulFilter>) -> Option<Row> {
     }
 }
 
-/// The filter of `query`: the repository, the format, how useful and the text.
+/// The ids of the live documents that have a pending version (in `state`, when one is named).
+fn with_pending(ctx: &mut Ctx<'_>, state: Option<Status>) -> Result<Vec<i64>, Fail> {
+    let mut filter = doc! { "pending_of": { "$ne": Bson::Null } };
+
+    if let Some(state) = state {
+        filter.insert("status", state.as_str());
+    }
+
+    let rows = ctx.find(DOCUMENTS, filter, (doc! { "_id": 1 }, 0, 0), doc! { "pending_of": 1 })?;
+
+    Ok(rows.iter().filter_map(|row| opt_int(row, "pending_of")).collect())
+}
+
+/// The condition that keeps the rows `status` lists: a live document counts for the state of its
+/// pending version too, as that is the state the person waits on.
+fn status_condition(ctx: &mut Ctx<'_>, status: StatusFilter) -> Result<Row, Fail> {
+    Ok(match status {
+        StatusFilter::All => doc! { "pending_of": Bson::Null },
+        StatusFilter::Live => doc! { "status": "live" },
+        StatusFilter::Pending => doc! { "status": "live", "_id": { "$in": with_pending(ctx, None)? } },
+        StatusFilter::Draft | StatusFilter::Waiting | StatusFilter::ChangesRequested => {
+            let wanted = status.state().map_or("draft", Status::as_str);
+            let live = with_pending(ctx, status.state())?;
+
+            doc! { "$or": [
+                { "pending_of": Bson::Null, "status": wanted },
+                { "status": "live", "_id": { "$in": live } },
+            ] }
+        }
+    })
+}
+
+/// The filter of `query`: the state, the repository, the format, how useful and the text.
 fn conditions(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<Row, Fail> {
-    let mut all: Vec<Row> = Vec::new();
+    let mut all: Vec<Row> = vec![status_condition(ctx, query.status)?];
 
     match &query.filter {
         RepoFilter::All => {}
@@ -217,6 +261,19 @@ pub(super) fn get(ctx: &mut Ctx<'_>, id: i64, detail: &Detail) -> Result<Option<
         return Ok(None);
     };
 
+    let doc = document(&row)?;
+
+    // Agents read live documents only: a draft or a pending version is not there for them.
+    if !detail.drafts && !doc.status.is_live() {
+        return Ok(None);
+    }
+
+    let pending = if detail.drafts {
+        pending_of_many(ctx, &[id])?.remove(&id)
+    } else {
+        None
+    };
+
     let sections = if detail.sections {
         Some(sections(ctx, id)?)
     } else {
@@ -229,11 +286,12 @@ pub(super) fn get(ctx: &mut Ctx<'_>, id: i64, detail: &Detail) -> Result<Option<
     };
 
     Ok(Some(DocumentDetail {
-        doc: document(&row)?,
+        doc,
         links: links(&row),
         usage: usage(&row),
         sections,
         chunk,
+        pending,
     }))
 }
 
@@ -277,11 +335,13 @@ fn chunk(ctx: &mut Ctx<'_>, id: i64, chunk_id: i64) -> Result<Chunk, Fail> {
 }
 
 pub(super) fn repos(ctx: &mut Ctx<'_>) -> Result<RepoCounts, Fail> {
-    let global = ctx.count(DOCUMENTS, doc! { "global": true })?;
+    // A pending version is not a document of a repository: the live one is.
+    let global = ctx.count(DOCUMENTS, doc! { "global": true, "pending_of": Bson::Null })?;
 
     let groups = ctx.aggregate(
         DOCUMENTS,
         vec![
+            doc! { "$match": { "pending_of": Bson::Null } },
             doc! { "$unwind": "$repo_keys" },
             doc! { "$group": { "_id": "$repo_keys", "docs": { "$sum": 1_i64 } } },
             doc! { "$sort": { "docs": -1, "_id": 1 } },
@@ -305,7 +365,10 @@ pub(super) fn stats(
 ) -> Result<Stats, Fail> {
     let totals = ctx.aggregate(
         DOCUMENTS,
-        vec![doc! { "$group": { "_id": Bson::Null, "documents": { "$sum": 1_i64 }, "bytes": { "$sum": "$bytes" } } }],
+        vec![
+            doc! { "$match": { "pending_of": Bson::Null } },
+            doc! { "$group": { "_id": Bson::Null, "documents": { "$sum": 1_i64 }, "bytes": { "$sum": "$bytes" } } },
+        ],
     )?;
     let (documents, bytes) = totals
         .first()
@@ -320,6 +383,7 @@ pub(super) fn stats(
     let repositories = ctx.aggregate(
         DOCUMENTS,
         vec![
+            doc! { "$match": { "pending_of": Bson::Null } },
             doc! { "$unwind": "$repo_keys" },
             doc! { "$group": { "_id": "$repo_keys" } },
             doc! { "$count": "repositories" },
@@ -331,11 +395,15 @@ pub(super) fn stats(
         chunks: count(ctx, CHUNKS, Row::new())?,
         embedded_chunks: count(ctx, CHUNKS, embedded)?,
         bytes: u64::try_from(bytes).unwrap_or(0),
-        global_documents: count(ctx, DOCUMENTS, doc! { "global": true })?,
+        global_documents: count(ctx, DOCUMENTS, doc! { "global": true, "pending_of": Bson::Null })?,
         repositories: repositories.first().map_or(0, |found| size(found, "repositories")),
         generation,
         schema_version,
         model_id,
+        drafts: count(ctx, DOCUMENTS, doc! { "status": "draft" })?,
+        waiting: count(ctx, DOCUMENTS, doc! { "status": "waiting" })?,
+        changes_requested: count(ctx, DOCUMENTS, doc! { "status": "changesRequested" })?,
+        pending: count(ctx, DOCUMENTS, doc! { "pending_of": { "$ne": Bson::Null } })?,
     })
 }
 

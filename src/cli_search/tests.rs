@@ -298,3 +298,54 @@ fn an_unreachable_remote_leaves_the_search_to_this_computer_and_is_said_so_besid
     let alone = world.search(&["--json", "--query", "install gateway"], &mut Fake(Ok(axis(0))));
     assert!(!alone.expect("answers").offline, "this computer alone is not offline");
 }
+
+#[test]
+fn the_persons_search_finds_drafts_with_their_status_and_a_pending_version_never_alone() {
+    use crate::store::Status;
+
+    let world = World::new();
+    let mut database = world.database();
+    let doc = |title: &str| Seed::new(title).embedded("Install", "Install the gateway with the installer.", axis(0));
+    let live = insert(&mut database, &doc("Gateway live"));
+    insert(&mut database, &doc("Gateway draft").status(Status::Draft));
+    insert(&mut database, &doc("Gateway waiting").status(Status::Waiting));
+    insert(&mut database, &doc("Gateway changes").status(Status::ChangesRequested));
+    insert(&mut database, &doc("Gateway pending").pending_of(live));
+    drop(database);
+
+    let found = world
+        .search(
+            &[
+                "--json",
+                "--query",
+                "install gateway",
+                "--limit",
+                "20",
+                "--scope",
+                "all",
+            ],
+            &mut Fake(Ok(axis(0))),
+        )
+        .expect("answers");
+    let mut seen: Vec<(String, String)> = items(&found)
+        .iter()
+        .map(|item| {
+            (
+                item["title"].as_str().expect("title").to_owned(),
+                item["status"].as_str().expect("status").to_owned(),
+            )
+        })
+        .collect();
+    seen.sort();
+
+    assert_eq!(
+        seen,
+        [
+            ("Gateway changes", "changesRequested"),
+            ("Gateway draft", "draft"),
+            ("Gateway live", "live"),
+            ("Gateway waiting", "waiting"),
+        ]
+        .map(|(title, status)| (title.to_owned(), status.to_owned()))
+    );
+}

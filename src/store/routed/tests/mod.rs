@@ -1,9 +1,11 @@
 use pretty_assertions::assert_eq;
 
 mod flaky;
+mod leaks;
 mod offline;
 mod paging;
 mod quality;
+mod review;
 mod search;
 
 use super::*;
@@ -57,6 +59,7 @@ fn query(sort: Sort, descending: bool, offset: usize, limit: usize) -> ListQuery
         descending,
         offset,
         limit,
+        status: crate::store::StatusFilter::All,
     }
 }
 
@@ -210,9 +213,13 @@ fn rename_links_and_delete_act_on_the_documents_own_place() {
     };
     let (local, remote) = (id_of("Local global"), id_of("Remote global"));
 
-    assert!(routed.rename(local, "Mine").expect("rename"));
-    assert!(routed.rename(remote, "Theirs").expect("rename"));
-    assert!(!routed.rename(ids::tag(Place::Local, 9999), "x").expect("missing"));
+    assert!(routed.rename(local, "Mine", None, 0).expect("rename"));
+    assert!(routed.rename(remote, "Theirs", None, 0).expect("rename"));
+    assert!(
+        !routed
+            .rename(ids::tag(Place::Local, 9999), "x", None, 0)
+            .expect("missing")
+    );
 
     let found = routed.get(local, &Detail::default()).expect("get").expect("found");
     assert_eq!((found.doc.title.as_str(), found.doc.id), ("Mine", local));
@@ -294,6 +301,7 @@ fn the_chunks_of_a_document_that_match_come_from_its_own_place_with_its_ids() {
             &Detail {
                 sections: false,
                 chunk: Some(found.chunks[0].chunk_id),
+                drafts: false,
             },
         )
         .expect("get")

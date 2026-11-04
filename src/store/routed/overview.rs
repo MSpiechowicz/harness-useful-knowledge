@@ -70,6 +70,10 @@ pub(super) fn stats(routed: &mut RoutedStore) -> Result<Stats, StoreError> {
                 generation: first.generation + stats.generation,
                 schema_version: first.schema_version,
                 model_id: first.model_id.or(stats.model_id),
+                drafts: first.drafts + stats.drafts,
+                waiting: first.waiting + stats.waiting,
+                changes_requested: first.changes_requested + stats.changes_requested,
+                pending: first.pending + stats.pending,
             },
         });
     }

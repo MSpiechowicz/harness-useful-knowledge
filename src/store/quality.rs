@@ -118,6 +118,14 @@ pub enum TitleScope {
     Global,
 }
 
+impl TitleScope {
+    /// Whether this asks for the documents of a folder of this computer (`path:`), which a team
+    /// database never holds and is never asked for.
+    pub fn is_local_path(&self) -> bool {
+        matches!(self, Self::Repo(key) if super::clean::is_local_path(key))
+    }
+}
+
 /// The most titles one scope is scanned for (a team keeps hundreds of documents, not millions).
 pub const TITLE_SCAN_MAX: usize = 20_000;
 

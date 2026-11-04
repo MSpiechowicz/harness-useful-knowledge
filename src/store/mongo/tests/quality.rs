@@ -128,6 +128,7 @@ fn team_mongo_documents_without_counter_fields_sort_as_zero_and_are_never_shown_
                 descending: false,
                 offset: 0,
                 limit: 50,
+                status: crate::store::StatusFilter::All,
             })
             .expect("list")
             .items

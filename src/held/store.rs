@@ -57,8 +57,18 @@ impl HeldStore {
     }
 
     /// Holds `item` and returns its `heldId`: the id of an identical proposal that waits already
-    /// (see the module docs), else a new one. The id, time and revision are set here.
-    pub fn hold(&self, mut item: HeldItem) -> Result<String, HoldError> {
+    /// (see the module docs), else the id of a proposal with requested changes that this one
+    /// answers (see [`Self::hold_named`]), else a new one. The id, time and revision are set here.
+    pub fn hold(&self, item: HeldItem) -> Result<String, HoldError> {
+        self.hold_named(item, None)
+    }
+
+    /// [`Self::hold`] for a proposal that may name the proposal it answers. A proposal with
+    /// requested changes is replaced in place (it keeps its id, loses the request, takes the new
+    /// text and is held as new) by a proposal of the same session that names it (`named` is its id),
+    /// or, with no name, has the same title once case and white space are ignored. Both sides
+    /// need a session to match by title. Anything else is held as a proposal of its own.
+    pub fn hold_named(&self, mut item: HeldItem, named: Option<&str>) -> Result<String, HoldError> {
         private_folder(&self.folder, "held folder")
             .and_then(|()| self.check())
             .map_err(HoldError::Failed)?;
@@ -71,6 +81,18 @@ impl HeldStore {
             return Ok(same.item.held_id.clone());
         }
 
+        if let Some(asked) = waiting.iter().find(|waiting| waiting.item.is_answered_by(&item, named)) {
+            let others: u64 = waiting
+                .iter()
+                .filter(|waiting| waiting.item.held_id != asked.item.held_id)
+                .map(|waiting| waiting.bytes)
+                .sum();
+
+            if let Some(id) = self.rework(&asked.item.held_id, others, item.clone())? {
+                return Ok(id);
+            }
+        }
+
         let others: u64 = waiting.iter().map(|waiting| waiting.bytes).sum();
 
         if waiting.len() >= HELD_MAX_ITEMS {
@@ -79,6 +101,7 @@ impl HeldStore {
 
         item.held_id = random_id();
         item.created_at = crate::support::time::rfc3339(now());
+        item.changes_requested = None;
         item.revision = item.digest();
 
         let text = serde_json::to_vec(&item).map_err(|error| HoldError::Failed(error.to_string()))?;
@@ -98,6 +121,39 @@ impl HeldStore {
         .map_err(HoldError::Failed)?;
 
         Ok(item.held_id)
+    }
+
+    /// Replaces proposal `held_id`, which has requested changes, with `item` under the same id:
+    /// `None` when it is no longer waiting with a request (a decision took it meanwhile).
+    /// `others` is how many bytes the other waiting proposals take.
+    fn rework(&self, held_id: &str, others: u64, mut item: HeldItem) -> Result<Option<String>, HoldError> {
+        let Some(claim) = self.claim(held_id).map_err(HoldError::Failed)? else {
+            return Ok(None);
+        };
+
+        if claim.item.changes_requested.is_none() {
+            let _ = claim.restore();
+
+            return Ok(None);
+        }
+
+        item.held_id = held_id.to_owned();
+        item.created_at = crate::support::time::rfc3339(now());
+        item.changes_requested = None;
+        item.revision = item.digest();
+
+        let size = serde_json::to_vec(&item).map_or(usize::MAX, |text| text.len());
+        let total = others.saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+
+        if size > HELD_FILE_MAX || total > HELD_TOTAL_BYTES {
+            let _ = claim.restore();
+
+            return Err(HoldError::Limit);
+        }
+
+        claim.update(&item).map_err(HoldError::Failed)?;
+
+        Ok(Some(item.held_id))
     }
 
     /// Claims proposal `held_id` for approving or rejecting it; `None` when it is not waiting (a
@@ -314,6 +370,27 @@ pub struct Claim {
 }
 
 impl Claim {
+    /// Puts the proposal back where it waited, as `item` (the same proposal, changed: a request
+    /// for changes, or its replacement): written aside first, so a reader never sees half a file.
+    pub fn update(self, item: &HeldItem) -> Result<(), String> {
+        let text = serde_json::to_vec(item).map_err(|error| error.to_string())?;
+
+        if text.len() > HELD_FILE_MAX {
+            let _ = self.restore();
+
+            return Err("the held proposal would be too large".to_owned());
+        }
+
+        let folder = self.home.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        write_atomic(&folder, &self.path, &text, TEMP_PREFIX, "held proposal")?;
+
+        let restored = put_back(&self.path, &self.home);
+        let _ = std::fs::remove_file(&self.lock);
+
+        restored
+    }
+
     /// Removes the claimed proposal: it was approved or rejected.
     pub fn finish(self) -> Result<(), String> {
         let removed =

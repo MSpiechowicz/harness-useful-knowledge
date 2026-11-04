@@ -164,7 +164,8 @@ fn knowledge_add() -> Value {
          not add anything: it goes to a review queue in Harness Desktop and the user approves or rejects it there. \
          Give the text as content, or a path to a text file inside the project (a symbolic link or a file outside \
          the project is refused). If a similar document is already stored, the call is refused with its id: pass \
-         replaces to update it, or distinct: true to add a separate document. Never include secrets.",
+         replaces to update it, or distinct: true to add a separate document. If the user asked for changes to a \
+         proposal you sent, call it again with revises set to its held id. Never include secrets.",
         json!({
             "title": text(&format!("Title of the document (1-{TITLE_MAX} characters)")),
             "content": text(&format!("The text of the document (at most {} KiB)", CONTENT_MAX / 1024)),
@@ -201,6 +202,10 @@ fn knowledge_add() -> Value {
             "distinct": {
                 "type": "boolean",
                 "description": "True to add the document although a similar one exists (the call is refused without replaces or distinct when one does)",
+            },
+            "revises": {
+                "type": "string",
+                "description": "The proposal (held:<id>, as this tool answered) the user asked you to change: this call replaces it",
             },
         }),
         &["title", "project_path"],

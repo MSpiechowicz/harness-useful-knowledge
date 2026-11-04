@@ -2,17 +2,21 @@
 //! each file as it is done and a cancel leaves a readable record.
 //!
 //! - `{"type":"plan","total":N}` first: how many files the import will look at.
-//! - `{"type":"file","path","status","reason"?,"docId"?,"chunks"?,"embedding"?,"warnings"?}` after each
-//!   file. `status` is `added`, `updated`, `unchanged`, `skipped` or `failed`, and `reason` says why
-//!   for the last two (and for an `updated` that replaced a document of the same name from another
-//!   repository). `embedding` is `done` or `pending` (no embedder was available, so the chunks
-//!   wait for `docs reindex`).
+//! - `{"type":"file","path","status","reason"?,"docId"?,"chunks"?,"embedding"?,"warnings"?,"draft"?,
+//!   "asked"?}` after each file. `status` is `added`, `updated`, `pending`, `unchanged`, `skipped` or
+//!   `failed`, and `reason` says why for the last two (and for an `updated` that replaced a document
+//!   of the same name from another repository). `pending` is a pending version stored for a live
+//!   document (the live text is unchanged until it goes live, `docId` is the pending row).
+//!   `draft` (on `added`, `updated` and `pending`) is true when the row is not live, `asked` that it
+//!   was asked for approval in the same step. `embedding` is `done` or `pending` (no embedder was
+//!   available, so the chunks wait for `docs reindex`).
 //!   `docId` is a number, or the string `local:12` for a document on this computer when both places
 //!   are in use.
 //! - `{"type":"progress","done":N,"total":N}` after each file.
 //! - `{"type":"done","counts":{...},"cancelled":bool,"counter":"tokenizer"|"approximate",
 //!   "embeddingPending":N}` last: `counter` is what counted the tokens, `embeddingPending` how many
-//!   chunks have no vector yet.
+//!   chunks have no vector yet. `counts` has `added`, `updated`, `unchanged`, `skipped` and `failed`,
+//!   and `pending` when a pending version was stored.
 
 use std::io::Write;
 
@@ -26,6 +30,8 @@ use crate::store::routed::ids;
 pub enum Status {
     Added,
     Updated,
+    /// A pending version of a live document was stored.
+    Pending,
     Unchanged,
     Skipped,
     Failed,
@@ -36,6 +42,7 @@ impl Status {
         match self {
             Self::Added => "added",
             Self::Updated => "updated",
+            Self::Pending => "pending",
             Self::Unchanged => "unchanged",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
@@ -48,6 +55,7 @@ impl Status {
 pub struct Counts {
     pub added: usize,
     pub updated: usize,
+    pub pending: usize,
     pub unchanged: usize,
     pub skipped: usize,
     pub failed: usize,
@@ -58,20 +66,28 @@ impl Counts {
         match status {
             Status::Added => self.added += 1,
             Status::Updated => self.updated += 1,
+            Status::Pending => self.pending += 1,
             Status::Unchanged => self.unchanged += 1,
             Status::Skipped => self.skipped += 1,
             Status::Failed => self.failed += 1,
         }
     }
 
+    /// The counts as the `done` event carries them: `pending` only when some file was.
     fn json(self) -> Value {
-        json!({
+        let mut counts = json!({
             "added": self.added,
             "updated": self.updated,
             "unchanged": self.unchanged,
             "skipped": self.skipped,
             "failed": self.failed,
-        })
+        });
+
+        if self.pending > 0 {
+            counts["pending"] = json!(self.pending);
+        }
+
+        counts
     }
 }
 
@@ -85,6 +101,10 @@ pub struct FileEvent {
     pub chunks: Option<usize>,
     pub embedding: Option<&'static str>,
     pub warnings: Vec<String>,
+    /// True when the row written is not live (a draft or a pending version).
+    pub draft: bool,
+    /// True when the row was asked for approval in the same step.
+    pub asked: bool,
 }
 
 impl FileEvent {
@@ -97,6 +117,8 @@ impl FileEvent {
             chunks: None,
             embedding: None,
             warnings: Vec::new(),
+            draft: false,
+            asked: false,
         }
     }
 }
@@ -163,6 +185,14 @@ impl<'a> Events<'a> {
 
         if !event.warnings.is_empty() {
             line["warnings"] = json!(event.warnings);
+        }
+
+        if matches!(event.status, Status::Added | Status::Updated | Status::Pending) {
+            line["draft"] = json!(event.draft);
+        }
+
+        if event.asked {
+            line["asked"] = json!(true);
         }
 
         self.emit(line);

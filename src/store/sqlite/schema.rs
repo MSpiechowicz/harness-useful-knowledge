@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use super::sql_shared::{keyword_index, tables};
+use super::sql_shared::{keyword_index, review, tables};
 use crate::store::DIMS;
 
 /// The schema version this server writes: how many entries [`MIGRATIONS`] has.
@@ -66,8 +66,23 @@ INSERT INTO knowledge_meta (key, value) VALUES ('schema_version', '1'), ('dims',
 "
 );
 
+/// Version 2: drafts and their review, see [`review`]. Every document of version 1 stays live.
+const V2: &str = concat!(
+    review!(),
+    "
+UPDATE knowledge_meta SET value = '2' WHERE key = 'schema_version';
+"
+);
+
 /// The migrations in order: entry `n` takes a database from version `n` to `n + 1`.
-const MIGRATIONS: [&str; 1] = [V1];
+const MIGRATIONS: [&str; 2] = [V1, V2];
+
+/// A database as version 1 left it, for the tests of the migration.
+#[cfg(test)]
+pub(super) fn create_v1(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(V1)?;
+    conn.execute_batch("PRAGMA user_version = 1")
+}
 
 /// Brings the database up to [`SCHEMA_VERSION`]; a newer one is left alone.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {
@@ -127,6 +142,11 @@ mod tests {
             "knowledge_doc_links",
             "knowledge_chunks",
             "knowledge_chunks_fts",
+            "knowledge_doc_events",
+            "knowledge_doc_comments",
+            "knowledge_doc_files",
+            "knowledge_doc_file_parts",
+            "knowledge_doc_snapshots",
         ] {
             assert!(names.iter().any(|name| name == expected), "{expected} in {names:?}");
         }

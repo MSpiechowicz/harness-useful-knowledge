@@ -2,10 +2,33 @@
 
 use super::ids;
 use crate::config::Place;
-use crate::store::{ChunkHit, Document, DocumentDetail};
+use crate::store::{ChunkHit, Document, DocumentDetail, DocumentRow, PendingVersion, ReviewReply};
 
 pub(super) fn tag_document(place: Place, doc: &mut Document) {
     doc.id = ids::tag(place, doc.id);
+    doc.pending_of = doc.pending_of.map(|live| ids::tag(place, live));
+}
+
+fn tag_pending(place: Place, pending: &mut Option<PendingVersion>) {
+    if let Some(pending) = pending {
+        pending.id = ids::tag(place, pending.id);
+    }
+}
+
+pub(super) fn tag_row(place: Place, row: &mut DocumentRow) {
+    tag_document(place, &mut row.doc);
+    tag_pending(place, &mut row.pending);
+}
+
+/// The reply of a transition with the id of the document tagged.
+pub(super) fn tag_reply(place: Place, reply: ReviewReply) -> ReviewReply {
+    match reply {
+        ReviewReply::Done(mut done) => {
+            done.id = ids::tag(place, done.id);
+            ReviewReply::Done(done)
+        }
+        other => other,
+    }
 }
 
 fn tag_hit(place: Place, hit: &mut ChunkHit) {
@@ -15,6 +38,7 @@ fn tag_hit(place: Place, hit: &mut ChunkHit) {
 
 pub(super) fn tag_detail(place: Place, detail: &mut DocumentDetail) {
     tag_document(place, &mut detail.doc);
+    tag_pending(place, &mut detail.pending);
 
     for section in detail.sections.iter_mut().flatten() {
         section.chunk_id = ids::tag(place, section.chunk_id);

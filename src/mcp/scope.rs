@@ -35,10 +35,11 @@ pub(super) fn scope_arg(raw: Option<&str>) -> Result<bool, String> {
 }
 
 /// What a search may see: the global documents and those linked to `repo`, or with `everything`
-/// every document (the repository still boosts its own).
+/// every document (the repository still boosts its own). Always the live documents: an agent never
+/// sees a draft (see [`Scope::with_drafts`], which this never calls).
 pub(super) fn search_scope(repo: Option<ProjectKey>, everything: bool) -> Scope {
-    Scope {
-        repo,
-        include_other_repos: everything,
-    }
+    let mut scope = Scope::from_repo(repo);
+    scope.include_other_repos = everything;
+
+    scope
 }

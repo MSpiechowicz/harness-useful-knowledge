@@ -21,7 +21,7 @@ use crate::chunk::{self, Chunked};
 use crate::extract;
 use crate::extract::pdf::PdfPages;
 use crate::limits::SHARED_SHAS_MAX;
-use crate::store::{Detail, Document, KnowledgeStore, StoreError, TitleScope};
+use crate::store::{Detail, Document, KnowledgeStore, StoreError, TitleScope, Visibility};
 use crate::tokens::TokenCounter;
 
 /// Fewest chunks an edited copy shares with its original.
@@ -133,14 +133,25 @@ pub struct Match {
     pub chunks: usize,
 }
 
-/// The strongest match for `probe` in `store`, `None` when no document is similar.
+/// The strongest match for `probe` among the live documents of `store`, `None` when none is
+/// similar. What agents may be told about: a draft or a pending version is never a match.
 pub fn find(store: &mut dyn KnowledgeStore, probe: &Probe) -> Result<Option<Match>, StoreError> {
+    find_visible(store, probe, Visibility::Live)
+}
+
+/// [`find`] among the documents `visibility` names: the person's own lookups ask for
+/// [`Visibility::WithDrafts`] (drafts are matches, a pending version never is).
+pub fn find_visible(
+    store: &mut dyn KnowledgeStore,
+    probe: &Probe,
+    visibility: Visibility,
+) -> Result<Option<Match>, StoreError> {
     let asked = &probe.chunk_shas[..probe.chunk_shas.len().min(SHARED_SHAS_MAX)];
     let chunks = asked.len();
     let sharing: HashMap<i64, usize> = if asked.is_empty() {
         HashMap::new()
     } else {
-        store.docs_sharing_chunks(asked)?.into_iter().collect()
+        store.docs_sharing_chunks(asked, visibility)?.into_iter().collect()
     };
 
     let matched = |doc: Document, reason: Reason| {
@@ -154,11 +165,11 @@ pub fn find(store: &mut dyn KnowledgeStore, probe: &Probe) -> Result<Option<Matc
         }
     };
 
-    if let Some(doc) = store.find_by_source_key(&probe.source_key)? {
+    if let Some(doc) = store.find_by_source_key(&probe.source_key, visibility)? {
         return Ok(Some(matched(doc, Reason::SourceKey)));
     }
 
-    if let Some(doc) = store.find_by_content_sha(&probe.content_sha)? {
+    if let Some(doc) = store.find_by_content_sha(&probe.content_sha, visibility)? {
         return Ok(Some(matched(doc, Reason::SameContent)));
     }
 
@@ -172,12 +183,17 @@ pub fn find(store: &mut dyn KnowledgeStore, probe: &Probe) -> Result<Option<Matc
 
     for (_, id) in sharing_most {
         // A document deleted since the lookup is passed over.
-        if let Some(found) = store.get(id, &Detail::default())? {
+        let detail = Detail {
+            drafts: visibility == Visibility::WithDrafts,
+            ..Detail::default()
+        };
+
+        if let Some(found) = store.get(id, &detail)? {
             return Ok(Some(matched(found.doc, Reason::SharedChunks)));
         }
     }
 
-    let titled = store.find_by_title(&probe.title, &probe.scope)?;
+    let titled = store.find_by_title(&probe.title, &probe.scope, visibility)?;
 
     Ok(titled
         .into_iter()

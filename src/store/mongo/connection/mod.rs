@@ -25,6 +25,9 @@ pub(super) const NAMESPACE_EXISTS: i32 = 48;
 /// The server error of a collection that does not exist.
 pub(super) const NAMESPACE_NOT_FOUND: i32 = 26;
 
+/// The server error of a write that breaks a unique index.
+pub(super) const DUPLICATE_KEY: i32 = 11000;
+
 /// What [`check`] learned from a URL.
 pub(super) struct Checked {
     /// The driver talks to this machine only (see [`local_seeds`]), so TLS may be off.

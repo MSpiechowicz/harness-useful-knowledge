@@ -16,6 +16,7 @@ fn scored(title: &str, heading: &str, text: &str) -> Scored {
             score: 0.0,
             updated_at: 0,
             repo_globs: None,
+            status: crate::store::Status::Live,
         },
         score: 812.4,
     }

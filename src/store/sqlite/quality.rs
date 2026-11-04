@@ -7,9 +7,9 @@ use rusqlite::{Connection, params};
 
 use super::SqliteStore;
 use super::documents::by_id;
-use super::sql_quality::{SHARING_SQL, SHOWN_SQL, TITLES_GLOBAL_SQL, TITLES_REPO_SQL, USEFUL_SQL, ids_json, shas_json};
+use super::sql_quality::{SHOWN_SQL, USEFUL_SQL, ids_json, sharing_sql, shas_json, titles_global_sql, titles_repo_sql};
 use crate::store::quality::{TITLE_SCAN_MAX, matching_titles};
-use crate::store::{Columns, Document, StoreError, TitleScope};
+use crate::store::{Columns, Document, StoreError, TitleScope, Visibility};
 
 /// The documents of `scope` whose title equals `title`, by id.
 pub(super) fn by_title(
@@ -17,17 +17,18 @@ pub(super) fn by_title(
     columns: Columns,
     title: &str,
     scope: &TitleScope,
+    visibility: Visibility,
 ) -> Result<Vec<Document>, StoreError> {
     let limit = i64::try_from(TITLE_SCAN_MAX).unwrap_or(i64::MAX);
     let map = |row: &rusqlite::Row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
 
     let titles: Vec<(i64, String)> = match scope {
         TitleScope::Global => conn
-            .prepare(TITLES_GLOBAL_SQL)?
+            .prepare(&titles_global_sql(visibility))?
             .query_map([limit], map)?
             .collect::<Result<_, _>>()?,
         TitleScope::Repo(key) => conn
-            .prepare(TITLES_REPO_SQL)?
+            .prepare(&titles_repo_sql(visibility))?
             .query_map(params![limit, key], map)?
             .collect::<Result<_, _>>()?,
     };
@@ -44,14 +45,18 @@ pub(super) fn by_title(
 }
 
 /// Each document with a chunk whose hash is in `shas`, with how many distinct ones.
-pub(super) fn sharing(conn: &Connection, shas: &[String]) -> Result<Vec<(i64, usize)>, StoreError> {
+pub(super) fn sharing(
+    conn: &Connection,
+    shas: &[String],
+    visibility: Visibility,
+) -> Result<Vec<(i64, usize)>, StoreError> {
     let wanted = shas_json(shas)?;
 
     if shas.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut statement = conn.prepare(SHARING_SQL)?;
+    let mut statement = conn.prepare(&sharing_sql(visibility))?;
     let rows = statement.query_map([wanted], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, usize>(1)?)))?;
 
     Ok(rows.collect::<Result<_, _>>()?)

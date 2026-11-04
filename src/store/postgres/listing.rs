@@ -4,7 +4,7 @@
 use postgres::GenericClient;
 use postgres::types::ToSql;
 
-use super::documents::{by_id, columns_sql, links_of, listed};
+use super::documents::{by_id, columns_sql, links_of, listed, pending_of_many};
 use super::error::{backend, column, count, int};
 use super::{meta, schema};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
@@ -12,10 +12,31 @@ use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, StoreError, UsefulFilter};
+use crate::store::{Section, Sort, Stats, StatusFilter, StoreError, UsefulFilter};
 
 /// A document of no repository (aliased `d`).
 const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
+
+/// The condition (on a document aliased `d`) that keeps the rows `status` lists, as a live
+/// document is kept by the state of its pending version.
+fn status_condition(status: StatusFilter) -> String {
+    let pending =
+        |extra: &str| format!("EXISTS (SELECT 1 FROM knowledge_documents p WHERE p.pending_of = d.id{extra})");
+
+    match status {
+        StatusFilter::All => "d.pending_of IS NULL".to_owned(),
+        StatusFilter::Live => "d.status = 'live'".to_owned(),
+        StatusFilter::Pending => format!("(d.status = 'live' AND {})", pending("")),
+        state => {
+            let wanted = state.state().map_or("live", |state| state.as_str());
+
+            format!(
+                "((d.pending_of IS NULL AND d.status = '{wanted}') OR (d.status = 'live' AND {}))",
+                pending(&format!(" AND p.status = '{wanted}'"))
+            )
+        }
+    }
+}
 
 /// A statement parameter that outlives the call that builds it.
 type Param = Box<dyn ToSql + Sync>;
@@ -74,12 +95,14 @@ pub(super) fn list(
 
     let ids: Vec<i64> = docs.iter().map(|(doc, _)| doc.id).collect();
     let mut links = links_of(client, &ids)?;
+    let mut pending = pending_of_many(client, columns, &ids)?;
 
     let items = docs
         .into_iter()
         .map(|(doc, usage)| DocumentRow {
             links: links.remove(&doc.id).unwrap_or_default(),
             usage,
+            pending: pending.remove(&doc.id),
             doc,
         })
         .collect();
@@ -111,6 +134,8 @@ fn conditions(columns: Columns, query: &ListQuery) -> (String, Vec<Param>) {
             ));
         }
     }
+
+    clauses.push(status_condition(query.status));
 
     if let Some(format) = &query.format {
         params.push(Box::new(format.clone()));
@@ -254,6 +279,17 @@ pub(super) fn get(
         return Ok(None);
     };
 
+    // Agents read live documents only: a draft or a pending version is not there for them.
+    if !detail.drafts && !doc.status.is_live() {
+        return Ok(None);
+    }
+
+    let pending = if detail.drafts {
+        pending_of_many(client, columns, &[id])?.remove(&id)
+    } else {
+        None
+    };
+
     let sections = if detail.sections {
         Some(sections(client, id)?)
     } else {
@@ -271,6 +307,7 @@ pub(super) fn get(
         usage,
         sections,
         chunk,
+        pending,
     }))
 }
 
@@ -331,13 +368,14 @@ fn chunk(client: &mut impl GenericClient, id: i64, chunk_id: i64) -> Result<Chun
 pub(super) fn repos(client: &mut impl GenericClient) -> Result<RepoCounts, StoreError> {
     let global = scalar(
         client,
-        &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+        &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
     )?;
 
     let rows = client
         .query(
-            "SELECT repo_key, count(*) AS docs FROM knowledge_doc_links
-             GROUP BY repo_key ORDER BY docs DESC, repo_key COLLATE \"C\"",
+            "SELECT l.repo_key, count(*) AS docs FROM knowledge_doc_links l
+             JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL
+             GROUP BY l.repo_key ORDER BY docs DESC, l.repo_key COLLATE \"C\"",
             &[],
         )
         .map_err(backend)?;
@@ -355,7 +393,7 @@ pub(super) fn stats(client: &mut impl GenericClient) -> Result<Stats, StoreError
 
     let totals = client
         .query_one(
-            "SELECT count(*), coalesce(sum(bytes), 0)::bigint FROM knowledge_documents",
+            "SELECT count(*), coalesce(sum(bytes), 0)::bigint FROM knowledge_documents WHERE pending_of IS NULL",
             &[],
         )
         .map_err(backend)?;
@@ -377,12 +415,32 @@ pub(super) fn stats(client: &mut impl GenericClient) -> Result<Stats, StoreError
         bytes: u64::try_from(bytes).unwrap_or(0),
         global_documents: scalar(
             client,
-            &format!("SELECT count(*) FROM knowledge_documents d WHERE {GLOBAL}"),
+            &format!("SELECT count(*) FROM knowledge_documents d WHERE d.pending_of IS NULL AND {GLOBAL}"),
         )?,
-        repositories: scalar(client, "SELECT count(DISTINCT repo_key) FROM knowledge_doc_links")?,
+        repositories: scalar(
+            client,
+            "SELECT count(DISTINCT l.repo_key) FROM knowledge_doc_links l
+             JOIN knowledge_documents d ON d.id = l.doc_id WHERE d.pending_of IS NULL",
+        )?,
         generation: meta::generation(client)?,
         schema_version: schema::stored_version(client)?.unwrap_or(schema::SCHEMA_VERSION),
         model_id,
+        drafts: scalar(
+            client,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'draft'",
+        )?,
+        waiting: scalar(
+            client,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'waiting'",
+        )?,
+        changes_requested: scalar(
+            client,
+            "SELECT count(*) FROM knowledge_documents WHERE status = 'changesRequested'",
+        )?,
+        pending: scalar(
+            client,
+            "SELECT count(*) FROM knowledge_documents WHERE pending_of IS NOT NULL",
+        )?,
     })
 }
 

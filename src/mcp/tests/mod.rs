@@ -222,9 +222,11 @@ fn a_serve_loop_reads_lines_skips_blanks_and_survives_garbage() {
 
 mod author;
 mod counting;
+mod drafts;
 mod duplicates;
 mod feedback;
 mod offline;
 mod proposals;
 mod reading;
 mod replaced;
+mod revises;
