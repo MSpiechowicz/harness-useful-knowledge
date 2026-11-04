@@ -201,8 +201,10 @@ fn a_proposal_may_name_the_one_it_answers_and_only_from_its_session() {
     assert_ne!(more, id);
 }
 
-/// The remote database alone is the libSQL server under test, with team approval switched on.
-fn team() -> Option<(World, Backend, Routing, Box<dyn KnowledgeStore>)> {
+/// The remote database alone is the libSQL server under test, with team approval switched on, and the
+/// lock the other libSQL cases take: it is held until the caller drops it, so `cargo test`, which runs
+/// every case of the binary in one process, never waits for it forever.
+fn team() -> Option<(World, Backend, Routing, Box<dyn KnowledgeStore>, std::fs::File)> {
     let url = std::env::var("HARNESS_KNOWLEDGE_TEST_LIBSQL_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())?;
@@ -217,8 +219,6 @@ fn team() -> Option<(World, Backend, Routing, Box<dyn KnowledgeStore>)> {
         .open(std::env::temp_dir().join("harness-knowledge-libsql-tests.lock"))
         .expect("lock file");
     lock.lock().expect("lock");
-    // The lock is held for the rest of the process: the case is short and the others take turns.
-    std::mem::forget(lock);
 
     let world = World::new();
     let mut store = crate::store::libsql::open_boxed(
@@ -232,12 +232,12 @@ fn team() -> Option<(World, Backend, Routing, Box<dyn KnowledgeStore>)> {
     .expect("a store");
     store.set_meta(crate::review::APPROVAL_KEY, "on").expect("approval on");
 
-    Some((world, backend, Routing::new(Where::Remote, Where::Remote), store))
+    Some((world, backend, Routing::new(Where::Remote, Where::Remote), store, lock))
 }
 
 #[test]
 fn team_an_approval_under_team_approval_is_a_draft_or_a_pending_version() {
-    let Some((world, backend, routing, mut store)) = team() else {
+    let Some((world, backend, routing, mut store, _lock)) = team() else {
         eprintln!("skipped: set HARNESS_KNOWLEDGE_TEST_LIBSQL_URL to run this case on a libSQL server");
         return;
     };
