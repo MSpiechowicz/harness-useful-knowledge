@@ -220,7 +220,11 @@ pub(super) fn ensure(client: &mut impl GenericClient) -> Result<Version, Fault> 
         Some(_) => {}
     }
 
-    if let Err(error) = client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector") {
+    // Two clients that create it at the same moment race inside the server: the loser is told the
+    // extension already exists (23505, unique_violation), which leaves it installed as wanted.
+    if let Err(error) = client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        && error.as_db_error().map(|db| db.code().code()) != Some("23505")
+    {
         return Err(match error.as_db_error().map(|db| db.code().code()) {
             Some("42501") => Problem::NoPrivilege.into(),
             Some("0A000") => Problem::NoPgvector.into(),

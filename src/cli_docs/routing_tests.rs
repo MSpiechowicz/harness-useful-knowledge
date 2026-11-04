@@ -254,9 +254,15 @@ impl Schema {
         let name = format!("hk_replacing_{}_{number}", std::process::id());
         let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls).expect("the test server answers");
 
-        admin
-            .batch_execute("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public")
-            .expect("pgvector");
+        // Two cases that create it at the same moment race inside the server: the loser is told the
+        // extension already exists (unique_violation), which is what it wanted.
+        if let Err(error) = admin.batch_execute("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public") {
+            assert_eq!(
+                error.code(),
+                Some(&postgres::error::SqlState::UNIQUE_VIOLATION),
+                "pgvector: {error}"
+            );
+        }
         admin
             .batch_execute(&format!(
                 "DROP SCHEMA IF EXISTS \"{name}\" CASCADE; CREATE SCHEMA \"{name}\""
