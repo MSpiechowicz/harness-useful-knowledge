@@ -201,10 +201,13 @@ fn a_proposal_may_name_the_one_it_answers_and_only_from_its_session() {
     assert_ne!(more, id);
 }
 
+/// What a team case works with: the world, the backend and routing, the store, and the libSQL test lock.
+type Team = (World, Backend, Routing, Box<dyn KnowledgeStore>, std::fs::File);
+
 /// The remote database alone is the libSQL server under test, with team approval switched on, and the
 /// lock the other libSQL cases take: it is held until the caller drops it, so `cargo test`, which runs
 /// every case of the binary in one process, never waits for it forever.
-fn team() -> Option<(World, Backend, Routing, Box<dyn KnowledgeStore>, std::fs::File)> {
+fn team() -> Option<Team> {
     let url = std::env::var("HARNESS_KNOWLEDGE_TEST_LIBSQL_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())?;
