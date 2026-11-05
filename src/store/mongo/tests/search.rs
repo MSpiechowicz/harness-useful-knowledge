@@ -193,7 +193,7 @@ fn team_mongo_relinking_a_document_changes_what_each_repository_finds_at_once() 
 }
 
 #[test]
-fn team_mongo_glob_matches_and_links_lift_a_chunk_above_an_equally_relevant_global_one() {
+fn team_mongo_a_link_lifts_a_chunk_above_a_global_one_a_rank_ahead_and_a_matching_glob_lifts_it_further() {
     let Some((_db, mut store)) = store() else { return };
     insert(
         &mut store,
@@ -226,7 +226,9 @@ fn team_mongo_glob_matches_and_links_lift_a_chunk_above_an_equally_relevant_glob
             .collect::<Vec<_>>()
     };
 
-    assert_eq!(answer(&mut store, &[]), ["Linked guide", "Glob guide", "Global guide"]);
+    // The three chunks rank 1, 2 and 3 (the order they were inserted in). The link is a tie-break,
+    // so it lifts the chunk one rank behind the global one and not the chunk two ranks behind it.
+    assert_eq!(answer(&mut store, &[]), ["Linked guide", "Global guide", "Glob guide"]);
     assert_eq!(
         answer(&mut store, &["src/auth/login.rs"]),
         ["Glob guide", "Linked guide", "Global guide"]
