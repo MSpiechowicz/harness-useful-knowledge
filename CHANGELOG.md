@@ -1,3 +1,10 @@
+# [2.1.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.0.0...v2.1.0) (2026-11-05)
+
+
+### Features
+
+* **docs:** sort the document list by how many paths it is narrowed to ([ae2e257](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/ae2e257e0251b09655e1b71d706d4bfd44dfd246))
+
 # [2.0.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v1.1.0...v2.0.0) (2026-11-04)
 
 
