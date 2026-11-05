@@ -71,6 +71,9 @@ pub(super) fn list(
         Sort::Size => "d.bytes",
         Sort::Format => "d.format",
         Sort::Chunks => "d.chunk_count",
+        Sort::Paths => {
+            "coalesce((SELECT sum(cardinality(l.globs)) FROM knowledge_doc_links l WHERE l.doc_id = d.id), 0)"
+        }
         Sort::Repos => {
             "coalesce((SELECT min(l.repo_key) COLLATE \"C\" FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')"
         }

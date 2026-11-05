@@ -74,6 +74,7 @@ fn features_list_what_this_build_can_do() {
         "docs-authors",
         "docs-drafts",
         "docs-approval",
+        "docs-sort-paths",
     ] {
         assert!(features.contains(&feature), "{feature} in {features:?}");
     }

@@ -283,6 +283,8 @@ pub enum Sort {
     Size,
     Format,
     Chunks,
+    /// By how many path globs its links carry together (a global or whole-repository one counts 0).
+    Paths,
     /// By the first repository key a document links to; global documents come first ascending.
     Repos,
     /// By how often agents found it useful (a document nobody rated counts 0).

@@ -105,6 +105,17 @@ fn useful_keeps_the_documents_found_useful_or_never_and_any_keeps_all() {
 }
 
 #[test]
+fn the_list_takes_the_sort_by_paths() {
+    let (lab, _) = Lab::new();
+
+    assert_eq!(lab.titles(&["list", "--json", "--sort", "paths"]), ["A", "B", "C"]);
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "paths", "--desc"]),
+        ["C", "B", "A"]
+    );
+}
+
+#[test]
 fn the_sorts_by_usefulness_take_desc_and_break_ties_by_id() {
     let (lab, _) = Lab::new();
     let sorted = |sort: &str, desc: bool| {

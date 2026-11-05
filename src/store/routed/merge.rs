@@ -67,6 +67,7 @@ pub(super) fn compare(a: &DocumentRow, b: &DocumentRow, sort: Sort, descending: 
         Sort::Size => a.doc.bytes.cmp(&b.doc.bytes),
         Sort::Format => a.doc.format.cmp(&b.doc.format),
         Sort::Chunks => a.doc.chunk_count.cmp(&b.doc.chunk_count),
+        Sort::Paths => paths_of(a).cmp(&paths_of(b)),
         Sort::Repos => first_repo(a).cmp(first_repo(b)),
         Sort::Useful => useful_of(a).cmp(&useful_of(b)),
         Sort::LastUseful => last_useful_of(a).cmp(&last_useful_of(b)),
@@ -75,6 +76,11 @@ pub(super) fn compare(a: &DocumentRow, b: &DocumentRow, sort: Sort, descending: 
     let ordering = by_key.then_with(|| a.doc.id.cmp(&b.doc.id));
 
     if descending { ordering.reverse() } else { ordering }
+}
+
+/// How many path globs the links of a document carry together, as the stores sort it.
+fn paths_of(row: &DocumentRow) -> usize {
+    row.links.iter().map(|link| link.globs.len()).sum()
 }
 
 /// The first repository key a document links to, `""` for a global one.

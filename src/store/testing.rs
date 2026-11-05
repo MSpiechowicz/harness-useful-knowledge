@@ -374,6 +374,54 @@ pub const TITLES: [&str; 12] = [
     "bravo",
 ];
 
+/// A list sorted by paths follows how many globs all the links of a document carry together, in
+/// either direction and in pages, ties by id the way the sort goes (`store` is empty).
+pub fn path_order_contract(store: &mut dyn KnowledgeStore) {
+    use super::{ListQuery, RepoFilter, Sort};
+
+    let seeds = [
+        Seed::new("Global"),
+        Seed::new("Two").link("git:h/o/a", &["a/**", "b/**"]),
+        Seed::new("Three across two links")
+            .link("git:h/o/a", &["a/**"])
+            .link("git:h/o/b", &["b/**", "c/**"]),
+        Seed::new("Whole repository").link("git:h/o/a", &[]),
+        Seed::new("One").link("git:h/o/b", &["a/**"]),
+    ];
+
+    for seed in seeds {
+        let (doc, chunks, links) = seed.chunk("Intro", "text").parts();
+        store.put_document(&doc, &chunks, &links).expect("put document");
+    }
+
+    let ask = |store: &mut dyn KnowledgeStore, descending: bool, offset: usize, limit: usize| -> Vec<String> {
+        store
+            .list(&ListQuery {
+                filter: RepoFilter::All,
+                format: None,
+                text: String::new(),
+                useful: None,
+                sort: Sort::Paths,
+                descending,
+                offset,
+                limit,
+                status: crate::store::StatusFilter::All,
+            })
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|row| row.doc.title)
+            .collect()
+    };
+
+    let ascending = ["Global", "Whole repository", "One", "Two", "Three across two links"];
+    let descending = ["Three across two links", "Two", "One", "Whole repository", "Global"];
+
+    assert_eq!(ask(store, false, 0, 10), ascending);
+    assert_eq!(ask(store, true, 0, 10), descending);
+    assert_eq!(ask(store, true, 1, 2), descending[1..3]);
+}
+
 /// The order the list sorted by title has in every place: case-insensitive for ASCII letters only
 /// (the one fold every database can do the same way), then by bytes, ties by id. A title that
 /// starts with a Polish capital sorts before its lower case letter, and both after every ASCII one.

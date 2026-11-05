@@ -49,6 +49,7 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         Some("size") => Sort::Size,
         Some("format") => Sort::Format,
         Some("chunks") => Sort::Chunks,
+        Some("paths") => Sort::Paths,
         Some("repos") => Sort::Repos,
         Some("useful") => Sort::Useful,
         Some("lastUseful") => Sort::LastUseful,

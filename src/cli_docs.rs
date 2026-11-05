@@ -3,7 +3,7 @@
 //! object on stdout. Timestamps are RFC 3339, field names camelCase.
 //!
 //! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--useful
-//!   any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local]`
+//!   any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local]`
 //!   prints `{"items": [...], "total": N}`:
 //!   one page of the documents (see [`json::document`] for an item: its `links`, `addedBy` and
 //!   `updatedBy`, and the counters `shown`, `useful` and `lastUsefulAt`, which are absent while the
@@ -113,7 +113,7 @@ use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
-                         [--useful any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
+                         [--useful any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
                          [--sections] [--chunk CID] | docs matches --json ID --query Q [--limit N] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
                          --json (ID... | --all) | docs similar --json [--repo KEY | --global] PATH... | \

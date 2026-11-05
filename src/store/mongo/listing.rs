@@ -27,8 +27,9 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
         Sort::Chunks => "chunk_count",
         // An array sorts by its smallest element ascending, an empty one (global) first.
         Sort::Repos => "repo_keys",
-        // A document nobody rated has no counters: it sorts as 0, in a field of its own.
-        Sort::Useful | Sort::LastUseful => USEFUL_ORDER,
+        // A count no field holds, and a document nobody rated has no counters (it sorts as 0): these
+        // sort on a field of their own.
+        Sort::Paths | Sort::Useful | Sort::LastUseful => COMPUTED_ORDER,
     };
     let direction = if query.descending { -1 } else { 1 };
     let sort = doc! { key: direction, "_id": direction };
@@ -39,8 +40,8 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     // A limit of 0 asks for no limit in a query.
     let rows = if limit == 0 {
         Vec::new()
-    } else if key == USEFUL_ORDER {
-        ctx.aggregate(DOCUMENTS, useful_pipeline(query.sort, filter, sort, skip, limit))?
+    } else if key == COMPUTED_ORDER {
+        ctx.aggregate(DOCUMENTS, computed_pipeline(query.sort, filter, sort, skip, limit))?
     } else {
         ctx.find(DOCUMENTS, filter, (sort, skip, limit), Row::new())?
     };
@@ -74,24 +75,33 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     })
 }
 
-/// The field a page is sorted on for the sorts by usefulness.
-const USEFUL_ORDER: &str = "useful_order";
+/// The field a page is sorted on for the sorts by a computed value.
+const COMPUTED_ORDER: &str = "computed_order";
 
-/// The pipeline of a page sorted by usefulness: the order is a computed field (a missing counter
-/// is 0). The page is sorted again at the end: Amazon DocumentDB keeps the order of a `$sort` only
-/// when it is the last stage.
-fn useful_pipeline(sort: Sort, filter: Row, order: Row, skip: u64, limit: i64) -> Vec<Row> {
+/// The value of [`COMPUTED_ORDER`]: the path globs of all the links together, or a counter (a
+/// missing one is 0).
+fn computed_value(sort: Sort) -> Row {
+    if sort == Sort::Paths {
+        let globs = doc! { "$size": { "$ifNull": ["$$link.globs", []] } };
+
+        return doc! { "$sum": { "$map": { "input": { "$ifNull": ["$links", []] }, "as": "link", "in": globs } } };
+    }
+
     let counter = if sort == Sort::Useful {
         "$useful"
     } else {
         "$last_useful_at"
     };
-    let number =
-        doc! { "$cond": [{ "$in": [{ "$type": counter }, ["int", "long", "double", "decimal"]] }, counter, 0_i64] };
 
+    doc! { "$cond": [{ "$in": [{ "$type": counter }, ["int", "long", "double", "decimal"]] }, counter, 0_i64] }
+}
+
+/// The pipeline of a page sorted by a computed field. The page is sorted again at the end: Amazon
+/// DocumentDB keeps the order of a `$sort` only when it is the last stage.
+fn computed_pipeline(sort: Sort, filter: Row, order: Row, skip: u64, limit: i64) -> Vec<Row> {
     vec![
         doc! { "$match": filter },
-        doc! { "$addFields": { USEFUL_ORDER: number } },
+        doc! { "$addFields": { COMPUTED_ORDER: computed_value(sort) } },
         doc! { "$sort": order.clone() },
         doc! { "$skip": i64::try_from(skip).unwrap_or(i64::MAX) },
         doc! { "$limit": limit },

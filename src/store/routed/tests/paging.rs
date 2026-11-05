@@ -35,6 +35,7 @@ fn pages_of_the_merged_list_are_the_pages_of_one_sorted_list_for_every_sort() {
         Sort::Size,
         Sort::Chunks,
         Sort::Format,
+        Sort::Paths,
         Sort::Repos,
     ] {
         for descending in [false, true] {
@@ -155,4 +156,40 @@ fn the_merged_titles_of_two_places_sort_the_way_each_store_sorts_them_for_polish
         titles(&routed.list(&query(Sort::Title, true, 0, 50)).expect("list")),
         reversed
     );
+}
+
+#[test]
+fn the_merged_list_sorts_by_paths_across_both_places() {
+    let mut remote = store();
+    let mut local = store();
+
+    insert(
+        &mut remote,
+        &Seed::new("two").link("git:h/o/a", &["a/**", "b/**"]).chunk("a", "text"),
+    );
+    insert(
+        &mut local,
+        &Seed::new("three")
+            .link("git:h/o/a", &["a/**"])
+            .link("git:h/o/b", &["b/**", "c/**"])
+            .chunk("a", "text"),
+    );
+    insert(&mut remote, &Seed::new("none").chunk("a", "text"));
+    insert(
+        &mut local,
+        &Seed::new("one").link("git:h/o/a", &["a/**"]).chunk("a", "text"),
+    );
+
+    let mut routed = routed_over(local, remote, Routing::new(Where::RemoteLocal, Where::RemoteLocal));
+    let titles = |routed: &mut RoutedStore, descending| -> Vec<String> {
+        let rows = routed
+            .list(&query(Sort::Paths, descending, 0, 100))
+            .expect("list")
+            .items;
+
+        rows.into_iter().map(|row| row.doc.title).collect()
+    };
+
+    assert_eq!(titles(&mut routed, false), ["none", "one", "two", "three"]);
+    assert_eq!(titles(&mut routed, true), ["three", "two", "one", "none"]);
 }

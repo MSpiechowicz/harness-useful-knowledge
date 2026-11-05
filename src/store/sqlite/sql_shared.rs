@@ -339,6 +339,10 @@ pub(crate) fn page_sql(columns: Columns, filter: &str, query: &ListQuery, params
         Sort::Size => "d.bytes",
         Sort::Format => "d.format",
         Sort::Chunks => "d.chunk_count",
+        // What cannot be read as globs reads as none (see `link`), and must not fail the page.
+        Sort::Paths => {
+            "coalesce((SELECT sum(CASE WHEN json_valid(l.globs) THEN json_array_length(l.globs) ELSE 0 END) FROM knowledge_doc_links l WHERE l.doc_id = d.id), 0)"
+        }
         Sort::Repos => "coalesce((SELECT min(l.repo_key) FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')",
         Sort::Useful => "coalesce(d.useful, 0)",
         Sort::LastUseful => "coalesce(d.last_useful_at, 0)",
