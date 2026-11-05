@@ -32,10 +32,50 @@ pub(super) fn down() -> Box<Fake> {
     })
 }
 
+/// An embedder that answers with a fixed vector, with the count of its calls.
+pub(super) fn counting(vector: Vec<f32>) -> (Box<Fake>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let embedder = Box::new(Fake {
+        answer: Ok(vector),
+        asked: asked.clone(),
+    });
+
+    (embedder, asked)
+}
+
 /// A data folder with a database holding `seeds`, and the setup to recall from it.
 pub(super) fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> (tempfile::TempDir, Setup) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let folder = dir.path().join("knowledge");
+    let setup = setup_in(dir.path(), seeds, embedder);
+
+    (dir, setup)
+}
+
+/// [`world`] for a prompt written in a known repository: `seeds` gets the key of that repository
+/// (to link documents to it) and the setup names the folder of the repository.
+pub(super) fn repo_world(
+    seeds: impl FnOnce(&str) -> Vec<Seed>,
+    embedder: Box<dyn QueryEmbedder + Send>,
+) -> (tempfile::TempDir, Setup) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).expect("create the repository folder");
+
+    let project = work.to_string_lossy().into_owned();
+    let key = ProjectResolver::new(Env::for_tests(dir.path()), None)
+        .resolve(Some(&project))
+        .expect("a usable folder")
+        .expect("a repository")
+        .key;
+
+    let mut setup = setup_in(dir.path(), &seeds(&key), embedder);
+    setup.project = Some(project);
+
+    (dir, setup)
+}
+
+fn setup_in(dir: &std::path::Path, seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> Setup {
+    let folder = dir.join("knowledge");
 
     if !seeds.is_empty() {
         let mut store = SqliteStore::open(&folder.join(crate::location::FILE_NAME)).expect("create the database");
@@ -45,16 +85,15 @@ pub(super) fn world(seeds: &[Seed], embedder: Box<dyn QueryEmbedder + Send>) -> 
         }
     }
 
-    let env = Env::for_tests(dir.path()).with_var(DIR_VAR, folder.to_string_lossy());
-    let setup = Setup {
+    let env = Env::for_tests(dir).with_var(DIR_VAR, folder.to_string_lossy());
+
+    Setup {
         env,
         backend: Backend::Sqlite,
         routing: Routing::local(),
         project: None,
         embedder,
-    };
-
-    (dir, setup)
+    }
 }
 
 pub(super) fn guide(title: &str, degrees: f32) -> Seed {

@@ -332,8 +332,12 @@ fn through_the_code(lab: &mut Lab, raws: &[Raw]) {
         };
 
         let found = search::run(&mut lab.store, Some(&mut lab.real), &query, Tuning::SEARCH).expect("search");
-        let by_vector = recall::recalled(&mut lab.store, &mut lab.real, &query).expect("recall");
-        let by_keyword = recall::recalled(&mut lab.store, &mut Down, &query).expect("recall without the embedder");
+        let by_vector = recall::recalled(&mut lab.store, &mut lab.real, &query)
+            .expect("recall")
+            .0;
+        let by_keyword = recall::recalled(&mut lab.store, &mut Down, &query)
+            .expect("recall without the embedder")
+            .0;
 
         let tally = |lab: &mut Lab, hits: &[Scored], tally: &mut (usize, usize)| match raw.case {
             Some(case) => {

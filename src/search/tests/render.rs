@@ -124,6 +124,12 @@ fn a_snippet_is_one_line_of_at_most_160_characters_around_the_first_matching_wor
 }
 
 #[test]
+fn a_snippet_cut_to_nothing_is_empty() {
+    assert_eq!(snippet("Some text that is cut to nothing.", &words_of("text"), 0), "");
+    assert_eq!(snippet("", &[], 0), "");
+}
+
+#[test]
 fn a_short_text_is_its_own_snippet_and_one_without_the_word_starts_at_its_start() {
     assert_eq!(
         snippet("Short  text\nhere.", &words_of("text"), SNIPPET_CHARS),

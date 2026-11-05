@@ -1,8 +1,10 @@
 //! What of the fused candidates is an answer, and in which order.
 //!
 //! 1. A chunk of a document linked to the repository the search is for scores
-//!    [`LINKED_BOOST`] times its fused score, and [`GLOB_BOOST`] times when one of the link's globs
-//!    matches a path the caller gave (the files the agent is working on).
+//!    [`LINKED_BOOST`] times its fused score (a tie-break: a linked document wins only when it is
+//!    about one rank from a global one, never by being a few ranks behind), and [`GLOB_BOOST`] times
+//!    when one of the link's globs matches a path the caller gave (the files the agent is working on,
+//!    a stronger signal).
 //! 2. Chunks that score less than [`FLOOR`], or less than [`MARGIN`] of the best chunk, are
 //!    dropped, so a long tail of weak matches does not follow one strong one.
 //! 3. A document keeps at most [`PER_DOCUMENT_MAX`] chunks, its best.
@@ -16,13 +18,21 @@ use super::fuse::Scored;
 use super::glob;
 
 /// Multiplies the score of a chunk of a document linked to the repository of the search (a global
-/// document is 1.0): an equally relevant linked document wins, a clearly more relevant global one
-/// still beats a weak linked one. X6 (every family document linked to its own repository, 40
-/// queries): 1.1 puts the right answer first 36 times instead of 31 and the copy of the working
-/// repository first for 6 of 6 twin documents (3 of 6 without a boost), and costs a question
-/// whose answer is in another repository one place in the first three (38 to 37). 1.25 costs 8
-/// first places, 1.5 costs 9 and loses 3 of the first three.
-pub const LINKED_BOOST: f64 = 1.1;
+/// document is 1.0). It is a tie-break: a linked document wins only when it is effectively level
+/// with a global one, about one rank apart (a fused 984 times 1.02 is 1004 and beats a global 1000,
+/// a fused 968 times 1.02 is 987 and does not). The scores fall about 16 per rank near the top, so a
+/// larger boost lets a linked document that is a few ranks behind push an exact global answer out
+/// of the answer (at 1.1 an unrelated linked chunk at 924 scored about 1016 and beat a global 1000).
+///
+/// X6 (every family document linked to its own repository, 40 queries), measured again for 1.02:
+/// the right answer is first 31 times without a boost, 35 at 1.02 and 36 at 1.1, the copy of the
+/// working repository is first for 3 of 6 twin documents without a boost and 6 of 6 from 1.02 up,
+/// and the first three documents hold the right answer 38 times at every boost. A question whose
+/// answer is in another repository gets it first 31 times without a boost and at 1.02, 28 at 1.1,
+/// 24 at 1.25 and 22 at 1.5 (37 of 40 in the first three from 1.02 up, 38 without a boost).
+/// Nearly all of what 1.1 bought for the working repository is bought by 1.02 too, without letting
+/// a linked chunk a few ranks behind beat an exact global answer, so 1.02 was chosen.
+pub const LINKED_BOOST: f64 = 1.02;
 
 /// The whole boost of a chunk whose document's link has a glob that matches a given path (it
 /// replaces [`LINKED_BOOST`], it does not multiply it). X6 (the hooks and the routines document
@@ -61,6 +71,14 @@ pub const KEYWORD_FLOOR: f64 = 0.0;
 /// 0.82 is above every off-topic query of X6 (0.816 at most) and keeps 37 of 40 answers in the
 /// first three documents (0.83 keeps 32).
 pub const RECALL_COSINE_FLOOR: f64 = 0.82;
+
+/// The cosine floor of the place a recall keeps for a global document that is not among the best
+/// pointers ([`crate::recall`]). A guaranteed place needs a stricter floor than [`RECALL_COSINE_FLOOR`]:
+/// the cosines of a corpus of related documents are compressed, so a document about something else
+/// still reaches 0.82. Measured on the family's documents (one global document, 11 prompts): the
+/// prompts about something else reach 0.838 at most, the ones about it 0.871 at least. A global
+/// document under it still gets a pointer the way every document does, by being among the best.
+pub const RECALL_GLOBAL_SLOT_COSINE: f64 = 0.85;
 
 /// How far under the best chunk's cosine a chunk may be to be recalled with it: a prompt gets
 /// the pointers that are as good as the best one, not three because three fit. X6: 0.02 keeps
@@ -168,6 +186,22 @@ mod tests {
         );
 
         assert_eq!(chunk_ids(&ranked), [1, 2]);
+    }
+
+    #[test]
+    fn a_linked_document_wins_only_when_level_with_a_global_one() {
+        let ranked = |linked: f64| {
+            let fused = vec![scored(1, 1, 1000.0, None), scored(2, 2, linked, Some(&[]))];
+            chunk_ids(&rank(fused, &[], 10))
+        };
+
+        assert_eq!(ranked(984.0), [2, 1], "about one rank behind: the tie-break decides");
+        assert_eq!(
+            ranked(968.0),
+            [1, 2],
+            "two ranks behind: the exact global answer stays first"
+        );
+        assert_eq!(ranked(924.0), [1, 2], "an unrelated linked chunk never beats it");
     }
 
     #[test]

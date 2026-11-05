@@ -102,6 +102,51 @@ fn a_search_in_one_place_answers_as_without_the_other() {
     assert_eq!(found.len(), 2);
 }
 
+#[test]
+fn a_hit_without_a_link_is_a_global_document_in_each_place_and_a_global_scope_sees_nothing_else() {
+    let mut routed = fixture(Where::RemoteLocal, Where::RemoteLocal);
+    let hits = |routed: &mut RoutedStore, scope: Scope| {
+        let query = Query {
+            text: "gateway",
+            scope: &scope,
+            paths: &[],
+            limit: 10,
+        };
+
+        let found = search::run(routed, None, &query, Tuning::SEARCH).expect("search");
+        let mut hits: Vec<(String, bool)> = found
+            .hits
+            .into_iter()
+            .map(|scored| (scored.hit.title, scored.hit.repo_globs.is_none()))
+            .collect();
+        hits.sort();
+        hits
+    };
+
+    let repository = Scope::from_repo(Some(crate::project::ProjectKey {
+        key: REPO.to_owned(),
+        root: std::path::PathBuf::new(),
+        remote: None,
+    }));
+
+    // From the repository: the linked documents have globs, the global ones have none.
+    assert_eq!(
+        hits(&mut routed, repository),
+        [
+            ("Local global".to_owned(), true),
+            ("Local linked".to_owned(), false),
+            ("Remote global".to_owned(), true),
+            ("Remote linked".to_owned(), false),
+        ]
+    );
+
+    // From no repository: the global documents of both places, and no linked one.
+    assert_eq!(
+        hits(&mut routed, Scope::from_repo(None)),
+        [("Local global".to_owned(), true), ("Remote global".to_owned(), true)]
+    );
+}
+
 fn routed_over_one(remote: SqliteStore) -> RoutedStore {
     RoutedStore::new(None, Some(Box::new(remote)), Routing::new(Where::Remote, Where::Remote))
 }

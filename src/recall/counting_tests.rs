@@ -4,7 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use super::tests::{PROMPT, answering, guide, world};
+use super::global_tests::hostile_seed;
+use super::tests::{PROMPT, answering, guide, repo_world, world};
 use super::*;
 use crate::location::FILE_NAME;
 use crate::store::testing::{Seed, axis};
@@ -135,4 +136,50 @@ fn an_unreachable_remote_does_not_stop_the_documents_of_this_computer_counting()
     print_and_count(&mut Vec::new(), recalled, LANDS);
 
     assert_eq!(shown(dir.path()), vec![(1, 1)]);
+}
+
+#[test]
+fn the_global_document_in_the_last_place_counts_and_the_one_it_displaced_does_not() {
+    // Three linked documents are closer than the global one, which takes the third place.
+    let (dir, setup) = repo_world(
+        |repo| {
+            vec![
+                guide("Linked one", 2.0).link(repo, &[]),
+                guide("Linked two", 3.0).link(repo, &[]),
+                guide("Linked three", 4.0).link(repo, &[]),
+                guide("Global guide", 15.0),
+            ]
+        },
+        answering(axis(0)),
+    );
+
+    let recalled = recalled_pointers(PROMPT, setup).expect("a block");
+    let mut out: Vec<u8> = Vec::new();
+    print_and_count(&mut out, recalled, LANDS);
+
+    let block = String::from_utf8(out).expect("text");
+    assert!(
+        block.contains("Global guide") && !block.contains("Linked three"),
+        "{block}"
+    );
+    assert_eq!(shown(dir.path()), vec![(1, 1), (2, 1), (3, 0), (4, 1)]);
+}
+
+#[test]
+fn a_global_document_that_does_not_fit_beside_the_best_pointer_is_not_counted() {
+    let (dir, setup) = repo_world(
+        |repo| {
+            vec![
+                hostile_seed(1, 2.0).link(repo, &[]),
+                hostile_seed(2, 3.0).link(repo, &[]),
+                hostile_seed(3, 15.0),
+            ]
+        },
+        answering(axis(0)),
+    );
+
+    let recalled = recalled_pointers(PROMPT, setup).expect("a block");
+    print_and_count(&mut Vec::new(), recalled, LANDS);
+
+    assert_eq!(shown(dir.path()), vec![(1, 1), (2, 0), (3, 0)]);
 }

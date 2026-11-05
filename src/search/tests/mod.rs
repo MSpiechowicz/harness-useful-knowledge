@@ -219,14 +219,14 @@ fn a_search_sees_the_global_documents_and_its_own_repositorys() {
 }
 
 #[test]
-fn the_repository_of_the_search_ranks_first_and_a_matching_glob_ranks_before_it() {
+fn the_repository_of_the_search_breaks_a_tie_and_a_matching_glob_ranks_before_it() {
     let mut store = store();
     let seed = |title: &str| Seed::new(title).embedded("Routing", "The gateway routes every request.", axis(0));
 
     insert(&mut store, &seed("Global"));
-    insert(&mut store, &seed("Other repo").link("git:h/o/b", &[]));
     insert(&mut store, &seed("Linked").link("git:h/o/a", &[]));
     insert(&mut store, &seed("Linked to api").link("git:h/o/a", &["src/api/**"]));
+    insert(&mut store, &seed("Other repo").link("git:h/o/b", &[]));
 
     let scope = Scope {
         repo: Some(key("git:h/o/a")),
@@ -235,10 +235,11 @@ fn the_repository_of_the_search_ranks_first_and_a_matching_glob_ranks_before_it(
     };
     let mut fake = Fake::answering(axis(0));
 
+    // The four chunks are equally relevant and rank 1 to 4 in the order they were inserted in. The
+    // link is a tie-break: it lifts the chunk one rank behind the global one, not the chunk two
+    // ranks behind it.
     let without = ask(&mut store, Some(&mut fake), "gateway routes", &scope, &[]);
-    let mut first_two: Vec<&str> = titles(&without)[..2].to_vec();
-    first_two.sort_unstable();
-    assert_eq!(first_two, ["Linked", "Linked to api"], "{:?}", titles(&without));
+    assert_eq!(titles(&without)[..2], ["Linked", "Global"], "{:?}", titles(&without));
 
     let paths = vec!["src/api/server.rs".to_owned()];
     let with = ask(&mut store, Some(&mut fake), "gateway routes", &scope, &paths);

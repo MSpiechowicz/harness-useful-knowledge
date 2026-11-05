@@ -108,6 +108,10 @@ pub fn words_of(text: &str) -> Vec<String> {
 /// `text` on one line, at most `max` characters, starting a little before the first of `words` it
 /// holds (the start of the text when it holds none), with `…` where it is cut.
 pub fn snippet(text: &str, words: &[String], max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+
     let line: Vec<char> = clean::line(text).chars().collect();
 
     if line.len() <= max {

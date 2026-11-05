@@ -187,7 +187,7 @@ Feature branches in each repo, commits per milestone, `cargo clean` before commi
   - keyword: 31/40 (Polish only 6/15).
   - vector: 38/40.
 - **Constants** (`src/store/rank.rs`):
-  - `COSINE_FLOOR` 0.80, `FLOOR` 400, `MARGIN` 0.4, `LINKED_BOOST` 1.1, `GLOB_BOOST` 1.3, `KEYWORD_FLOOR` 0. Keyword scores are not comparable across backends, so cosine is the portable signal.
+  - `COSINE_FLOOR` 0.80, `FLOOR` 400, `MARGIN` 0.4, `LINKED_BOOST` 1.02, `GLOB_BOOST` 1.3, `KEYWORD_FLOOR` 0. Keyword scores are not comparable across backends, so cosine is the portable signal.
   - Recall: `RECALL_COSINE_FLOOR` 0.82 with a 0.02 band (0/6 off-topic answered, found@3 37/40), and `RECALL_KEYWORD_FLOOR` 10 when the embedder is down (SQLite/libSQL scale, uncalibrated on Postgres and Atlas).
 - **Reproduce:** `cargo test --release --lib search::tests::calibration -- --nocapture` with `HARNESS_KNOWLEDGE_TEST_MODEL_DIR` and `HARNESS_KNOWLEDGE_TEST_CORPUS_ROOT`.
 

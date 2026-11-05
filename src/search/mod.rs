@@ -179,13 +179,13 @@ fn run_parts(
 }
 
 /// An embedder that answers the same text twice from its first answer.
-struct Cached<'a> {
+pub(crate) struct Cached<'a> {
     inner: &'a mut dyn QueryEmbedder,
     last: Option<(String, Result<Vec<f32>, String>)>,
 }
 
 impl<'a> Cached<'a> {
-    fn new(inner: &'a mut dyn QueryEmbedder) -> Self {
+    pub(crate) fn new(inner: &'a mut dyn QueryEmbedder) -> Self {
         Self { inner, last: None }
     }
 }

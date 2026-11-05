@@ -79,7 +79,8 @@ fn link(repo: &str, globs: &[&str]) -> Vec<Link> {
 
 /// The repository a document belongs to, by its source key.
 fn repo_of(name: &str) -> &'static str {
-    let name = name.strip_prefix("corpus/").unwrap_or(name);
+    // The source key is the path of the copy: `<temp folder>/corpus/memory/docs/hybrid-search.md`.
+    let name = name.rsplit_once("corpus/").map_or(name, |(_, relative)| relative);
 
     if name.starts_with("memory/") {
         MEMORY
@@ -106,7 +107,7 @@ fn repositories(lab: &mut Lab, documents: &[(i64, String)]) {
         CASES.len()
     );
 
-    for boost in [1.0, 1.1, 1.25, 1.5, 2.0] {
+    for boost in [1.0, 1.02, 1.1, 1.25, 1.5, 2.0] {
         let mut right = (0, 0);
         let mut wrong = (0, 0);
 
@@ -139,7 +140,7 @@ fn repositories(lab: &mut Lab, documents: &[(i64, String)]) {
         "  twin documents (hybrid-search.md in two repositories): the copy of the working repository first, of 6"
     );
 
-    for boost in [1.0, 1.1, 1.25, 1.5] {
+    for boost in [1.0, 1.02, 1.1, 1.25, 1.5] {
         let mut own = 0;
 
         for text in [
@@ -211,6 +212,7 @@ fn globs(lab: &mut Lab, documents: &[(i64, String)]) {
 
     for (linked, glob_boost) in [
         (1.0, 1.0),
+        (1.02, 1.3),
         (1.1, 1.1),
         (1.1, 1.25),
         (1.1, 1.3),
