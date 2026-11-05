@@ -1,3 +1,10 @@
+## [2.1.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.0...v2.1.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **routing:** give a slow remote database longer before calling it offline ([6c33908](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/6c33908afa77db275edf7018b609bbb153ab3931))
+
 # [2.1.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.0.0...v2.1.0) (2026-11-05)
 
 

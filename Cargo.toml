@@ -1,7 +1,7 @@
 [package]
 name = "harness_knowledge"
 description = "Project knowledge MCP server for any coding agent harness (documents, hybrid BM25 + vector search)"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-or-later"

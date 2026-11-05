@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "harness_knowledge"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "ctrlc",
  "dunce",
