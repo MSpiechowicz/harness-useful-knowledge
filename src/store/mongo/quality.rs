@@ -277,7 +277,9 @@ impl MongoStore {
     }
 }
 
-/// True when `privilege` grants `update` on the documents collection of database `name`.
+/// True when `privilege` grants `update` on the documents collection of database `name`. An empty
+/// `db` or `collection` in a privilege resource means every one (`readWriteAnyDatabase`, Atlas's
+/// default developer role, reports `{db: "", collection: ""}`).
 fn allows_update(privilege: &Row, name: &str) -> bool {
     let updates = privilege
         .get_array("actions")
@@ -287,7 +289,33 @@ fn allows_update(privilege: &Row, name: &str) -> bool {
     };
 
     let here = resource.get_bool("anyResource").unwrap_or(false)
-        || (resource.get_str("db") == Ok(name) && matches!(resource.get_str("collection"), Ok("" | DOCUMENTS)));
+        || (matches!(resource.get_str("db"), Ok(db) if db.is_empty() || db == name)
+            && matches!(resource.get_str("collection"), Ok("" | DOCUMENTS)));
 
     updates && here
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn privilege(db: &str, collection: &str, action: &str) -> Row {
+        doc! { "resource": { "db": db, "collection": collection }, "actions": [action] }
+    }
+
+    #[test]
+    fn an_update_on_every_database_counts_as_one_on_the_documents() {
+        // `readWriteAnyDatabase` reports an empty db and collection: every one.
+        assert!(allows_update(&privilege("", "", "update"), "test"));
+        assert!(allows_update(&privilege("", DOCUMENTS, "update"), "test"));
+        assert!(allows_update(&privilege("test", "", "update"), "test"));
+        assert!(allows_update(&privilege("test", DOCUMENTS, "update"), "test"));
+    }
+
+    #[test]
+    fn other_databases_other_collections_and_other_actions_do_not() {
+        assert!(!allows_update(&privilege("other", "", "update"), "test"));
+        assert!(!allows_update(&privilege("", "system.js", "update"), "test"));
+        assert!(!allows_update(&privilege("test", DOCUMENTS, "insert"), "test"));
+    }
 }
