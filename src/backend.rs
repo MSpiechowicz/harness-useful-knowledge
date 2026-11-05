@@ -23,7 +23,7 @@ use crate::support::{Env, deadline};
 
 /// How long connecting to the remote database may take before this computer answers instead (when
 /// the URL sets no timeout of its own): a dead remote costs this once, then its cooldown applies.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The same for `recall --hook`, which has to finish within [`crate::recall::DEADLINE`].
 pub const HOOK_PROBE_TIMEOUT: Duration = Duration::from_secs(1);

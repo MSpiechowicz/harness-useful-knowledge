@@ -15,7 +15,7 @@
 //! A failure that is only a wait that ran out (the remote did not answer within a probe the caller
 //! chose, see [`Reach::failed_in`]) carries how long it waited, and is honoured by a reader only when
 //! that reader would not wait longer ([`Reach::cooling_for`]). So the 1 s a hook gives the remote
-//! never makes a 3 s read, or a write that waits as long as its driver does, skip a remote that
+//! never makes a 5 s read, or a write that waits as long as its driver does, skip a remote that
 //! merely connects slowly. A refused connection, a host that does not resolve and the like are
 //! facts for every reader.
 

@@ -140,6 +140,11 @@ pub(super) fn stats_as(context: &Context, args: &[Option<&str>], actor: Option<&
 
     if offline {
         shown["offline"] = json!(true);
+
+        // Scrubbed when it was recorded. Absent when nothing was tried (see `OpenError::Busy`).
+        if let Some(reason) = backend::reach_of(context.env, context.backend).cooling() {
+            shown["offlineReason"] = json!(reason);
+        }
     }
 
     Ok(Done::ok(shown))

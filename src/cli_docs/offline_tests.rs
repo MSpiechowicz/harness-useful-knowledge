@@ -88,6 +88,16 @@ fn a_list_comes_from_this_computer_and_says_offline_while_the_remote_is_unreacha
     assert_eq!(listed["items"][0]["title"], "Mine");
     assert_eq!(listed["items"][0]["id"], "local:1");
     assert_eq!(listed["offline"], json!(true));
+
+    // The silent servers of other tests in this process can hold every slot for opening the remote
+    // for a while. Then nothing was tried and nothing is recorded (`OpenError::Busy`), so try again.
+    let started = Instant::now();
+
+    while !computer.cooldown_file().is_file() && started.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(100));
+        computer.json(BOTH, &["list", "--json"]);
+    }
+
     assert!(
         computer.cooldown_file().is_file(),
         "the failure is shared with other processes"

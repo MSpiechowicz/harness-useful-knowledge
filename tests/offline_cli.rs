@@ -209,6 +209,7 @@ fn team_the_fallback_follows_a_remote_that_stops_pauses_and_returns() {
 
     let stats = computer.run(&["stats", "--json"], "").json();
     assert_eq!(stats["offline"], json!(true));
+    assert!(stats["offlineReason"].is_string(), "the banner can say why: {stats}");
     assert_eq!(stats["places"]["remote"], json!({ "offline": true }));
     assert_eq!(stats["places"]["local"]["documents"], 1);
 
