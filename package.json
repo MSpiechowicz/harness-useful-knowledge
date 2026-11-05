@@ -1,6 +1,6 @@
 {
   "name": "harness-knowledge",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Harness Knowledge: a local stdio MCP server that indexes documents and answers with cited passages",
   "license": "GPL-3.0-or-later",
   "private": true,

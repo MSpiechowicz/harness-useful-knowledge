@@ -1,3 +1,10 @@
+## [2.1.2](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.1...v2.1.2) (2026-11-05)
+
+
+### Bug Fixes
+
+* **mongo:** count an any-database update privilege as writable ([435321f](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/435321f4653b05ed316ae232c608909118a7e41a))
+
 ## [2.1.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.0...v2.1.1) (2026-11-05)
 
 
