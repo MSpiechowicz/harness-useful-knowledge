@@ -1,3 +1,10 @@
+## [2.1.3](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.2...v2.1.3) (2026-11-05)
+
+
+### Bug Fixes
+
+* **recall:** keep a place for a matching global document and make the link boost a tie-break ([3c7b68c](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/3c7b68c8616ba9eaef0a011431022904e88c2215))
+
 ## [2.1.2](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.1...v2.1.2) (2026-11-05)
 
 
