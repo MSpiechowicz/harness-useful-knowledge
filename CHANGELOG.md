@@ -1,3 +1,10 @@
+# [2.2.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.4...v2.2.0) (2026-11-06)
+
+
+### Features
+
+* **docs:** filter and sort the documents by who added them ([a837071](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/a837071a821d05494293b930b78b82a99f900298))
+
 ## [2.1.4](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.3...v2.1.4) (2026-11-06)
 
 
