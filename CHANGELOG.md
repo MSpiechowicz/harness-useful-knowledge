@@ -1,3 +1,10 @@
+## [2.2.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.2.0...v2.2.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **project:** do not take a project's key from planted or changed git config ([f2c7857](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/f2c785782be29121e52acbc0703bc73a10e4abf8)), closes [MSpiechowicz/harness-useful-desktop#55](https://github.com/MSpiechowicz/harness-useful-desktop/issues/55)
+
 # [2.2.0](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.4...v2.2.0) (2026-11-06)
 
 
