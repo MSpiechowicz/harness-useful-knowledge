@@ -61,7 +61,10 @@ fn with_offline_notice(server: &mut Server, text: String) -> String {
 /// Parses tool arguments, serde's message names the offending field.
 pub(super) fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
     serde_json::from_value(arguments).map_err(|error| {
-        format!("invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields")
+        format!(
+            "invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields, then \
+             call the tool again with the fixed arguments."
+        )
     })
 }
 

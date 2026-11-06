@@ -74,7 +74,7 @@ const SYSTEM_FOLDERS: [&str; 16] = [
 pub(super) fn check(env: &Env, root: &Path) -> Result<(), String> {
     let refused = || {
         "project_path must be the root of a project: a git work tree or a folder with a project file such as \
-         Cargo.toml or package.json (the home folder and system folders are refused)"
+         Cargo.toml or package.json (the home folder and system folders are refused). Fix it and call the tool again."
             .to_owned()
     };
 

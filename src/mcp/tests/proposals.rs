@@ -291,6 +291,10 @@ fn the_arguments_are_checked() {
     ] {
         let refused = world.err("knowledge_add", arguments.clone());
         assert!(refused.contains(expected), "{arguments}: {refused}");
+
+        if expected == "absolute" || expected == "invalid arguments" {
+            assert!(refused.contains("call the tool again"), "{arguments}: {refused}");
+        }
     }
 
     assert_eq!(world.held_files().len(), 0);

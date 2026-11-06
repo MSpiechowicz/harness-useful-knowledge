@@ -20,6 +20,7 @@ knowledge_feedback with the ids that helped (or an empty list).
 - Call knowledge_add only when the user explicitly asks you to add a document. It goes to a review queue in Harness \
 Desktop and nothing is stored until the user approves it. If it refuses because a similar document exists, pass \
 replaces with that id to update it, or distinct: true.
+- A call refused for its arguments: fix them and call the tool again.
 - Never propose secrets, credentials or personal data.";
 
 /// Every tool, as `tools/list` returns them.

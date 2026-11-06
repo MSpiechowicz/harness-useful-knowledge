@@ -15,7 +15,7 @@ pub(super) fn repository(server: &mut Server, project_path: Option<&str>) -> Res
     server.projects.resolve(project_path).map_err(|reason| {
         format!(
             "{reason} (got {:?}). Pass project_path as the absolute path of the repository you are working in, \
-             its git root",
+             its git root, and call the tool again.",
             project_path.unwrap_or_default()
         )
     })
