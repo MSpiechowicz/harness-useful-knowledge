@@ -1,3 +1,10 @@
+## [2.1.4](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.3...v2.1.4) (2026-11-06)
+
+
+### Bug Fixes
+
+* **mcp:** tell the agent to call a tool again after refused arguments ([e853e49](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/e853e499c7ca5d63dc4a252687d1b07caa672070))
+
 ## [2.1.3](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.1.2...v2.1.3) (2026-11-05)
 
 
