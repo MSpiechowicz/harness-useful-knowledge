@@ -38,9 +38,9 @@ use crate::backend::OpenError;
 use crate::config::{Kind, Place, Routing};
 use crate::limits::LIST_PAGE_MAX;
 use crate::store::{
-    Chunk, ChunkHit, ChunkMatches, Comment, Detail, Document, DocumentDetail, DocumentPage, DocumentRow, History,
-    KnowledgeStore, Link, ListQuery, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply,
-    Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility,
+    AuthorFacet, Chunk, ChunkHit, ChunkMatches, Comment, Detail, Document, DocumentDetail, DocumentPage, DocumentRow,
+    History, KnowledgeStore, Link, ListQuery, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange,
+    ReviewReply, Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility,
 };
 use rows::{interleave, tag_detail, tag_reply, tag_row, tagged_hits};
 
@@ -360,6 +360,7 @@ impl KnowledgeStore for RoutedStore {
         let want = query.offset.saturating_add(query.limit);
         let mut rows: Vec<DocumentRow> = Vec::new();
         let mut total = 0;
+        let mut authors = AuthorFacet::default();
 
         for place in [Place::Remote, Place::Local] {
             if only.is_some_and(|only| only != place) {
@@ -385,6 +386,7 @@ impl KnowledgeStore for RoutedStore {
                 continue;
             };
             total += page.total;
+            authors.merge(page.authors);
 
             for mut row in page.items {
                 tag_row(place, &mut row);
@@ -400,7 +402,7 @@ impl KnowledgeStore for RoutedStore {
             .take(query.limit.min(LIST_PAGE_MAX))
             .collect();
 
-        Ok(DocumentPage { items, total })
+        Ok(DocumentPage { items, total, authors })
     }
 
     fn get(&mut self, id: i64, detail: &Detail) -> Result<Option<DocumentDetail>, StoreError> {

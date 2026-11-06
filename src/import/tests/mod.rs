@@ -170,6 +170,8 @@ fn all_documents(store: &mut SqliteStore) -> Vec<DocumentRow> {
             format: None,
             text: String::new(),
             useful: None,
+            author: None,
+            want_authors: false,
             sort: Sort::Title,
             descending: false,
             offset: 0,

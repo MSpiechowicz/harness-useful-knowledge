@@ -6,6 +6,13 @@ pub const LIST_PAGE_DEFAULT: usize = 50;
 /// Most rows of one page of a list.
 pub const LIST_PAGE_MAX: usize = 200;
 
+/// Most people `docs list` names in its `authors` facet.
+pub const AUTHOR_FACET_MAX: usize = 200;
+
+/// Most groups of people one place reads for the `authors` facet of `docs list`, the unknown row
+/// included.
+pub const AUTHOR_GROUPS_READ_MAX: usize = 1000;
+
 /// Most characters of a document title.
 pub const TITLE_MAX: usize = 300;
 

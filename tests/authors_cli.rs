@@ -124,3 +124,95 @@ fn without_a_git_name_the_authors_are_null() {
         (Value::Null, Value::Null)
     );
 }
+
+/// The exit code of `args` run the way [`run`] does.
+fn exit_code(root: &Path, args: &[&str]) -> Option<i32> {
+    Command::new(BINARY)
+        .args(args)
+        .env_clear()
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("HARNESS_KNOWLEDGE_DIR", root.join("knowledge"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("runs")
+        .code()
+}
+
+fn import(root: &Path, name: &str, text: &str) {
+    let file = root.join(format!("{}.md", name.to_lowercase()));
+    std::fs::write(&file, text).expect("write");
+
+    run(
+        root,
+        &["docs", "import", "--ndjson"],
+        &json!({ "paths": [file] }).to_string(),
+    );
+}
+
+fn titles(listed: &Value) -> Vec<&str> {
+    listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["title"].as_str().expect("title"))
+        .collect()
+}
+
+#[test]
+fn an_empty_database_lists_nobody_and_the_list_filters_and_sorts_by_who_added_the_documents() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let root = root.path();
+    let empty = json!({ "people": [], "unknown": 0 });
+
+    // Without a database, and with one that holds nothing yet.
+    let listed = run(root, &["docs", "list", "--json", "--author", "Ada"], "");
+    assert_eq!(listed[0], json!({ "items": [], "total": 0, "authors": empty }));
+
+    set_git_name(root, "Ada");
+    import(root, "Alpha", "# Alpha\n\nThe gateway routes requests.");
+    import(root, "Gamma", "# Gamma\n\nThe gateway retries requests.");
+    set_git_name(root, "Bob");
+    import(root, "Beta", "# Beta\n\nThe gateway times requests out.");
+    std::fs::remove_file(root.join(".gitconfig")).expect("no name");
+    import(root, "Delta", "# Delta\n\nThe gateway logs requests.");
+
+    let list = |extra: &[&str]| -> Value {
+        let mut args = vec!["docs", "list", "--json"];
+        args.extend_from_slice(extra);
+
+        run(root, &args, "").remove(0)
+    };
+
+    assert_eq!(
+        titles(&list(&["--author", "Ada", "--sort", "title"])),
+        ["Alpha", "Gamma"]
+    );
+    assert_eq!(titles(&list(&["--author", "ada"])), Vec::<&str>::new());
+    assert_eq!(titles(&list(&["--author-unknown"])), ["Delta"]);
+    assert_eq!(
+        titles(&list(&["--sort", "addedBy"])),
+        ["Alpha", "Gamma", "Beta", "Delta"]
+    );
+    assert_eq!(
+        titles(&list(&["--sort", "addedBy", "--desc"])),
+        ["Beta", "Gamma", "Alpha", "Delta"]
+    );
+
+    let people = json!({ "people": [{ "name": "Ada", "count": 2 }, { "name": "Bob", "count": 1 }], "unknown": 1 });
+    assert_eq!(list(&["--author", "Bob"])["authors"], people);
+    assert_eq!(list(&["--author", "Bob"])["total"], 1);
+
+    // A name that is not one, or two filters that exclude each other, are usage errors.
+    for args in [
+        &["docs", "list", "--json", "--author", " "][..],
+        &["docs", "list", "--json", "--author", "Ada", "--author-unknown"],
+        &["docs", "list", "--json", "--sort", "addedby"],
+    ] {
+        assert_eq!(exit_code(root, args), Some(2), "{args:?}");
+    }
+}

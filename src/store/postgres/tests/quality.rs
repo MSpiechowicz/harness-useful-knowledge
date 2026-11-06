@@ -5,7 +5,8 @@ use super::support::{client, database, insert, unique, with_login};
 use crate::backend::Access;
 use crate::store::postgres::PostgresStore;
 use crate::store::testing::{
-    Seed, absent_columns_contract, authors_contract, counters_contract, shared_chunks_contract, titles_contract,
+    Seed, absent_columns_contract, author_facet_asked_contract, author_filter_contract, author_invalid_names_contract,
+    author_listing_scale_contract, authors_contract, counters_contract, shared_chunks_contract, titles_contract,
     useful_listing_contract,
 };
 use crate::store::{DocUsage, KnowledgeStore};
@@ -34,6 +35,34 @@ fn team_the_useful_filter_and_sorts_follow_the_contract() {
     let Some(db) = database() else { return };
 
     useful_listing_contract(&mut db.open());
+}
+
+#[test]
+fn team_author_filter_and_sort_follow_the_contract() {
+    let Some(db) = database() else { return };
+
+    author_filter_contract(&mut db.open());
+}
+
+#[test]
+fn team_author_names_that_are_not_names_are_never_shown() {
+    let Some(db) = database() else { return };
+
+    author_invalid_names_contract(&mut db.open());
+}
+
+#[test]
+fn team_author_facet_is_read_only_when_asked() {
+    let Some(db) = database() else { return };
+
+    author_facet_asked_contract(&mut db.open());
+}
+
+#[test]
+fn team_author_pages_of_a_thousand_documents_add_up() {
+    let Some(db) = database() else { return };
+
+    author_listing_scale_contract(&mut db.open());
 }
 
 #[test]

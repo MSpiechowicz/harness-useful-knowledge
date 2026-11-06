@@ -4,7 +4,7 @@ use super::Failure;
 use crate::cli::Args;
 use crate::config::Place;
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
-use crate::store::{ListQuery, RepoFilter, Sort, StatusFilter, UsefulFilter, clean};
+use crate::store::{AuthorFilter, ListQuery, RepoFilter, Sort, StatusFilter, UsefulFilter, clean};
 
 /// The query of `docs list` and the place `--place` narrows it to.
 pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Place>), Failure> {
@@ -18,8 +18,10 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         "--place",
         "--useful",
         "--status",
+        "--author",
     ];
-    let parsed = Args::parse(args, &["--json", "--global", "--all", "--desc"], &valued).ok_or(Failure::Usage)?;
+    let flags = ["--json", "--global", "--all", "--desc", "--author-unknown"];
+    let parsed = Args::parse(args, &flags, &valued).ok_or(Failure::Usage)?;
 
     if !parsed.positional.is_empty() || !parsed.flag("--json") {
         return Err(Failure::Usage);
@@ -53,12 +55,21 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         Some("repos") => Sort::Repos,
         Some("useful") => Sort::Useful,
         Some("lastUseful") => Sort::LastUseful,
+        Some("addedBy") => Sort::AddedBy,
         Some(_) => return Err(Failure::Usage),
     };
 
     let useful = match parsed.value("--useful") {
         None | Some("any") => None,
         Some(raw) => Some(UsefulFilter::parse(raw).ok_or(Failure::Usage)?),
+    };
+
+    // A name and "nobody known" together ask for nothing, and a blank or unfit name is not a name.
+    let author = match (parsed.value("--author"), parsed.flag("--author-unknown")) {
+        (None, false) => None,
+        (None, true) => Some(AuthorFilter::Unknown),
+        (Some(name), false) => Some(AuthorFilter::named(name).ok_or(Failure::Usage)?),
+        (Some(_), true) => return Err(Failure::Usage),
     };
 
     let status = match parsed.value("--status") {
@@ -94,6 +105,9 @@ pub(super) fn parse_list(args: &[Option<&str>]) -> Result<(ListQuery, Option<Pla
         format,
         text,
         useful,
+        author,
+        // The person's own list shows who else could be picked.
+        want_authors: true,
         status,
         sort,
         descending: parsed.flag("--desc"),

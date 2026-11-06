@@ -411,6 +411,8 @@ pub fn waiting_for(store: &mut dyn KnowledgeStore, name: Option<&str>) -> Result
             format: None,
             text: String::new(),
             useful: None,
+            author: None,
+            want_authors: false,
             status: StatusFilter::Waiting,
             sort: Sort::Updated,
             descending: false,

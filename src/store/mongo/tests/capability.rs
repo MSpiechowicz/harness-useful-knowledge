@@ -19,6 +19,8 @@ fn everything() -> ListQuery {
         format: None,
         text: String::new(),
         useful: None,
+        author: None,
+        want_authors: false,
         sort: Sort::Updated,
         descending: true,
         offset: 0,

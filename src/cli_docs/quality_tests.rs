@@ -48,6 +48,18 @@ impl Lab {
         (Self { root, env }, [a, b, c])
     }
 
+    /// A lab whose documents are the `seeds`, stored in order, and their ids.
+    fn with(seeds: &[Seed]) -> (Self, Vec<i64>) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let folder = root.path().join("knowledge");
+        let env = Env::for_tests("/home/u").with_var(DIR_VAR, folder.to_string_lossy());
+
+        let mut store = SqliteStore::open(&folder.join(FILE_NAME)).expect("create");
+        let ids = seeds.iter().map(|seed| insert(&mut store, seed)).collect();
+
+        (Self { root, env }, ids)
+    }
+
     fn run(&self, args: &[&str]) -> Reply {
         let context = Context::new(&self.env, &Backend::Sqlite, Routing::local());
         let args: Vec<Option<&str>> = args.iter().map(|arg| Some(*arg)).collect();
@@ -77,9 +89,18 @@ impl Lab {
 
     /// Removes the added columns, leaving the file as an older server's.
     fn strip(&self) {
+        self.drop_columns(&crate::store::quality::USAGE_NAMES);
+    }
+
+    /// Removes the author columns only.
+    fn strip_authors(&self) {
+        self.drop_columns(&crate::store::quality::AUTHOR_NAMES);
+    }
+
+    fn drop_columns(&self, names: &[&str]) {
         let conn = Connection::open(self.root.path().join("knowledge").join(FILE_NAME)).expect("open");
 
-        for name in crate::store::quality::USAGE_NAMES {
+        for name in names {
             conn.execute_batch(&format!("ALTER TABLE knowledge_documents DROP COLUMN {name}"))
                 .expect("drop column");
         }
@@ -270,4 +291,245 @@ fn remote_writable_is_null_without_a_remote_database_and_while_it_is_down() {
 
     assert_eq!(stats["places"]["remote"], json!({ "offline": true }));
     assert_eq!(stats["remoteWritable"], Value::Null);
+}
+
+/// Four documents: Ada added two (one through a harness), Bob one, and nobody known the last.
+fn authored() -> Lab {
+    let (lab, _) = Lab::with(&[
+        Seed::new("A")
+            .source("/a")
+            .chunk("1", "alpha")
+            .by("Ada", Some("codex"))
+            .updated(1_000),
+        Seed::new("B")
+            .source("/b")
+            .chunk("1", "beta")
+            .by("bob", None)
+            .updated(2_000),
+        Seed::new("C").source("/c").chunk("1", "gamma").updated(3_000),
+        Seed::new("D")
+            .source("/d")
+            .chunk("1", "delta")
+            .by("Ada", None)
+            .format("pdf")
+            .updated(4_000),
+    ]);
+
+    lab
+}
+
+#[test]
+fn author_keeps_the_documents_a_person_added_and_author_unknown_those_nobody_did() {
+    let lab = authored();
+
+    assert_eq!(lab.titles(&["list", "--json", "--author", "Ada"]), ["A", "D"]);
+    assert_eq!(lab.titles(&["list", "--json", "--author=bob"]), ["B"]);
+    assert_eq!(
+        lab.titles(&["list", "--json", "--author", "  Ada  "]),
+        ["A", "D"],
+        "trimmed"
+    );
+    assert_eq!(lab.titles(&["list", "--json", "--author-unknown"]), ["C"]);
+
+    for other in ["ADA", "Bob", "Nobody"] {
+        let listed = lab.json(&["list", "--json", "--author", other]);
+        assert_eq!(
+            (listed["items"].clone(), listed["total"].clone()),
+            (json!([]), json!(0)),
+            "{other}"
+        );
+    }
+
+    // It goes with the other filters, and the total follows it.
+    let listed = lab.json(&["list", "--json", "--author", "Ada", "--format", "pdf"]);
+    assert_eq!(
+        (listed["total"].clone(), listed["items"].as_array().map(Vec::len)),
+        (json!(1), Some(1))
+    );
+}
+
+#[test]
+fn the_list_carries_who_added_the_documents_under_every_filter_but_the_author_one() {
+    let lab = authored();
+    let everyone = json!({ "people": [{ "name": "Ada", "count": 2 }, { "name": "bob", "count": 1 }], "unknown": 1 });
+
+    assert_eq!(lab.json(&["list", "--json"])["authors"], everyone);
+    assert_eq!(lab.json(&["list", "--json", "--author", "Ada"])["authors"], everyone);
+    assert_eq!(lab.json(&["list", "--json", "--author-unknown"])["authors"], everyone);
+    assert_eq!(
+        lab.json(&["list", "--json", "--page", "9"])["authors"],
+        everyone,
+        "past the end"
+    );
+
+    assert_eq!(
+        lab.json(&["list", "--json", "--format", "pdf"])["authors"],
+        json!({ "people": [{ "name": "Ada", "count": 1 }], "unknown": 0 })
+    );
+    assert_eq!(
+        lab.json(&["list", "--json", "--query", "alpha", "--author", "bob"])["authors"],
+        json!({ "people": [{ "name": "Ada", "count": 1 }, { "name": "bob", "count": 0 }], "unknown": 0 }),
+        "the selected person is listed, with the documents the filters keep"
+    );
+
+    // A name nobody added under the other filters is in the facet with a count of 0.
+    assert_eq!(
+        lab.json(&["list", "--json", "--format", "pdf", "--author", "Zed"])["authors"],
+        json!({ "people": [{ "name": "Ada", "count": 1 }, { "name": "Zed", "count": 0 }], "unknown": 0 })
+    );
+}
+
+#[test]
+fn added_by_sorts_by_the_name_with_the_unknown_last_both_ways() {
+    let lab = authored();
+
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "addedBy"]),
+        ["A", "D", "B", "C"]
+    );
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "addedBy", "--desc"]),
+        ["B", "D", "A", "C"]
+    );
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "addedBy", "--page", "2", "--per-page", "3"]),
+        ["C"]
+    );
+}
+
+#[test]
+fn at_most_two_hundred_people_are_listed_and_the_selected_one_is_among_them() {
+    let seeds: Vec<Seed> = (0..250)
+        .map(|n| {
+            // The last people added the fewest documents, so they are the ones cut.
+            let seed = Seed::new(&format!("Doc {n:03}"))
+                .source(&format!("/{n}"))
+                .chunk("1", "text");
+
+            seed.by(&format!("Person {n:03}"), None)
+        })
+        .chain((0..3).map(|n| {
+            Seed::new(&format!("Extra {n}"))
+                .source(&format!("/extra/{n}"))
+                .chunk("1", "text")
+                .by("Person 000", None)
+        }))
+        .collect();
+    let (lab, _) = Lab::with(&seeds);
+
+    let names = |listed: &Value| -> Vec<String> {
+        listed["authors"]["people"]
+            .as_array()
+            .expect("people")
+            .iter()
+            .map(|person| person["name"].as_str().expect("name").to_owned())
+            .collect()
+    };
+
+    let listed = lab.json(&["list", "--json"]);
+    let people = names(&listed);
+    assert_eq!(people.len(), 200);
+    assert_eq!(people[0], "Person 000");
+    assert!(!people.contains(&"Person 249".to_owned()));
+    assert_eq!(listed["authors"]["people"][0]["count"], json!(4));
+
+    let listed = lab.json(&["list", "--json", "--author", "Person 249"]);
+    let people = names(&listed);
+    assert_eq!(
+        (people.len(), people.last().map(String::as_str)),
+        (200, Some("Person 249"))
+    );
+    assert_eq!(listed["total"], json!(1));
+    assert!(
+        listed["authors"]["people"]
+            .as_array()
+            .expect("people")
+            .contains(&json!({ "name": "Person 249", "count": 1 }))
+    );
+}
+
+#[test]
+fn a_database_without_the_author_columns_has_no_person() {
+    let lab = authored();
+    lab.strip_authors();
+
+    let nobody = json!({ "people": [], "unknown": 4 });
+    // The person asked for is listed all the same, with the documents they were found to have (none).
+    let asked = json!({ "people": [{ "name": "Ada", "count": 0 }], "unknown": 4 });
+
+    let listed = lab.json(&["list", "--json", "--author", "Ada"]);
+    assert_eq!(
+        (
+            listed["items"].clone(),
+            listed["total"].clone(),
+            listed["authors"].clone()
+        ),
+        (json!([]), json!(0), asked)
+    );
+
+    assert_eq!(
+        lab.titles(&["list", "--json", "--author-unknown"]),
+        ["A", "B", "C", "D"]
+    );
+    assert_eq!(lab.json(&["list", "--json"])["authors"], nobody);
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "addedBy"]),
+        ["A", "B", "C", "D"]
+    );
+    assert_eq!(
+        lab.titles(&["list", "--json", "--sort", "addedBy", "--desc"]),
+        ["D", "C", "B", "A"]
+    );
+}
+
+#[test]
+fn the_author_options_refuse_what_is_not_a_name_or_asks_for_nothing() {
+    let (lab, _) = Lab::with(&[]);
+
+    for args in [
+        &["list", "--json", "--author", ""][..],
+        &["list", "--json", "--author", "   "],
+        &["list", "--json", "--author", "Ada\nLovelace"],
+        &["list", "--json", "--author", "Ada\u{202e}"],
+        &["list", "--json", "--author", &"x".repeat(81)],
+        &["list", "--json", "--author"],
+        &["list", "--json", "--author", "Ada", "--author", "Bob"],
+        &["list", "--json", "--author", "Ada", "--author-unknown"],
+        &["list", "--json", "--author-unknown", "--author-unknown"],
+        &["list", "--json", "--author-unknown=yes"],
+        &["list", "--json", "--sort", "addedby"],
+    ] {
+        assert_eq!(lab.run(args).map(|done| done.json), Err(Failure::Usage), "{args:?}");
+    }
+}
+
+#[test]
+fn a_name_of_a_hundred_thousand_characters_is_never_printed_and_counts_as_unknown() {
+    let huge = "x".repeat(100_000);
+    let (lab, _) = Lab::with(&[
+        Seed::new("A")
+            .source("/a")
+            .chunk("1", "alpha")
+            .by("Ada", None)
+            .updated(1_000),
+        Seed::new("B")
+            .source("/b")
+            .chunk("1", "beta")
+            .by(&huge, None)
+            .updated(2_000),
+        Seed::new("C")
+            .source("/c")
+            .chunk("1", "gamma")
+            .by(&huge, None)
+            .updated(3_000),
+    ]);
+
+    let listed = lab.json(&["list", "--json", "--per-page", "1", "--sort", "addedBy"]);
+
+    assert_eq!(listed["total"], json!(3));
+    assert_eq!(
+        listed["authors"],
+        json!({ "people": [{ "name": "Ada", "count": 1 }], "unknown": 2 })
+    );
+    assert!(listed.to_string().len() < 5_000, "no oversized name in the answer");
 }

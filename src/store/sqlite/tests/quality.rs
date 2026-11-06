@@ -5,10 +5,11 @@ use rusqlite::Connection;
 
 use crate::store::sqlite::schema::{SCHEMA_VERSION, migrate, user_version};
 use crate::store::testing::{
-    Seed, absent_columns_contract, authors_contract, counters_contract, insert, shared_chunks_contract, store,
+    Seed, absent_columns_contract, author_facet_asked_contract, author_filter_contract, author_invalid_names_contract,
+    author_listing_scale_contract, authors_contract, counters_contract, insert, shared_chunks_contract, store,
     titles_contract, useful_listing_contract,
 };
-use crate::store::{DocUsage, KnowledgeStore, SqliteStore};
+use crate::store::{AuthorFilter, DocUsage, KnowledgeStore, ListQuery, RepoFilter, Sort, SqliteStore, StatusFilter};
 
 const ADDED: [&str; 7] = [
     "added_by_name",
@@ -47,6 +48,26 @@ fn counters_follow_the_contract() {
 #[test]
 fn the_useful_filter_and_sorts_follow_the_contract() {
     useful_listing_contract(&mut store());
+}
+
+#[test]
+fn author_filter_and_sort_follow_the_contract() {
+    author_filter_contract(&mut store());
+}
+
+#[test]
+fn author_names_that_are_not_names_are_never_shown() {
+    author_invalid_names_contract(&mut store());
+}
+
+#[test]
+fn author_facet_is_read_only_when_asked() {
+    author_facet_asked_contract(&mut store());
+}
+
+#[test]
+fn author_pages_of_a_thousand_documents_add_up() {
+    author_listing_scale_contract(&mut store());
 }
 
 #[test]
@@ -135,6 +156,8 @@ fn a_file_extended_by_this_version_keeps_its_schema_version_and_opens_read_only_
                 format: None,
                 text: String::new(),
                 useful: None,
+                author: None,
+                want_authors: false,
                 sort: crate::store::Sort::Title,
                 descending: false,
                 offset: 0,
@@ -163,6 +186,8 @@ fn a_file_extended_by_this_version_keeps_its_schema_version_and_opens_read_only_
             format: None,
             text: String::new(),
             useful: None,
+            author: None,
+            want_authors: false,
             sort: crate::store::Sort::Title,
             descending: false,
             offset: 0,
@@ -206,4 +231,77 @@ fn counting_never_waits_for_a_lock_another_connection_holds() {
             .map(|u| u.shown),
         Some(1)
     );
+}
+
+/// Names SQLite reads as something short but that hold more: a NUL cuts a text for `substr`, and a
+/// lead byte with a run of continuation bytes counts as one character. They are no known author, not
+/// a person named by what comes before the NUL, and are read cut by their bytes.
+#[test]
+fn a_name_that_is_not_valid_text_or_hides_bytes_is_no_known_author_and_the_list_still_answers() {
+    let dir = folder();
+    let path = dir.path().join("knowledge.sqlite3");
+
+    let mut writer = SqliteStore::open(&path).expect("create");
+    for (title, name) in [
+        ("Fine", "Ada"),
+        ("Nul", "x"),
+        ("Lead", "x"),
+        ("Broken", "x"),
+        ("Plain", "x"),
+    ] {
+        insert(
+            &mut writer,
+            &Seed::new(title)
+                .source(&format!("/{title}"))
+                .chunk("1", "a")
+                .by(name, None),
+        );
+    }
+    drop(writer);
+
+    let conn = Connection::open(&path).expect("open");
+    let forms: [(&str, Vec<u8>); 4] = [
+        ("Nul", b"Ada\0tail".to_vec()),
+        ("Lead", [vec![0xC0], vec![0x80; 1 << 20]].concat()),
+        ("Broken", b"A\xFF".to_vec()),
+        ("Plain", vec![b'n'; 1 << 20]),
+    ];
+
+    for (title, bytes) in &forms {
+        conn.execute(
+            "UPDATE knowledge_documents SET added_by_name = CAST(?1 AS TEXT) WHERE title = ?2",
+            rusqlite::params![bytes, title],
+        )
+        .expect("write the name");
+    }
+
+    drop(conn);
+
+    let mut reader = SqliteStore::open_read_only(&path).expect("open").expect("a database");
+    let list = |reader: &mut SqliteStore, author: Option<AuthorFilter>| {
+        reader
+            .list(&ListQuery {
+                filter: RepoFilter::All,
+                format: None,
+                text: String::new(),
+                useful: None,
+                author,
+                want_authors: true,
+                status: StatusFilter::All,
+                sort: Sort::Updated,
+                descending: false,
+                offset: 0,
+                limit: 1,
+            })
+            .expect("list")
+    };
+
+    let page = list(&mut reader, None);
+    assert_eq!(page.total, 5);
+    assert_eq!((page.authors.people(), page.authors.unknown()), (vec![("Ada", 1)], 4));
+    assert!(!page.authors.json().to_string().contains("tail"));
+
+    // The person is the one name that is exactly Ada, the others do not count towards it.
+    let page = list(&mut reader, Some(AuthorFilter::Named("Ada".to_owned())));
+    assert_eq!((page.total, page.authors.people()), (1, vec![("Ada", 1)]));
 }

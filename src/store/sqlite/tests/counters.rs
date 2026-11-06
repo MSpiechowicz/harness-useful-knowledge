@@ -235,6 +235,8 @@ fn a_counter_or_a_name_another_type_was_put_in_reads_instead_of_failing_the_row(
             format: None,
             text: String::new(),
             useful: None,
+            author: None,
+            want_authors: false,
             sort: crate::store::Sort::Useful,
             descending: false,
             offset: 0,

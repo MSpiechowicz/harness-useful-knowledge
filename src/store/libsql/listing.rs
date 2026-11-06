@@ -5,17 +5,35 @@
 use super::documents::{by_id, links_of, links_of_many, listed, pending_of_many};
 use super::meta;
 use super::sql::{Sql, Value, args, query_row};
+use crate::store::author_list::unhex;
 use crate::store::sqlite::sql_shared::{
-    GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql,
+    GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, author_groups_sql, list_conditions, matches_query, page_limit, page_sql,
+    with_author,
 };
+use crate::store::{AuthorFacet, Section, Stats, StoreError};
 use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
 };
-use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(db: &mut dyn Sql, columns: Columns, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = list_conditions::<Value>(columns, query);
+    let (base, mut params) = list_conditions::<Value>(columns, query);
+
+    // The facet honours every filter but the author one, so it is read before that filter's name is
+    // bound. Only a list that asks for it pays for it.
+    let authors = if query.want_authors {
+        let groups = db
+            .query(&author_groups_sql(columns, &base), &params)?
+            .iter()
+            .map(|row| Ok((row.tolerant_text(0).and_then(|hex| unhex(&hex)), row.get::<usize>(1)?)))
+            .collect::<Result<Vec<_>, StoreError>>()?;
+
+        AuthorFacet::from_groups(groups)
+    } else {
+        AuthorFacet::default()
+    };
+
+    let filter = with_author(columns, query, &base, &mut params);
     let total = db.query(
         &format!("SELECT count(*) FROM knowledge_documents d WHERE {filter}"),
         &params,
@@ -46,7 +64,7 @@ pub(super) fn list(db: &mut dyn Sql, columns: Columns, query: &ListQuery) -> Res
         })
         .collect();
 
-    Ok(DocumentPage { items, total })
+    Ok(DocumentPage { items, total, authors })
 }
 
 /// The chunks of document `id` that match `text`, at most `limit`.

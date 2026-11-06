@@ -256,6 +256,7 @@ each place under `places`.
 ```sh
 harness-knowledge docs import --ndjson < manifest.json   # {"paths":[],"folders":[],"links":[]}
 harness-knowledge docs list --json --query billing
+harness-knowledge docs list --json --author "Ada" --sort addedBy   # or --author-unknown
 harness-knowledge search --json --query "how are refunds retried" --project .
 harness-knowledge held list --json [--sort created|addedBy]
 harness-knowledge held approve --json <id>
@@ -266,6 +267,12 @@ echo "how do we deploy?" | harness-knowledge recall --hook --project .
 `harness-knowledge --help` lists every command. Commands print JSON and exit 0 on success, 1 on a
 failure, 2 for a usage error or an unknown command, and 3 for a missing database capability.
 `recall --hook` always exits 0 and prints at most three pointers, or nothing.
+
+`docs list` keeps the documents one person added with `--author NAME` (the git `user.name` they were
+written under, matched exactly, upper and lower case apart) or the ones nobody is known for with
+`--author-unknown`, and `--sort addedBy` orders them by that name with the unknown ones last either way.
+Its answer also carries `authors`: `{"people": [{"name", "count"}], "unknown": N}`, how many documents each
+person added under every filter but the author one, at most 200 people with the one asked for always among them.
 
 ## Build
 

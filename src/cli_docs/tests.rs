@@ -101,7 +101,10 @@ fn titles(listing: &Value) -> Vec<&str> {
 fn on_a_fresh_folder_every_read_is_empty_and_creates_nothing() {
     let fixture = Fixture::new();
 
-    assert_eq!(fixture.json(&["list", "--json"]), json!({ "items": [], "total": 0 }));
+    assert_eq!(
+        fixture.json(&["list", "--json"]),
+        json!({ "items": [], "total": 0, "authors": { "people": [], "unknown": 0 } })
+    );
     assert_eq!(
         fixture.json(&[
             "list",
@@ -118,7 +121,7 @@ fn on_a_fresh_folder_every_read_is_empty_and_creates_nothing() {
             "--page",
             "3"
         ]),
-        json!({ "items": [], "total": 0 })
+        json!({ "items": [], "total": 0, "authors": { "people": [], "unknown": 0 } })
     );
     assert_eq!(fixture.json(&["repos", "--json"]), json!({ "global": 0, "repos": [] }));
 
@@ -389,7 +392,10 @@ fn deleting_removes_documents_and_counts_those_that_existed() {
     );
 
     assert_eq!(fixture.json(&["delete", "--json", &billing]), json!({ "deleted": 1 }));
-    assert_eq!(fixture.json(&["list", "--json"]), json!({ "items": [], "total": 0 }));
+    assert_eq!(
+        fixture.json(&["list", "--json"]),
+        json!({ "items": [], "total": 0, "authors": { "people": [], "unknown": 0 } })
+    );
 }
 
 #[test]

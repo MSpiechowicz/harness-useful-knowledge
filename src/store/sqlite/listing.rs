@@ -1,20 +1,34 @@
 //! Reading documents: the list with its filters and order, one document with its parts, and the
 //! counts per repository and overall.
 
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::documents::{by_id, links_of, links_of_many, listed, pending_of_many};
-use super::sql_shared::{GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, list_conditions, matches_query, page_limit, page_sql};
+use super::sql_shared::{
+    GLOBAL, MATCHES_COUNT_SQL, MATCHES_SQL, author_groups_sql, list_conditions, matches_query, page_limit, page_sql,
+    with_author,
+};
 use super::{meta, schema};
+use crate::store::author_list::unhex;
+use crate::store::{AuthorFacet, Section, Stats, StoreError};
 use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
 };
-use crate::store::{Section, Stats, StoreError};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(conn: &Connection, columns: Columns, query: &ListQuery) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = list_conditions::<Value>(columns, query);
+    let (base, mut params) = list_conditions::<Value>(columns, query);
+
+    // The facet honours every filter but the author one, so it is read before that filter's name is
+    // bound. Only a list that asks for it pays for it.
+    let authors = if query.want_authors {
+        author_facet(conn, columns, &base, &params)?
+    } else {
+        AuthorFacet::default()
+    };
+
+    let filter = with_author(columns, query, &base, &mut params);
     let total: i64 = conn.query_row(
         &format!("SELECT count(*) FROM knowledge_documents d WHERE {filter}"),
         params_from_iter(params.iter()),
@@ -47,7 +61,32 @@ pub(super) fn list(conn: &Connection, columns: Columns, query: &ListQuery) -> Re
     Ok(DocumentPage {
         items,
         total: usize::try_from(total).unwrap_or(0),
+        authors,
     })
+}
+
+/// The authors facet under `filter`. A name that is not valid UTF-8, or has a control character in
+/// it, which somebody may have written, is no known author.
+fn author_facet(
+    conn: &Connection,
+    columns: Columns,
+    filter: &str,
+    params: &[Value],
+) -> Result<AuthorFacet, StoreError> {
+    let mut statement = conn.prepare(&author_groups_sql(columns, filter))?;
+    let groups = statement
+        .query_map(params_from_iter(params.iter()), |row| {
+            // The hex of the name, NULL for none: anything else cannot be a name.
+            let name = match row.get_ref(0)? {
+                ValueRef::Text(hex) => std::str::from_utf8(hex).ok().and_then(unhex),
+                _ => None,
+            };
+
+            Ok((name, row.get::<_, usize>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AuthorFacet::from_groups(groups))
 }
 
 /// The chunks of document `id` that match `text`, at most `limit`.

@@ -60,10 +60,12 @@ use super::review::{
 };
 use super::upgrade::{Plan, plan};
 use super::{
+    AuthorFacet, Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply,
+};
+use super::{
     Chunk, ChunkHit, ChunkMatches, Columns, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link,
     ListQuery,
 };
-use super::{Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply};
 use super::{Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility, clean};
 use crate::backend::{Access, OpenError, Opened, Upgrade};
 use crate::config::Secrets;
@@ -496,6 +498,7 @@ impl KnowledgeStore for PostgresStore {
             return Ok(DocumentPage {
                 items: Vec::new(),
                 total: 0,
+                authors: AuthorFacet::default(),
             });
         }
 

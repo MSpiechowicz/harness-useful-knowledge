@@ -4,7 +4,7 @@
 use super::Seed;
 use crate::limits::SHARED_SHAS_MAX;
 use crate::store::{Author, Detail, DocUsage, Document, KnowledgeStore, ListQuery, RepoFilter, Sort, StoreError};
-use crate::store::{DocumentPage, DocumentRow, TitleScope, UsefulFilter};
+use crate::store::{AuthorFilter, DocumentPage, DocumentRow, StatusFilter, TitleScope, UsefulFilter};
 
 fn author(name: &str, via: Option<&str>) -> Option<Author> {
     Some(Author {
@@ -34,6 +34,8 @@ pub fn rows(store: &mut dyn KnowledgeStore) -> Vec<DocumentRow> {
             format: None,
             text: String::new(),
             useful: None,
+            author: None,
+            want_authors: false,
             sort: Sort::Updated,
             descending: false,
             offset: 0,
@@ -58,6 +60,8 @@ fn page(
             format: None,
             text: String::new(),
             useful,
+            author: None,
+            want_authors: false,
             sort,
             descending,
             offset,
@@ -202,6 +206,418 @@ pub fn authors_contract(store: &mut dyn KnowledgeStore) {
     let anonymous = put(store, &Seed::new("Anonymous").chunk("Intro", "beta words"));
     let stored = read(store, anonymous).doc;
     assert_eq!((stored.added_by, stored.updated_by), (None, None));
+}
+
+/// The query of every document, sorted, over one page.
+fn query(sort: Sort, descending: bool, (offset, limit): (usize, usize)) -> ListQuery {
+    ListQuery {
+        filter: RepoFilter::All,
+        format: None,
+        text: String::new(),
+        useful: None,
+        author: None,
+        want_authors: true,
+        status: StatusFilter::All,
+        sort,
+        descending,
+        offset,
+        limit,
+    }
+}
+
+fn named(name: &str) -> Option<AuthorFilter> {
+    Some(AuthorFilter::Named(name.to_owned()))
+}
+
+/// The people of a page's facet with their counts, and the unknown count.
+fn facet_of(page: &DocumentPage) -> (Vec<(String, usize)>, usize) {
+    let people = page
+        .authors
+        .people()
+        .into_iter()
+        .map(|(name, count)| (name.to_owned(), count))
+        .collect();
+
+    (people, page.authors.unknown())
+}
+
+fn person(name: &str, count: usize) -> (String, usize) {
+    (name.to_owned(), count)
+}
+
+/// `--author` keeps the documents added by exactly that name (case-sensitive, the harness ignored)
+/// and `--author-unknown` those with no known author, the sort by who added a document puts the
+/// unknown last in both directions and breaks ties by id, and the facet counts the people under
+/// every filter but the author one.
+pub fn author_filter_contract(store: &mut dyn KnowledgeStore) {
+    let alpha = put(
+        store,
+        &Seed::new("Alpha")
+            .chunk("1", "one")
+            .by("Ada", Some("claude-code"))
+            .updated(1),
+    );
+    let beta = put(store, &Seed::new("Beta").chunk("1", "two").by("Ada", None).updated(2));
+    let gamma = put(
+        store,
+        &Seed::new("Gamma")
+            .chunk("1", "three")
+            .by("Bob", None)
+            .format("pdf")
+            .updated(3),
+    );
+    let delta = put(store, &Seed::new("Delta").chunk("1", "four").by("ada", None).updated(4));
+    let epsilon = put(store, &Seed::new("Epsilon").chunk("1", "five").updated(5));
+    let zeta = put(store, &Seed::new("Zeta").chunk("1", "six").by("", None).updated(6));
+    let eta = put(
+        store,
+        &Seed::new("Eta").chunk("1", "seven").by("Émile", None).updated(7),
+    );
+    let theta = put(store, &Seed::new("Theta").chunk("1", "eight").updated(8));
+
+    let listed = |store: &mut dyn KnowledgeStore, query: ListQuery| -> (Vec<i64>, usize) {
+        let page = store.list(&query).expect("list");
+
+        (ids_of(&page), page.total)
+    };
+    let all = (0, 50);
+
+    // The name decides, not the harness it was written through, and not the case.
+    let found = listed(
+        store,
+        ListQuery {
+            author: named("Ada"),
+            ..query(Sort::Updated, false, all)
+        },
+    );
+    assert_eq!(found, (vec![alpha, beta], 2));
+
+    let found = listed(
+        store,
+        ListQuery {
+            author: named("ada"),
+            ..query(Sort::Updated, false, all)
+        },
+    );
+    assert_eq!(found, (vec![delta], 1));
+
+    for nobody in ["ADA", "Ad", "Ada via claude-code", "Nobody"] {
+        let found = listed(
+            store,
+            ListQuery {
+                author: named(nobody),
+                ..query(Sort::Updated, false, all)
+            },
+        );
+        assert_eq!(found, (vec![], 0), "{nobody}");
+    }
+
+    // No name and an empty one are no known author.
+    let unknown = Some(AuthorFilter::Unknown);
+    let found = listed(
+        store,
+        ListQuery {
+            author: unknown.clone(),
+            ..query(Sort::Updated, false, all)
+        },
+    );
+    assert_eq!(found, (vec![epsilon, zeta, theta], 3));
+
+    let found = listed(store, query(Sort::Updated, false, all));
+    assert_eq!(found, (vec![alpha, beta, gamma, delta, epsilon, zeta, eta, theta], 8));
+
+    // Ascending by the name folded to lower case (the letters of ASCII only, so a name that starts
+    // with another letter sorts after them), ties and the unknown by id, the unknown last.
+    let ascending = [alpha, beta, delta, gamma, eta, epsilon, zeta, theta];
+    let descending = [eta, gamma, delta, beta, alpha, theta, zeta, epsilon];
+
+    assert_eq!(
+        ids_of(&store.list(&query(Sort::AddedBy, false, all)).expect("list")),
+        ascending
+    );
+    assert_eq!(
+        ids_of(&store.list(&query(Sort::AddedBy, true, all)).expect("list")),
+        descending
+    );
+
+    // Pages cut that order, also across the unknown ones.
+    let found = listed(store, query(Sort::AddedBy, false, (2, 4)));
+    assert_eq!(found, (vec![delta, gamma, eta, epsilon], 8));
+
+    let found = listed(store, query(Sort::AddedBy, true, (4, 3)));
+    assert_eq!(found, (vec![alpha, theta, zeta], 8));
+
+    // The sort and the filter go together.
+    let found = listed(
+        store,
+        ListQuery {
+            author: named("Ada"),
+            ..query(Sort::AddedBy, true, all)
+        },
+    );
+    assert_eq!(found, (vec![beta, alpha], 2));
+
+    let found = listed(
+        store,
+        ListQuery {
+            author: unknown,
+            ..query(Sort::AddedBy, true, all)
+        },
+    );
+    assert_eq!(found, (vec![theta, zeta, epsilon], 3));
+
+    // The facet: most first, then by name (ASCII letters folded), and the unknown ones apart. The
+    // harness is no part of a person.
+    let everyone = vec![person("Ada", 2), person("ada", 1), person("Bob", 1), person("Émile", 1)];
+
+    let page = store.list(&query(Sort::Updated, false, all)).expect("list");
+    assert_eq!(facet_of(&page), (everyone.clone(), 3));
+
+    // The author filter does not change it, the total follows the filter.
+    for author in [named("Ada"), named("Nobody"), Some(AuthorFilter::Unknown)] {
+        let page = store
+            .list(&ListQuery {
+                author,
+                ..query(Sort::Updated, false, all)
+            })
+            .expect("list");
+        assert_eq!(facet_of(&page), (everyone.clone(), 3));
+    }
+
+    // Every other filter changes it, and the page does not: a page past the end has the facet too.
+    let page = store
+        .list(&ListQuery {
+            format: Some("pdf".to_owned()),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!(facet_of(&page), (vec![person("Bob", 1)], 0));
+
+    let page = store
+        .list(&ListQuery {
+            text: "Alpha".to_owned(),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!(facet_of(&page), (vec![person("Ada", 1)], 0));
+
+    let page = store.list(&query(Sort::Updated, false, (100, 10))).expect("list");
+    assert_eq!(
+        (page.items.len(), page.total, facet_of(&page)),
+        (0, 8, (everyone.clone(), 3))
+    );
+
+    store.record_shown(&[beta, epsilon]).expect("shown");
+    store.record_useful(&[beta, epsilon], 10).expect("useful");
+
+    let page = store
+        .list(&ListQuery {
+            useful: Some(UsefulFilter::Ever),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!(facet_of(&page), (vec![person("Ada", 1)], 1));
+
+    let page = store
+        .list(&ListQuery {
+            useful: Some(UsefulFilter::Ever),
+            author: named("Bob"),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!((page.total, facet_of(&page)), (0, (vec![person("Ada", 1)], 1)));
+}
+
+/// A name somebody wrote into the database that is not one (empty, only blanks, with spaces around
+/// it, with an invisible character, too long) is no person: the facet counts it as unknown and never
+/// shows it.
+pub fn author_invalid_names_contract(store: &mut dyn KnowledgeStore) {
+    // Names of 80 characters are fine, of 81 and of a hundred thousand are not (and the long ones
+    // start alike, so they could be one group, counted all the same). A name that is 80 characters
+    // and then blanks and more is not one either: the cut that reads 81 characters of it must not
+    // make it pass as its trimmed form.
+    let fine = "y".repeat(80);
+    let emoji = "\u{1f600}".repeat(80);
+    let padded_long = format!("{} {}", "b".repeat(80), "y".repeat(1000));
+    let padded_short = format!("{} c", "b".repeat(80));
+    let stored = [
+        "Ada",
+        "",
+        "   ",
+        " Bob ",
+        "Eve\u{202e}",
+        "Mal\u{200b}",
+        &"x".repeat(81),
+        &"x".repeat(100_000),
+        &format!("{}z", "x".repeat(100_000)),
+        &fine,
+        &padded_long,
+        &padded_short,
+        &emoji,
+        &"\u{1f600}".repeat(81),
+    ];
+
+    for (n, name) in stored.iter().enumerate() {
+        put(
+            store,
+            &Seed::new(&format!("Doc {n}"))
+                .chunk("1", "text")
+                .by(name, None)
+                .updated(n as i64),
+        );
+    }
+
+    put(store, &Seed::new("Doc none").chunk("1", "text"));
+
+    let page = store.list(&query(Sort::Updated, false, (0, 50))).expect("list");
+    assert_eq!(
+        facet_of(&page),
+        (vec![person("Ada", 1), person(&fine, 1), person(&emoji, 1)], 12)
+    );
+
+    let printed = page.authors.json().to_string();
+    assert!(!printed.contains('\u{202e}') && !printed.contains('\u{200b}') && !printed.contains("xxxx"));
+    assert!(!printed.contains("bbbb"), "a padded name is not shown");
+
+    // A page of one row, in either order, answers the same and shows no oversized name.
+    for descending in [false, true] {
+        let one = store.list(&query(Sort::AddedBy, descending, (0, 1))).expect("list");
+
+        assert_eq!((one.items.len(), one.total), (1, 15));
+        assert_eq!(
+            facet_of(&one),
+            (vec![person("Ada", 1), person(&fine, 1), person(&emoji, 1)], 12)
+        );
+        assert!(!one.authors.json().to_string().contains("xxxx"));
+    }
+
+    // The sort still answers: every row is there once.
+    let page = store.list(&query(Sort::AddedBy, false, (0, 50))).expect("list");
+    assert_eq!(page.items.len(), 15);
+}
+
+/// The authors facet is read only for a query that asks for it (`want_authors`): without it the
+/// facet is empty and the page, its order and its total are the same.
+pub fn author_facet_asked_contract(store: &mut dyn KnowledgeStore) {
+    put(store, &Seed::new("Alpha").chunk("1", "one").by("Ada", None).updated(1));
+    put(store, &Seed::new("Beta").chunk("1", "two").by("Bob", None).updated(2));
+    put(store, &Seed::new("Gamma").chunk("1", "three").updated(3));
+
+    let asked = store.list(&query(Sort::AddedBy, false, (0, 50))).expect("list");
+    assert_eq!(facet_of(&asked), (vec![person("Ada", 1), person("Bob", 1)], 1));
+
+    let not_asked = store
+        .list(&ListQuery {
+            want_authors: false,
+            ..query(Sort::AddedBy, false, (0, 50))
+        })
+        .expect("list");
+    assert_eq!(facet_of(&not_asked), (vec![], 0));
+    assert_eq!((ids_of(&not_asked), not_asked.total), (ids_of(&asked), asked.total));
+
+    // Also with the author filter, whose page and total are the same.
+    let not_asked = store
+        .list(&ListQuery {
+            want_authors: false,
+            author: named("Ada"),
+            ..query(Sort::Updated, false, (0, 50))
+        })
+        .expect("list");
+    assert_eq!((facet_of(&not_asked), not_asked.total), ((vec![], 0), 1));
+}
+
+/// A thousand documents of hundreds of people page in both directions of the sort by who added them
+/// without overlap or gap, the unknown ones last, and the facet adds up to the documents the other
+/// filters keep, whichever name is selected.
+pub fn author_listing_scale_contract(store: &mut dyn KnowledgeStore) {
+    const DOCS: usize = 1200;
+    const PEOPLE: usize = 250;
+
+    // Every tenth document has no author (a quarter of those have an empty name). The rest go round
+    // the people, so the ones whose number ends in 9 never get one.
+    let mut added: Vec<(i64, Option<String>)> = Vec::new();
+
+    for n in 0..DOCS {
+        let name = (n % 10 != 9).then(|| format!("Person {:03}", n % PEOPLE));
+        let seed = Seed::new(&format!("Doc {n:04}")).chunk("1", "text").updated(n as i64);
+        let seed = match (&name, n % 40) {
+            (Some(name), _) => seed.by(name, None),
+            (None, 9) => seed.by("", None),
+            (None, _) => seed,
+        };
+
+        added.push((put(store, &seed), name));
+    }
+
+    // The order the contract asks for.
+    let key = |name: &Option<String>| name.as_ref().map(|name| name.to_ascii_lowercase());
+    let mut expected = added.clone();
+    expected.sort_by(|a, b| match (key(&a.1), key(&b.1)) {
+        (Some(x), Some(y)) => x.cmp(&y).then(a.0.cmp(&b.0)),
+        (None, None) => a.0.cmp(&b.0),
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+    });
+    let ascending: Vec<i64> = expected.iter().map(|(id, _)| *id).collect();
+
+    let mut descending = expected.clone();
+    descending.sort_by(|a, b| match (key(&a.1), key(&b.1)) {
+        (Some(x), Some(y)) => y.cmp(&x).then(b.0.cmp(&a.0)),
+        (None, None) => b.0.cmp(&a.0),
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+    });
+    let descending: Vec<i64> = descending.iter().map(|(id, _)| *id).collect();
+
+    for (way, wanted) in [(false, ascending), (true, descending)] {
+        let mut paged: Vec<i64> = Vec::new();
+
+        for offset in (0..DOCS).step_by(200) {
+            let page = store.list(&query(Sort::AddedBy, way, (offset, 200))).expect("list");
+
+            assert_eq!(page.total, DOCS);
+            paged.extend(ids_of(&page));
+        }
+
+        assert_eq!(paged, wanted, "descending: {way}");
+    }
+
+    // The facet adds up, with or without a name selected, and holds the people it read.
+    let unknown = added.iter().filter(|(_, name)| name.is_none()).count();
+    let people = added
+        .iter()
+        .filter_map(|(_, name)| name.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for author in [None, named("Person 007"), named("Nobody"), Some(AuthorFilter::Unknown)] {
+        let page = store
+            .list(&ListQuery {
+                author: author.clone(),
+                ..query(Sort::AddedBy, false, (0, 1))
+            })
+            .expect("list");
+        let (listed, unknown_count) = facet_of(&page);
+
+        assert_eq!(unknown_count, unknown, "{author:?}");
+        assert_eq!(listed.len(), people.len(), "{author:?}");
+        assert_eq!(
+            listed.iter().map(|(_, count)| count).sum::<usize>() + unknown_count,
+            DOCS
+        );
+        assert!(listed.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+    }
+
+    let page = store
+        .list(&ListQuery {
+            author: named("Person 007"),
+            ..query(Sort::AddedBy, false, (0, 50))
+        })
+        .expect("list");
+    let own = added
+        .iter()
+        .filter(|(_, name)| name.as_deref() == Some("Person 007"))
+        .count();
+    assert_eq!((page.total, page.items.len()), (own, own));
 }
 
 fn usage(store: &mut dyn KnowledgeStore, id: i64) -> Option<DocUsage> {
@@ -418,4 +834,33 @@ pub fn absent_columns_contract(store: &mut dyn KnowledgeStore, id: i64) {
     store.record_shown(&[id]).expect("shown does nothing");
     store.record_useful(&[id], 5).expect("useful does nothing");
     assert_eq!(read(store, id).usage, None);
+
+    // Nobody has a known author: a name keeps none, unknown keeps all, the sort by who added a
+    // document is the default order, and the facet holds nobody and every document as unknown.
+    let kept = store
+        .list(&ListQuery {
+            author: named("Ada"),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!((kept.items.len(), kept.total), (0, 0));
+    assert_eq!(facet_of(&kept), (vec![], by_updated.len()));
+
+    let kept = store
+        .list(&ListQuery {
+            author: Some(AuthorFilter::Unknown),
+            ..query(Sort::Updated, false, all)
+        })
+        .expect("list");
+    assert_eq!((ids_of(&kept), kept.total), (by_updated.clone(), by_updated.len()));
+    assert_eq!(facet_of(&kept), (vec![], by_updated.len()));
+
+    assert_eq!(
+        ids_of(&store.list(&query(Sort::AddedBy, false, all)).expect("list")),
+        by_updated
+    );
+    assert_eq!(
+        ids_of(&store.list(&query(Sort::AddedBy, true, all)).expect("list")),
+        by_updated_desc
+    );
 }

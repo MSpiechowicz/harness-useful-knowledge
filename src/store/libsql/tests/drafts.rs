@@ -273,6 +273,8 @@ fn everything() -> ListQuery {
         format: None,
         text: String::new(),
         useful: None,
+        author: None,
+        want_authors: false,
         status: StatusFilter::All,
         sort: Sort::Updated,
         descending: false,

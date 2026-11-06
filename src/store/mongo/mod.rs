@@ -87,9 +87,11 @@ use super::review::{
     COMMENT_BODY_MAX, actor, check_change, check_comments, check_file_size, comment_body, file_name, file_sha,
 };
 use super::{
+    AuthorFacet, Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply,
+};
+use super::{
     Chunk, ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery,
 };
-use super::{Comment, History, NewComment, PendingChunk, PendingVersion, RepoCounts, ReviewChange, ReviewReply};
 use super::{Scope, SectionText, Stats, StoreError, StoredFile, TitleScope, Visibility, clean};
 
 /// The database used when the URL path names none.
@@ -486,6 +488,7 @@ impl KnowledgeStore for MongoStore {
             return Ok(DocumentPage {
                 items: Vec::new(),
                 total: 0,
+                authors: AuthorFacet::default(),
             });
         }
 

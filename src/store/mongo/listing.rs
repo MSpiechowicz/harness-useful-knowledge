@@ -7,16 +7,24 @@ use super::ctx::{Ctx, Fail};
 use super::documents::{document, links, pending_of_many, usage};
 use super::schema::{CHUNKS, DOCUMENTS};
 use super::{int, opt_int, terms, text};
-use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
+use crate::limits::{AUTHOR_GROUPS_READ_MAX, LIST_PAGE_MAX, QUERY_TOKENS_MAX};
+use crate::store::author_list::NAME_READ_MAX;
+use crate::store::{AuthorFacet, AuthorFilter, Section, Sort, Stats, Status, StatusFilter, StoreError, UsefulFilter};
 use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, Status, StatusFilter, StoreError, UsefulFilter};
 
 /// One page of the documents `query` keeps, with the total over all pages.
 pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage, Fail> {
-    let filter = conditions(ctx, query)?;
+    let base = conditions(ctx, query)?;
+    // Only a list that asks for the facet pays for it.
+    let authors = if query.want_authors {
+        author_facet(ctx, &base)?
+    } else {
+        AuthorFacet::default()
+    };
+    let filter = with_author(base, query.author.as_ref());
     let total = ctx.count(DOCUMENTS, filter.clone())?;
 
     let key = match query.sort {
@@ -30,9 +38,16 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
         // A count no field holds, and a document nobody rated has no counters (it sorts as 0): these
         // sort on a field of their own.
         Sort::Paths | Sort::Useful | Sort::LastUseful => COMPUTED_ORDER,
+        // Two fields of their own, see below.
+        Sort::AddedBy => AUTHOR_RANK,
     };
     let direction = if query.descending { -1 } else { 1 };
-    let sort = doc! { key: direction, "_id": direction };
+    let sort = if query.sort == Sort::AddedBy {
+        // No known author comes last in both directions.
+        doc! { AUTHOR_RANK: 1, AUTHOR_ORDER: direction, "_id": direction }
+    } else {
+        doc! { key: direction, "_id": direction }
+    };
 
     let skip = u64::try_from(query.offset).unwrap_or(u64::MAX);
     let limit = i64::try_from(query.limit.min(LIST_PAGE_MAX)).unwrap_or(0);
@@ -40,7 +55,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     // A limit of 0 asks for no limit in a query.
     let rows = if limit == 0 {
         Vec::new()
-    } else if key == COMPUTED_ORDER {
+    } else if key == COMPUTED_ORDER || key == AUTHOR_RANK {
         ctx.aggregate(DOCUMENTS, computed_pipeline(query.sort, filter, sort, skip, limit))?
     } else {
         ctx.find(DOCUMENTS, filter, (sort, skip, limit), Row::new())?
@@ -72,19 +87,33 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &ListQuery) -> Result<DocumentPage,
     Ok(DocumentPage {
         items,
         total: usize::try_from(total).unwrap_or(usize::MAX),
+        authors,
     })
 }
 
 /// The field a page is sorted on for the sorts by a computed value.
 const COMPUTED_ORDER: &str = "computed_order";
 
-/// The value of [`COMPUTED_ORDER`]: the path globs of all the links together, or a counter (a
-/// missing one is 0).
-fn computed_value(sort: Sort) -> Row {
+/// The fields of the sort by who added a document: 0 for a document with a known author and 1 for
+/// one without, and the name with ASCII letters folded to lower case.
+const AUTHOR_RANK: &str = "author_rank";
+const AUTHOR_ORDER: &str = "author_order";
+
+/// The fields [`computed_pipeline`] adds for `sort`: [`COMPUTED_ORDER`] (the path globs of all the
+/// links together, or a counter, a missing one being 0), or the two of the author.
+fn computed_fields(sort: Sort) -> Row {
+    if sort == Sort::AddedBy {
+        return doc! {
+            AUTHOR_RANK: { "$cond": [named_author(), 0_i64, 1_i64] },
+            AUTHOR_ORDER: { "$cond": [named_author(), { "$toLower": cut_name() }, ""] },
+        };
+    }
+
     if sort == Sort::Paths {
         let globs = doc! { "$size": { "$ifNull": ["$$link.globs", []] } };
+        let paths = doc! { "$sum": { "$map": { "input": { "$ifNull": ["$links", []] }, "as": "link", "in": globs } } };
 
-        return doc! { "$sum": { "$map": { "input": { "$ifNull": ["$links", []] }, "as": "link", "in": globs } } };
+        return doc! { COMPUTED_ORDER: paths };
     }
 
     let counter = if sort == Sort::Useful {
@@ -93,7 +122,65 @@ fn computed_value(sort: Sort) -> Row {
         "$last_useful_at"
     };
 
-    doc! { "$cond": [{ "$in": [{ "$type": counter }, ["int", "long", "double", "decimal"]] }, counter, 0_i64] }
+    doc! { COMPUTED_ORDER: { "$cond": [{ "$in": [{ "$type": counter }, ["int", "long", "double", "decimal"]] }, counter, 0_i64] } }
+}
+
+/// The name of a document cut to [`NAME_READ_MAX`] characters: a longer one is not a name, and
+/// reaches this process cut, as a sort key or a group.
+fn cut_name() -> Row {
+    doc! { "$substrCP": ["$added_by_name", 0_i64, i64::try_from(NAME_READ_MAX).unwrap_or(i64::MAX)] }
+}
+
+/// True for a document whose `added_by_name` is a name: text, and not empty.
+fn named_author() -> Row {
+    doc! { "$and": [
+        { "$eq": [{ "$type": "$added_by_name" }, "string"] },
+        { "$ne": ["$added_by_name", ""] },
+    ] }
+}
+
+/// `filter` and the match of the author filter. Kept apart from [`conditions`]: the facet of the
+/// authors honours every filter but this one, and `conditions` runs reads of its own.
+fn with_author(filter: Row, author: Option<&AuthorFilter>) -> Row {
+    let matching = match author {
+        None => return filter,
+        Some(AuthorFilter::Named(name)) => doc! { "added_by_name": name },
+        Some(AuthorFilter::Unknown) => doc! { "added_by_name": { "$in": [Bson::Null, ""] } },
+    };
+
+    doc! { "$and": [filter, matching] }
+}
+
+/// How many documents of `filter` each person added, and how many have no known author. A name that
+/// is missing, empty or not text is no known author (one group), the groups are cut to what one read
+/// takes with the unknown one first, and sorted again last as DocumentDB keeps the order of a `$sort`
+/// only when it is the last stage.
+fn author_facet(ctx: &mut Ctx<'_>, filter: &Row) -> Result<AuthorFacet, Fail> {
+    let order = doc! { "unknown": -1, "count": -1, "_id": 1 };
+    let pipeline = vec![
+        doc! { "$match": filter.clone() },
+        doc! { "$group": {
+            "_id": { "$cond": [named_author(), cut_name(), Bson::Null] },
+            "count": { "$sum": 1_i64 },
+        } },
+        doc! { "$addFields": { "unknown": { "$cond": [{ "$eq": ["$_id", Bson::Null] }, 1_i64, 0_i64] } } },
+        doc! { "$sort": order.clone() },
+        doc! { "$limit": i64::try_from(AUTHOR_GROUPS_READ_MAX).unwrap_or(i64::MAX) },
+        doc! { "$sort": order },
+    ];
+
+    let groups = ctx
+        .aggregate(DOCUMENTS, pipeline)?
+        .iter()
+        .map(|row| {
+            (
+                text(row, "_id"),
+                usize::try_from(int(row, "count")).unwrap_or(usize::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(AuthorFacet::from_groups(groups))
 }
 
 /// The pipeline of a page sorted by a computed field. The page is sorted again at the end: Amazon
@@ -101,7 +188,7 @@ fn computed_value(sort: Sort) -> Row {
 fn computed_pipeline(sort: Sort, filter: Row, order: Row, skip: u64, limit: i64) -> Vec<Row> {
     vec![
         doc! { "$match": filter },
-        doc! { "$addFields": { COMPUTED_ORDER: computed_value(sort) } },
+        doc! { "$addFields": computed_fields(sort) },
         doc! { "$sort": order.clone() },
         doc! { "$skip": i64::try_from(skip).unwrap_or(i64::MAX) },
         doc! { "$limit": limit },

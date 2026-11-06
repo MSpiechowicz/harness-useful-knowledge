@@ -3,8 +3,8 @@
 //! object on stdout. Timestamps are RFC 3339, field names camelCase.
 //!
 //! - `docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] [--useful
-//!   any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local]`
-//!   prints `{"items": [...], "total": N}`:
+//!   any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--author NAME | --author-unknown] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful|addedBy] [--desc] [--page N] [--per-page N] [--place remote|local]`
+//!   prints `{"items": [...], "total": N, "authors": {...}}`:
 //!   one page of the documents (see [`json::document`] for an item: its `links`, `addedBy` and
 //!   `updatedBy`, and the counters `shown`, `useful` and `lastUsefulAt`, which are absent while the
 //!   database has no counter columns). `--useful ever` keeps the documents an agent found useful
@@ -25,7 +25,16 @@
 //!   `--status` keeps the documents by their state, `all` (the default) every row that is not a
 //!   pending version, drafts included: `live` the live documents, `draft`, `waiting` and
 //!   `changesRequested` those rows and the live documents whose pending version is in that state,
-//!   `pending` the live documents that have a pending version. An item has its `status` and
+//!   `pending` the live documents that have a pending version. `--author NAME` keeps the documents
+//!   added by exactly that name (case-sensitive, the harness it was written through ignored, usage
+//!   error when blank or not a valid name), `--author-unknown` those with no known author, and both
+//!   together are a usage error. `--sort addedBy` sorts by that name with ASCII letters folded to
+//!   lower case, ties by id, the documents with no known author last in both directions. `authors`
+//!   is `{"people": [{"name", "count"}], "unknown": N}`: how many documents each person added under
+//!   every filter but the author one, most first then by name, at most 200 people (a name selected
+//!   by `--author` is always among them, with the `total` as its count when it would be cut), and
+//!   how many have no known author. A database without the author columns has no person, keeps
+//!   no document for `--author`, all for `--author-unknown`, and sorts `addedBy` as `updated`. An item has its `status` and
 //!   `revision`, and a live one `pending`: `null` or `{"id", "status", "revision", "updatedBy",
 //!   "updatedAt"}`. A row that is waiting for approval has `authors` (as `docs get` prints it), and
 //!   so does the `pending` object of a live row whose pending version is waiting: the people the
@@ -108,12 +117,12 @@ use crate::import::document::now;
 use crate::limits::{DELETE_IDS_MAX, STDIN_MAX};
 use crate::store::review::AUTHORS_FETCH_MAX;
 use crate::store::routed::{REMOTE_DOWN_WRITE, ids};
-use crate::store::{Detail, KnowledgeStore, Link, ListQuery, Status, StoreError, clean};
+use crate::store::{AuthorFacet, AuthorFilter, Detail, KnowledgeStore, Link, ListQuery, Status, StoreError, clean};
 use crate::support::Env;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "docs list --json [--repo KEY | --global | --all] [--format F] [--query Q] \
-                         [--useful any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
+                         [--useful any|ever|never] [--status all|live|draft|waiting|changesRequested|pending] [--author NAME | --author-unknown] [--sort title|updated|size|format|chunks|paths|repos|useful|lastUseful|addedBy] [--desc] [--page N] [--per-page N] [--place remote|local] | docs get --json ID \
                          [--sections] [--chunk CID] | docs matches --json ID --query Q [--limit N] | docs links set --json ID < links.json | docs rename --json ID \
                          --title TITLE | docs delete --json ID... | docs import --ndjson < manifest.json | docs reindex \
                          --json (ID... | --all) | docs similar --json [--repo KEY | --global] PATH... | \
@@ -349,7 +358,9 @@ fn list(context: &Context, args: &[Option<&str>]) -> Reply {
     let store = if wanted { context.open(Access::Read)? } else { None };
 
     let Some(mut store) = store else {
-        return Ok(Done::ok(json!({ "items": [], "total": 0 })));
+        return Ok(Done::ok(
+            json!({ "items": [], "total": 0, "authors": AuthorFacet::default().json() }),
+        ));
     };
 
     let mut shown = list_on(store.as_mut(), place, &query)?;
@@ -361,7 +372,7 @@ fn list(context: &Context, args: &[Option<&str>]) -> Reply {
     Ok(Done::ok(shown))
 }
 
-/// One page of `docs list` from `store`: `{"items", "total"}`.
+/// One page of `docs list` from `store`: `{"items", "total", "authors"}`.
 pub(crate) fn list_on(
     store: &mut dyn KnowledgeStore,
     place: Option<Place>,
@@ -418,7 +429,10 @@ pub(crate) fn list_on(
         items.push(shown);
     }
 
-    Ok(json!({ "items": items, "total": page.total }))
+    let selected = AuthorFilter::name(query.author.as_ref());
+    let authors = page.authors.capped(selected, page.total).json();
+
+    Ok(json!({ "items": items, "total": page.total, "authors": authors }))
 }
 
 /// A document or chunk id as written: `12`, or `local:12` for one on this computer (see

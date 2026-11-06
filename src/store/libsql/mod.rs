@@ -61,8 +61,8 @@ use super::Visibility;
 use super::review::{
     COMMENT_BODY_MAX, actor, check_change, check_comments, check_file_size, comment_body, file_name, file_sha,
 };
+use super::{AuthorFacet, Columns, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 use super::{ChunkHit, ChunkMatches, Detail, Document, DocumentDetail, DocumentPage, KnowledgeStore, Link, ListQuery};
-use super::{Columns, PendingChunk, RepoCounts, Scope, Stats, StoreError, TitleScope, clean};
 use super::{Comment, History, NewComment, PendingVersion, ReviewChange, ReviewReply, SectionText, StoredFile};
 
 /// How long a write keeps asking for a lock the server reports busy.
@@ -445,6 +445,7 @@ impl KnowledgeStore for LibsqlStore {
             return Ok(DocumentPage {
                 items: Vec::new(),
                 total: 0,
+                authors: AuthorFacet::default(),
             });
         }
 

@@ -8,7 +8,8 @@
 
 use super::sql_quality::document_columns;
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
-use crate::store::{Columns, ListQuery, RepoFilter, Sort, StatusFilter, StoreError, UsefulFilter};
+use crate::store::author_list::groups_sql_sqlite;
+use crate::store::{AuthorFilter, Columns, ListQuery, RepoFilter, Sort, StatusFilter, StoreError, UsefulFilter};
 
 /// The meta keys the store keeps itself.
 const RESERVED_META: [&str; 3] = ["generation", "schema_version", "dims"];
@@ -324,15 +325,42 @@ pub(crate) fn list_conditions<V: From<String>>(columns: Columns, query: &ListQue
     (clauses.join(" AND "), params)
 }
 
+/// `filter` with the condition of `query`'s author filter added, and its name (if any) pushed to
+/// `params`. Kept apart from [`list_conditions`]: the facet of the authors honours every filter but
+/// this one, and a statement that does not use a parameter is refused.
+pub(crate) fn with_author<V: From<String>>(
+    columns: Columns,
+    query: &ListQuery,
+    filter: &str,
+    params: &mut Vec<V>,
+) -> String {
+    let condition = AuthorFilter::condition(query.author.as_ref(), AUTHOR_COLUMN, columns.authors, |name| {
+        params.push(name.to_owned().into());
+        format!("?{}", params.len())
+    });
+
+    match condition {
+        Some(condition) => format!("{filter} AND {condition}"),
+        None => filter.to_owned(),
+    }
+}
+
+/// The name of the person who added a document (aliased `d`).
+pub(crate) const AUTHOR_COLUMN: &str = "d.added_by_name";
+
+/// The groups of the authors facet under `filter` (see [`AuthorFilter`]): the name as the hex of its
+/// bytes, `None` for no known author, and the count.
+pub(crate) fn author_groups_sql(columns: Columns, filter: &str) -> String {
+    groups_sql_sqlite(AUTHOR_COLUMN, columns.authors, filter)
+}
+
 /// The page of the documents `filter` keeps, in `query`'s order. The limit and the offset are the
 /// last two of the `params` numbered parameters.
 pub(crate) fn page_sql(columns: Columns, filter: &str, query: &ListQuery, params: usize) -> String {
-    // Without the counters the sorts by usefulness are the default order.
-    let sort = if columns.usage {
-        query.sort
-    } else {
-        query.sort.without_usage()
-    };
+    // Without the counters the sorts by usefulness are the default order, without the author columns
+    // so is the sort by who added a document.
+    let sort = query.sort.for_columns(columns);
+    let direction = if query.descending { "DESC" } else { "ASC" };
     let order = match sort {
         Sort::Title => "d.title COLLATE NOCASE",
         Sort::Updated => "d.updated_at",
@@ -346,8 +374,9 @@ pub(crate) fn page_sql(columns: Columns, filter: &str, query: &ListQuery, params
         Sort::Repos => "coalesce((SELECT min(l.repo_key) FROM knowledge_doc_links l WHERE l.doc_id = d.id), '')",
         Sort::Useful => "coalesce(d.useful, 0)",
         Sort::LastUseful => "coalesce(d.last_useful_at, 0)",
+        // No known author comes last in both directions. `lower` folds ASCII letters only.
+        Sort::AddedBy => "(nullif(d.added_by_name, '') IS NULL) ASC, lower(nullif(d.added_by_name, ''))",
     };
-    let direction = if query.descending { "DESC" } else { "ASC" };
 
     format!(
         "SELECT {} FROM knowledge_documents d WHERE {filter}

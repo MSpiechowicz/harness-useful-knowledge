@@ -17,6 +17,8 @@ fn filtered(store: &mut MongoStore, text: &str) -> DocumentPage {
             format: None,
             text: text.to_owned(),
             useful: None,
+            author: None,
+            want_authors: false,
             sort: Sort::Title,
             descending: false,
             offset: 0,

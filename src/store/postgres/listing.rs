@@ -8,11 +8,12 @@ use super::documents::{by_id, columns_sql, links_of, listed, pending_of_many};
 use super::error::{backend, column, count, int};
 use super::{meta, schema};
 use crate::limits::{LIST_PAGE_MAX, QUERY_TOKENS_MAX};
+use crate::store::author_list::groups_sql_postgres;
+use crate::store::{AuthorFacet, AuthorFilter, Section, Sort, Stats, StatusFilter, StoreError, UsefulFilter};
 use crate::store::{
     Chunk, ChunkMatch, ChunkMatches, Columns, Detail, DocumentDetail, DocumentPage, DocumentRow, ListQuery, RepoCounts,
     RepoFilter,
 };
-use crate::store::{Section, Sort, Stats, StatusFilter, StoreError, UsefulFilter};
 
 /// A document of no repository (aliased `d`).
 const GLOBAL: &str = "NOT EXISTS (SELECT 1 FROM knowledge_doc_links l WHERE l.doc_id = d.id)";
@@ -47,7 +48,25 @@ pub(super) fn list(
     columns: Columns,
     query: &ListQuery,
 ) -> Result<DocumentPage, StoreError> {
-    let (filter, mut params) = conditions(columns, query);
+    let (base, mut params) = conditions(columns, query);
+
+    // The facet honours every filter but the author one, so it is read before that filter's name is
+    // bound. Only a list that asks for it pays for it.
+    let authors = if query.want_authors {
+        let sql = groups_sql_postgres(AUTHOR_COLUMN, columns.authors, &base);
+        let groups = client.query(&sql, &refs(&params)).map_err(backend)?;
+
+        AuthorFacet::from_groups(
+            groups
+                .iter()
+                .map(|row| Ok((column::<Option<String>>(row, 0)?, count(row, 1)?)))
+                .collect::<Result<Vec<_>, StoreError>>()?,
+        )
+    } else {
+        AuthorFacet::default()
+    };
+
+    let filter = with_author(columns, query, &base, &mut params);
 
     let total = client
         .query_one(
@@ -59,12 +78,9 @@ pub(super) fn list(
     // The `C` collation keeps the order the same on every server, whatever its locale. A title folds
     // ASCII letters only (`lower` would also fold the letters of the server's locale), the one fold
     // every store does alike, so merged pages of two places are the pages of each one's own order.
-    // Without the counters the sorts by usefulness are the default order.
-    let sort = if columns.usage {
-        query.sort
-    } else {
-        query.sort.without_usage()
-    };
+    // Without the counters the sorts by usefulness are the default order, without the author columns
+    // so is the sort by who added a document.
+    let sort = query.sort.for_columns(columns);
     let order = match sort {
         Sort::Title => "translate(d.title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE \"C\"",
         Sort::Updated => "d.updated_at",
@@ -79,6 +95,10 @@ pub(super) fn list(
         }
         Sort::Useful => "coalesce(d.useful, 0)",
         Sort::LastUseful => "coalesce(d.last_useful_at, 0)",
+        // No known author comes last in both directions.
+        Sort::AddedBy => {
+            "(nullif(d.added_by_name, '') IS NULL) ASC, translate(nullif(d.added_by_name, ''), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE \"C\""
+        }
     };
     let direction = if query.descending { "DESC" } else { "ASC" };
 
@@ -113,11 +133,30 @@ pub(super) fn list(
     Ok(DocumentPage {
         items,
         total: count(&total, 0)?,
+        authors,
     })
 }
 
 fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
     params.iter().map(|param| &**param as &(dyn ToSql + Sync)).collect()
+}
+
+/// The name of the person who added a document (aliased `d`).
+const AUTHOR_COLUMN: &str = "d.added_by_name";
+
+/// `filter` with the condition of `query`'s author filter added, and its name (if any) pushed to
+/// `params`. Kept apart from [`conditions`]: the facet of the authors honours every filter but this
+/// one, and a statement that does not use a parameter is refused.
+fn with_author(columns: Columns, query: &ListQuery, filter: &str, params: &mut Vec<Param>) -> String {
+    let condition = AuthorFilter::condition(query.author.as_ref(), AUTHOR_COLUMN, columns.authors, |name| {
+        params.push(Box::new(name.to_owned()));
+        format!("${}", params.len())
+    });
+
+    match condition {
+        Some(condition) => format!("{filter} AND {condition}"),
+        None => filter.to_owned(),
+    }
 }
 
 /// The `WHERE` clause of `query`'s filters and its numbered parameters.

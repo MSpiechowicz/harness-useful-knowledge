@@ -29,6 +29,18 @@ fn an_unreachable_remote_leaves_every_read_to_this_computer_and_costs_one_attemp
 
     assert_eq!(all_titles(&mut routed), LOCAL_ONLY);
     assert_eq!(routed.list(&query(Sort::Title, false, 0, 10)).expect("list").total, 2);
+    assert_eq!(
+        routed
+            .list(&ListQuery {
+                want_authors: true,
+                ..query(Sort::Title, false, 0, 10)
+            })
+            .expect("list")
+            .authors
+            .unknown(),
+        2,
+        "the authors facet is of this computer alone too"
+    );
     assert_eq!(search_titles(&mut routed, "gateway").len(), 2);
     assert_eq!(routed.repos().expect("repos").global, 1);
     assert_eq!(routed.stats().expect("stats").documents, 2);

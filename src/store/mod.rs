@@ -15,6 +15,7 @@
 //! `updated_at` is the time the content was last imported: only [`KnowledgeStore::put_document`]
 //! sets it, so renaming or relinking a document leaves it as it was.
 
+pub mod author_list;
 pub mod clean;
 mod error;
 pub mod fuse;
@@ -36,6 +37,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use author_list::{AuthorFacet, AuthorFilter};
 pub use error::StoreError;
 pub use quality::{Author, Columns, DocUsage, TitleScope, UsefulFilter};
 pub use reach::Reach;
@@ -291,6 +293,9 @@ pub enum Sort {
     Useful,
     /// By when an agent last found it useful (never counts 0).
     LastUseful,
+    /// By the name of the person who added it, ASCII letters folded to lower case. A document with
+    /// no known author comes last, ascending or descending.
+    AddedBy,
 }
 
 impl Sort {
@@ -300,6 +305,21 @@ impl Sort {
             Self::Useful | Self::LastUseful => Self::Updated,
             other => other,
         }
+    }
+
+    /// The order a database without the author columns uses for the sort by who added a document.
+    pub fn without_authors(self) -> Self {
+        match self {
+            Self::AddedBy => Self::Updated,
+            other => other,
+        }
+    }
+
+    /// The sort a database with these `columns` can do: the one asked for, or the default order.
+    pub fn for_columns(self, columns: Columns) -> Self {
+        let sort = if columns.usage { self } else { self.without_usage() };
+
+        if columns.authors { sort } else { sort.without_authors() }
     }
 }
 
@@ -314,6 +334,12 @@ pub struct ListQuery {
     pub text: String,
     /// Keeps the documents agents found useful, or never useful; `None` keeps all.
     pub useful: Option<UsefulFilter>,
+    /// Keeps the documents added by this person, or by nobody known; `None` keeps all.
+    pub author: Option<AuthorFilter>,
+    /// Whether the page carries the authors facet ([`DocumentPage::authors`]). It costs a grouping
+    /// query over every document the other filters keep, so only the person's own list asks for it:
+    /// without it the facet is empty and no such query runs.
+    pub want_authors: bool,
     /// Keeps the rows in these states (see [`StatusFilter`]). No default: an agent's list asks for
     /// [`StatusFilter::Live`].
     pub status: StatusFilter,
@@ -339,6 +365,9 @@ pub struct DocumentPage {
     pub items: Vec<DocumentRow>,
     /// The documents the filters keep, over all pages.
     pub total: usize,
+    /// Who added the documents the filters keep, the author filter apart (see [`AuthorFacet`]). Empty
+    /// unless the query asked for it ([`ListQuery::want_authors`]).
+    pub authors: AuthorFacet,
 }
 
 /// What [`KnowledgeStore::get`] reads besides the document and its links.

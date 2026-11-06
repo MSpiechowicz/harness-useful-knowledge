@@ -4,7 +4,8 @@
 use super::support::{insert, server};
 use crate::store::libsql::{LibsqlStore, SCHEMA_VERSION};
 use crate::store::testing::{
-    Seed, absent_columns_contract, authors_contract, counters_contract, shared_chunks_contract, titles_contract,
+    Seed, absent_columns_contract, author_facet_asked_contract, author_filter_contract, author_invalid_names_contract,
+    author_listing_scale_contract, authors_contract, counters_contract, shared_chunks_contract, titles_contract,
     useful_listing_contract,
 };
 use crate::store::{DocUsage, KnowledgeStore};
@@ -38,6 +39,34 @@ fn team_the_useful_filter_and_sorts_follow_the_contract() {
     let Some(server) = server() else { return };
 
     useful_listing_contract(&mut server.store());
+}
+
+#[test]
+fn team_author_filter_and_sort_follow_the_contract() {
+    let Some(server) = server() else { return };
+
+    author_filter_contract(&mut server.store());
+}
+
+#[test]
+fn team_author_names_that_are_not_names_are_never_shown() {
+    let Some(server) = server() else { return };
+
+    author_invalid_names_contract(&mut server.store());
+}
+
+#[test]
+fn team_author_facet_is_read_only_when_asked() {
+    let Some(server) = server() else { return };
+
+    author_facet_asked_contract(&mut server.store());
+}
+
+#[test]
+fn team_author_pages_of_a_thousand_documents_add_up() {
+    let Some(server) = server() else { return };
+
+    author_listing_scale_contract(&mut server.store());
 }
 
 #[test]
@@ -166,4 +195,63 @@ fn team_a_counter_at_the_largest_integer_stays_there_and_a_hand_edit_reads() {
     let found = store.get(id, &Default::default()).expect("the row reads").expect("doc");
     assert_eq!(found.usage.map(|usage| usage.shown), Some(0));
     assert_eq!(found.doc.added_by, None);
+}
+
+/// A name that is not valid UTF-8, or has a NUL in it, is no known author. The server cannot send
+/// text that is not valid UTF-8, so the facet reads the bytes of a name as hex. The page is cut to a
+/// row the server can send: the one that is by Ada.
+#[test]
+fn team_a_name_that_is_not_valid_text_or_hides_bytes_is_no_known_author_in_the_facet() {
+    use crate::store::{AuthorFilter, ListQuery, RepoFilter, Sort, StatusFilter};
+
+    let Some(server) = server() else { return };
+    let mut store = server.store();
+
+    for title in ["Fine", "Nul", "Broken", "Lead"] {
+        insert(
+            &mut store,
+            &Seed::new(title)
+                .source(&format!("/{title}"))
+                .chunk("1", "a")
+                .by("x", None),
+        );
+    }
+
+    server
+        .execute("UPDATE knowledge_documents SET added_by_name = 'Ada' WHERE title = 'Fine'")
+        .expect("write the name");
+    server
+        .execute("UPDATE knowledge_documents SET added_by_name = CAST(x'416461007461696C' AS TEXT) WHERE title = 'Nul'")
+        .expect("write the name");
+    server
+        .execute("UPDATE knowledge_documents SET added_by_name = CAST(x'41FF' AS TEXT) WHERE title = 'Broken'")
+        .expect("write the name");
+    server
+        .execute("UPDATE knowledge_documents SET added_by_name = CAST(x'C080808080' AS TEXT) WHERE title = 'Lead'")
+        .expect("write the name");
+
+    let list = |store: &mut crate::store::libsql::LibsqlStore, author: Option<AuthorFilter>| {
+        store
+            .list(&ListQuery {
+                filter: RepoFilter::All,
+                format: None,
+                text: String::new(),
+                useful: None,
+                author,
+                want_authors: true,
+                status: StatusFilter::All,
+                sort: Sort::Updated,
+                descending: false,
+                offset: 0,
+                limit: 1,
+            })
+            .expect("list")
+    };
+
+    let page = list(&mut store, None);
+    assert_eq!(page.total, 4);
+    assert_eq!((page.authors.people(), page.authors.unknown()), (vec![("Ada", 1)], 3));
+
+    let page = list(&mut store, Some(AuthorFilter::Named("Ada".to_owned())));
+    assert_eq!((page.total, page.authors.people()), (1, vec![("Ada", 1)]));
 }

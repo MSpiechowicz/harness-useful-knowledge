@@ -55,6 +55,8 @@ fn query(sort: Sort, descending: bool, offset: usize, limit: usize) -> ListQuery
         format: None,
         text: String::new(),
         useful: None,
+        author: None,
+        want_authors: false,
         sort,
         descending,
         offset,

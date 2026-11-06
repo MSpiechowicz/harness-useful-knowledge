@@ -87,6 +87,8 @@ fn collect(
         format: None,
         text: text.to_owned(),
         useful: None,
+        author: None,
+        want_authors: false,
         status: StatusFilter::Live,
         sort: Sort::Updated,
         descending: true,

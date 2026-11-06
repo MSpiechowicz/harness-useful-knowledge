@@ -268,6 +268,8 @@ impl Lab {
                 format: None,
                 text: String::new(),
                 useful: None,
+                author: None,
+                want_authors: false,
                 sort: crate::store::Sort::Title,
                 descending: false,
                 offset: 0,

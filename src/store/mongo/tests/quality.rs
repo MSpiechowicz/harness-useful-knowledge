@@ -8,7 +8,9 @@ use std::thread;
 
 use super::{insert, store};
 use crate::store::testing::{
-    Seed, authors_contract, counters_contract, shared_chunks_contract, titles_contract, useful_listing_contract,
+    Seed, author_facet_asked_contract, author_filter_contract, author_invalid_names_contract,
+    author_listing_scale_contract, authors_contract, counters_contract, shared_chunks_contract, titles_contract,
+    useful_listing_contract,
 };
 use crate::store::{DocUsage, KnowledgeStore, StoreError};
 
@@ -31,6 +33,34 @@ fn team_mongo_the_useful_filter_and_sorts_follow_the_contract() {
     let Some((_db, mut store)) = store() else { return };
 
     useful_listing_contract(&mut store);
+}
+
+#[test]
+fn team_mongo_author_filter_and_sort_follow_the_contract() {
+    let Some((_db, mut store)) = store() else { return };
+
+    author_filter_contract(&mut store);
+}
+
+#[test]
+fn team_mongo_author_names_that_are_not_names_are_never_shown() {
+    let Some((_db, mut store)) = store() else { return };
+
+    author_invalid_names_contract(&mut store);
+}
+
+#[test]
+fn team_mongo_author_facet_is_read_only_when_asked() {
+    let Some((_db, mut store)) = store() else { return };
+
+    author_facet_asked_contract(&mut store);
+}
+
+#[test]
+fn team_mongo_author_pages_of_a_thousand_documents_add_up() {
+    let Some((_db, mut store)) = store() else { return };
+
+    author_listing_scale_contract(&mut store);
 }
 
 #[test]
@@ -124,6 +154,8 @@ fn team_mongo_documents_without_counter_fields_sort_as_zero_and_are_never_shown_
                 format: None,
                 text: String::new(),
                 useful,
+                author: None,
+                want_authors: false,
                 sort,
                 descending: false,
                 offset: 0,
