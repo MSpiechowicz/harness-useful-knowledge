@@ -242,12 +242,32 @@ impl Server {
             return protocol::error(id, INVALID_PARAMS, "tools/call needs a tool name");
         };
 
-        let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let mut arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        drop_empty_project_path(&mut arguments);
 
         match calls::call(self, name, arguments) {
             Some(reply) => protocol::result(id, tool_result(&reply)),
             None => protocol::error(id, INVALID_PARAMS, &format!("unknown tool: {}", short(name))),
         }
+    }
+}
+
+/// Removes a `project_path` that is blank text, `{}` or null: agents send those when they mean the repository
+/// they are working in, and the call then resolves to the root of the folder the server runs in.
+fn drop_empty_project_path(arguments: &mut Value) {
+    let Some(fields) = arguments.as_object_mut() else {
+        return;
+    };
+
+    let empty = match fields.get("project_path") {
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Object(object)) => object.is_empty(),
+        Some(Value::Null) => true,
+        _ => false,
+    };
+
+    if empty {
+        fields.remove("project_path");
     }
 }
 

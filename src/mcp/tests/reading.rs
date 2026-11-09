@@ -35,6 +35,47 @@ fn seeded() -> World {
     world
 }
 
+#[test]
+fn an_empty_project_path_means_the_repository_the_server_runs_in() {
+    let mut world = seeded();
+    let project = world.project();
+    world.server.projects = ProjectResolver::new(world.server.env.clone(), Some(project.clone()));
+
+    for empty in [json!({}), json!(""), json!("  "), Value::Null] {
+        let listed = world.ok("knowledge_list", json!({ "project_path": empty }));
+
+        assert!(listed.contains("Project runbook"), "{empty}: {listed}");
+        assert!(!listed.contains("Other repo notes"), "{empty}: {listed}");
+    }
+
+    std::fs::write(project.join("notes.md"), "# Notes\n\nHow the gateway starts.\n").expect("write");
+    world.ok(
+        "knowledge_add",
+        json!({ "title": "Gateway start", "path": "notes.md", "project_path": {} }),
+    );
+    assert!(!world.held_files().is_empty());
+
+    let nested = world.err("knowledge_list", json!({ "project_path": { "path": "/x" } }));
+    assert!(
+        nested.contains("invalid"),
+        "a path inside an object is no empty value: {nested}"
+    );
+}
+
+#[test]
+fn an_empty_project_path_outside_a_repository_still_asks_for_one() {
+    let mut world = World::new();
+    std::fs::write(world.home().join("diary.txt"), "private words").expect("write");
+
+    let refused = world.err(
+        "knowledge_add",
+        json!({ "title": "x", "path": "diary.txt", "project_path": {} }),
+    );
+
+    assert!(refused.contains("project_path"), "{refused}");
+    assert!(world.held_files().is_empty());
+}
+
 fn search(world: &mut World, extra: Value) -> String {
     let mut arguments = json!({ "query": "install gateway", "project_path": project_arg(world) });
     arguments
