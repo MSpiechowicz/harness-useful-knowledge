@@ -1,3 +1,10 @@
+## [2.2.2](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.2.1...v2.2.2) (2026-11-09)
+
+
+### Bug Fixes
+
+* **mcp:** use the repository the server runs in when project_path is empty ([b6bfccc](https://github.com/MSpiechowicz/harness-useful-knowledge/commit/b6bfcccea460301d086ce49511cfe140bad5d146))
+
 ## [2.2.1](https://github.com/MSpiechowicz/harness-useful-knowledge/compare/v2.2.0...v2.2.1) (2026-11-06)
 
 
